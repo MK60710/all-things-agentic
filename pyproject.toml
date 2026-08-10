@@ -1,0 +1,22 @@
+[project]
+name = "all-things-agentic"
+version = "0.1.0"
+description = "Interactive knowledge-graph research partner — All Things Agentic Hackathon"
+requires-python = ">=3.11"
+dependencies = [
+    "google-adk>=1.0.0",
+    "google-genai>=1.0.0",
+    "google-cloud-firestore>=2.19.0",
+    "networkx>=3.3",
+    "pydantic>=2.9",
+    "requests>=2.32",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+]
+
+[tool.uv]
+dev-dependencies = []
