@@ -9,15 +9,20 @@ surfaced next (the Day 16 verification checkpoint in the plan).
 
 from __future__ import annotations
 
+import logging
+import os
 import uuid
 from collections.abc import Callable
 from datetime import datetime, timezone
 
 import networkx as nx
+from google import genai
 from pydantic import BaseModel
 
 from agent.graph_manager import GraphManager
 from agent.schema import NodeType
+
+logger = logging.getLogger(__name__)
 
 ExplainFn = Callable[[str, str, list[str]], str]
 
@@ -39,6 +44,63 @@ def _default_explain(name_a: str, name_b: str, evidence: list[str]) -> str:
         f"{name_a} and {name_b} share context ({shared}) but have no direct "
         f"connection in the graph — worth checking if that's a real gap."
     )
+
+
+class GeminiExplainer:
+    """Calls Gemini via Vertex AI to explain a candidate research gap.
+
+    Authenticates via Application Default Credentials (project IAM), not an
+    API key, matching the rest of this project's auth convention. Falls
+    back to the deterministic template on any failure - a Gemini outage,
+    quota limit, or auth issue must never break gap-finding itself, since
+    the candidates themselves already come from graph topology, not the
+    model.
+    """
+
+    def __init__(
+        self,
+        client: genai.Client | None = None,
+        model: str = "gemini-2.5-flash",
+        project: str | None = None,
+        location: str | None = None,
+    ):
+        self._model = model
+        self._client = client or genai.Client(
+            vertexai=True,
+            project=project or os.environ.get("GOOGLE_CLOUD_PROJECT"),
+            location=location or os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1"),
+        )
+
+    def __call__(self, name_a: str, name_b: str, evidence: list[str]) -> str:
+        shared = ", ".join(evidence) if evidence else "no shared neighbors"
+        prompt = (
+            "You are helping a researcher spot gaps in a knowledge graph "
+            "built from academic papers. Two entities share context but "
+            "have no direct connection recorded between them.\n\n"
+            f"Entity A: {name_a}\n"
+            f"Entity B: {name_b}\n"
+            f"Shared context (common neighbors): {shared}\n\n"
+            "In 1-2 sentences, explain why this might be a real, "
+            "worth-checking research gap, or say if it looks more like a "
+            "coincidence."
+        )
+        try:
+            response = self._client.models.generate_content(
+                model=self._model, contents=prompt
+            )
+            text = (response.text or "").strip()
+            if text:
+                return text
+        except Exception:
+            # Never let a Gemini outage/quota/config issue break gap-finding
+            # itself (candidates already come from graph topology), but log
+            # it - a silently-swallowed wrong model name is exactly what
+            # slipped through here during development.
+            logger.warning(
+                "GeminiExplainer call failed, falling back to template",
+                exc_info=True,
+            )
+        return _default_explain(name_a, name_b, evidence)
 
 
 class GapFinder:
