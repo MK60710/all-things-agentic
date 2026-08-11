@@ -13,6 +13,9 @@ class _FakeDocRef:
     def set(self, data: dict, merge: bool = True) -> None:
         self._store[self._doc_id] = data
 
+    def delete(self) -> None:
+        self._store.pop(self._doc_id, None)
+
 
 class _FakeSnapshot:
     def __init__(self, doc_id: str, data: dict):

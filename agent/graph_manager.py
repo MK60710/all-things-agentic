@@ -39,6 +39,8 @@ CANONICALIZATION_LOW = 0.75
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    if len(a) != len(b):
+        return 0.0
     dot = sum(x * y for x, y in zip(a, b))
     norm_a = math.sqrt(sum(x * x for x in a))
     norm_b = math.sqrt(sum(y * y for y in b))
@@ -266,8 +268,11 @@ class GraphManager:
     ) -> GraphIngestionReport:
         """Persist structured extraction output with stable, retry-safe IDs."""
 
+        # paper_id is caller-supplied (an ADK tool call could eventually
+        # drive this per the module docstring), so it's hashed the same way
+        # as every other id here rather than used raw as a graph/Firestore id.
         paper_node = Node(
-            id=extraction.paper_id,
+            id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"node:paper:{extraction.paper_id}")),
             type=NodeType.PAPER,
             name=paper_name or extraction.paper_id,
             description="Source paper",
@@ -298,7 +303,12 @@ class GraphManager:
                     )
                 )
                 reused = False
-            entity_to_node_id[entity.name] = node_id
+            # Relations only carry entity *names* (see ExtractedRelation), not
+            # types, so this map can't fully disambiguate two same-name,
+            # different-type entities from a single extraction. Keep the
+            # first occurrence deterministically rather than letting a later
+            # duplicate silently overwrite it depending on iteration order.
+            entity_to_node_id.setdefault(entity.name, node_id)
             node_writes.append(
                 NodeWriteResult(
                     entity_name=entity.name,
@@ -359,7 +369,11 @@ class GraphManager:
         if name in entity_to_node_id:
             return entity_to_node_id[name]
 
-        canonical = self.canonicalize(name, node_type=NodeType.CONCEPT)
+        # No type is known for an implicit relation endpoint (relations only
+        # carry names), so search across all node types rather than
+        # restricting to CONCEPT, or an existing node of a different type
+        # (e.g. a MODEL) could never be matched here.
+        canonical = self.canonicalize(name, node_type=None)
         if canonical.decision == "auto_merge" and canonical.matched_node_id:
             return canonical.matched_node_id
 

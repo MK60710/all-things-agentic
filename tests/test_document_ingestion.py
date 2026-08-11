@@ -89,6 +89,11 @@ def test_pdf_text_extractor_falls_back_to_ocr(tmp_path, monkeypatch):
     assert result.used_ocr is True
     assert result.raw_text == "OCR recovered text"
     assert "used_ocr_fallback" in result.warnings
+    # Pages/chunks from this path must be labeled "ocr", not the default
+    # "pdf_text" - downstream consumers rely on this to flag lower-
+    # confidence OCR-derived text.
+    assert result.pages[0].source == "ocr"
+    assert result.chunk_metadata[0].source == "ocr"
 
 
 def test_pdf_text_extractor_uses_ocr_when_pdftotext_is_missing(
@@ -111,6 +116,39 @@ def test_pdf_text_extractor_uses_ocr_when_pdftotext_is_missing(
     assert result.used_ocr is True
     assert result.raw_text == "OCR fallback text"
     assert any("pdftotext_unavailable" in warning for warning in result.warnings)
+
+
+def test_pdf_text_extractor_rejects_path_outside_allowed_root(tmp_path, monkeypatch):
+    allowed_root = tmp_path / "corpus"
+    allowed_root.mkdir()
+    outside_pdf = tmp_path / "outside" / "other.pdf"
+    outside_pdf.parent.mkdir()
+    outside_pdf.write_bytes(b"%PDF-1.4 fake")
+
+    extractor = PdfTextExtractor(min_usable_chars=0, allowed_root=allowed_root)
+
+    try:
+        extractor.extract("paper-x", outside_pdf)
+    except DocumentExtractionError as exc:
+        assert "outside the allowed root" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("expected DocumentExtractionError")
+
+
+def test_pdf_text_extractor_allows_path_inside_allowed_root(tmp_path, monkeypatch):
+    allowed_root = tmp_path / "corpus"
+    allowed_root.mkdir()
+    pdf_path = allowed_root / "paper.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 fake")
+
+    def fake_run(*args, **kwargs):
+        return SimpleNamespace(returncode=0, stdout="Title\fBody text", stderr="")
+
+    monkeypatch.setattr("agent.document_ingestion.subprocess.run", fake_run)
+
+    extractor = PdfTextExtractor(min_usable_chars=0, allowed_root=allowed_root)
+    result = extractor.extract("paper-1", pdf_path)
+    assert result.paper_id == "paper-1"
 
 
 def test_pdf_text_extractor_fails_without_pdf(tmp_path, monkeypatch):

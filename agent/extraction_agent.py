@@ -112,8 +112,25 @@ class ExtractionAgent:
                 message=str(exc),
             )
             if fail_closed:
+                # Hard failure: no result at all, caller must treat this
+                # paper as not extracted.
                 return ExtractionOutcome(paper_id=paper_id, document=document, issue=issue)
-            return ExtractionOutcome(paper_id=paper_id, document=document, issue=issue)
+            # Graceful degradation: structured extraction failed, but the
+            # document itself ingested fine, so fall back to a chunks-only
+            # result (same shape ChunkOnlyStructuredExtractor produces) so
+            # the paper still flows into indexing instead of being dropped
+            # entirely. `issue` stays set, so ExtractionOutcome.ok is still
+            # False, callers can tell this wasn't a clean success.
+            fallback_result = ExtractionResult(
+                paper_id=paper_id,
+                entities=[],
+                relations=[],
+                chunks=document.chunks,
+                chunk_metadata=document.chunk_metadata,
+            )
+            return ExtractionOutcome(
+                paper_id=paper_id, document=document, result=fallback_result, issue=issue
+            )
 
     def extract_batch(
         self, papers: Iterable[tuple[str, str]]

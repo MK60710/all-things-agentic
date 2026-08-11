@@ -73,6 +73,48 @@ def test_extract_one_uses_structured_extractor():
     assert outcome.result.chunks == ["chunk one", "chunk two"]
 
 
+class _FailingStructuredExtractor:
+    def extract(self, document: DocumentIngestionResult) -> ExtractionResult:
+        raise RuntimeError("structured extraction blew up")
+
+
+def test_extract_one_fail_closed_true_returns_no_result():
+    agent = ExtractionAgent(
+        document_extractor=_FakeDocumentExtractor(),
+        structured_extractor=_FailingStructuredExtractor(),
+    )
+
+    outcome = agent.extract_one("paper-1", "paper.pdf", fail_closed=True)
+
+    assert outcome.ok is False
+    assert outcome.result is None
+    assert outcome.document is not None
+    assert outcome.issue is not None
+    assert outcome.issue.stage == "structured_extraction"
+
+
+def test_extract_one_fail_closed_false_falls_back_to_chunks_only():
+    """fail_closed=False must actually behave differently from True -
+    degrade to a chunks-only result instead of dropping the paper, while
+    still reporting the issue so callers can tell it wasn't a clean
+    success."""
+    agent = ExtractionAgent(
+        document_extractor=_FakeDocumentExtractor(),
+        structured_extractor=_FailingStructuredExtractor(),
+    )
+
+    outcome = agent.extract_one("paper-1", "paper.pdf", fail_closed=False)
+
+    assert outcome.ok is False  # issue is still set
+    assert outcome.result is not None
+    assert outcome.result.paper_id == "paper-1"
+    assert outcome.result.entities == []
+    assert outcome.result.relations == []
+    assert outcome.result.chunks == ["chunk one", "chunk two"]
+    assert outcome.issue is not None
+    assert outcome.issue.stage == "structured_extraction"
+
+
 def test_extract_batch_isolates_failure_per_paper():
     agent = ExtractionAgent(
         document_extractor=_FakeDocumentExtractor(failures={"bad.pdf"}),
