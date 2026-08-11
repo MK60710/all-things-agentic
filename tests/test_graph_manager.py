@@ -3,7 +3,16 @@ from __future__ import annotations
 import uuid
 
 from agent.graph_manager import GraphManager
-from agent.schema import Edge, EdgeType, Node, NodeType, ProvenanceTag
+from agent.schema import (
+    Edge,
+    EdgeType,
+    ExtractionResult,
+    ExtractedEntity,
+    ExtractedRelation,
+    Node,
+    NodeType,
+    ProvenanceTag,
+)
 
 
 def _make_manager(fake_db) -> GraphManager:
@@ -150,3 +159,42 @@ def test_rehydrate_loads_existing_data(fake_db):
     # New GraphManager instance, same fake_db — simulates Cloud Run cold start.
     gm2 = _make_manager(fake_db)
     assert node.id in gm2.graph
+
+
+def test_apply_extraction_result_is_idempotent(fake_db):
+    gm = _make_manager(fake_db)
+    extraction = ExtractionResult(
+        paper_id="paper-1",
+        entities=[
+            ExtractedEntity(
+                name="Chain of Thought",
+                type=NodeType.CONCEPT,
+                description="Reasoning style",
+            ),
+            ExtractedEntity(
+                name="Reasoning",
+                type=NodeType.CONCEPT,
+                description="Inference process",
+            ),
+        ],
+        relations=[
+            ExtractedRelation(
+                source_entity="Chain of Thought",
+                relation=EdgeType.SUPPORTS,
+                target_entity="Reasoning",
+                source_quote="Chain of thought prompts can support reasoning.",
+                source_section="Introduction",
+            )
+        ],
+        chunks=["chunk one"],
+    )
+
+    first = gm.apply_extraction_result(extraction, paper_name="Paper Title")
+    second = gm.apply_extraction_result(extraction, paper_name="Paper Title")
+
+    assert first.paper_node_id == "paper-1"
+    assert len(first.node_writes) == 2
+    assert len(first.edge_writes) == 1
+    assert gm.graph.number_of_nodes() == 3
+    assert gm.graph.number_of_edges() == 1
+    assert second.edge_writes[0].edge_id == first.edge_writes[0].edge_id

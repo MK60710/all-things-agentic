@@ -1,0 +1,10 @@
+google-adk>=1.0.0
+google-genai>=1.0.0
+google-cloud-firestore>=2.19.0
+fastembed>=0.7.0
+networkx>=3.3
+pymupdf>=1.25.0
+pydantic>=2.9
+pytest>=8.3
+pytest-asyncio>=0.24
+requests>=2.32
