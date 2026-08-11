@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import pytest
+from pydantic import ValidationError
+
 from agent.schema import EdgeType, ExtractedRelation, NodeType, ProvenanceTag
 
 
@@ -20,6 +23,16 @@ def test_extracted_relation_requires_source_quote():
     )
     assert relation.source_quote
     assert relation.relation == EdgeType.PROPOSES
+
+
+def test_extracted_relation_rejects_blank_source_quote():
+    with pytest.raises(ValidationError):
+        ExtractedRelation(
+            source_entity="Paper A",
+            relation=EdgeType.PROPOSES,
+            target_entity="Method X",
+            source_quote="   ",
+        )
 
 
 def test_provenance_tag_values():

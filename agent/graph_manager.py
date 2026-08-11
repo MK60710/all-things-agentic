@@ -12,11 +12,24 @@ import math
 import re
 import uuid
 from dataclasses import dataclass
+from typing import Any, Callable
 
 import networkx as nx
-from google.cloud import firestore
 
-from agent.schema import Edge, EdgeType, Node, NodeType, ProvenanceTag
+try:
+    from google.cloud import firestore
+except ImportError:  # pragma: no cover - exercised only outside test doubles
+    firestore = None  # type: ignore[assignment]
+
+from agent.schema import (
+    Edge,
+    EdgeType,
+    ExtractionResult,
+    ExtractedEntity,
+    Node,
+    NodeType,
+    ProvenanceTag,
+)
 
 # Two-tier canonicalization thresholds. Above HIGH: auto-merge silently.
 # Below LOW: treat as genuinely new. In between: the concrete trigger
@@ -45,17 +58,47 @@ class CanonicalizationResult:
     score: float | None = None
 
 
+@dataclass
+class NodeWriteResult:
+    entity_name: str
+    node_id: str
+    decision: str
+    score: float | None = None
+    reused_existing_node: bool = False
+
+
+@dataclass
+class EdgeWriteResult:
+    relation: str
+    edge_id: str
+    source_id: str
+    target_id: str
+
+
+@dataclass
+class GraphIngestionReport:
+    paper_id: str
+    paper_node_id: str
+    node_writes: list[NodeWriteResult]
+    edge_writes: list[EdgeWriteResult]
+
+
 class GraphManager:
     def __init__(
         self,
         project_id: str,
         database: str = "(default)",
-        db_client: firestore.Client | None = None,
+        db_client: Any | None = None,
     ):
         self.graph = nx.MultiDiGraph()
-        self._db = db_client or firestore.Client(
-            project=project_id, database=database
-        )
+        if db_client is not None:
+            self._db = db_client
+        else:
+            if firestore is None:
+                raise ModuleNotFoundError(
+                    "google.cloud.firestore is not installed; inject db_client for tests"
+                )
+            self._db = firestore.Client(project=project_id, database=database)
         self._known_distinct: set[tuple[str, str]] = set()
         self._rehydrate()
 
@@ -125,6 +168,32 @@ class GraphManager:
             self.graph.predecessors(node_id)
         )
 
+    def _stable_node_id(
+        self, paper_id: str, name: str, node_type: NodeType
+    ) -> str:
+        normalized = _normalize_name(name)
+        return str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL, f"node:{paper_id}:{node_type.value}:{normalized}"
+            )
+        )
+
+    def _stable_edge_id(
+        self,
+        paper_id: str,
+        source_id: str,
+        target_id: str,
+        relation: EdgeType,
+        source_quote: str,
+    ) -> str:
+        quote_key = re.sub(r"\s+", " ", source_quote).strip()
+        return str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"edge:{paper_id}:{source_id}:{target_id}:{relation.value}:{quote_key}",
+            )
+        )
+
     def find_sparse_pairs(
         self, node_type: NodeType | None = None, limit: int = 10
     ) -> list[tuple[str, str]]:
@@ -154,12 +223,17 @@ class GraphManager:
     # ---- Canonicalization ----
 
     def canonicalize(
-        self, name: str, embedding: list[float] | None = None
+        self,
+        name: str,
+        embedding: list[float] | None = None,
+        node_type: NodeType | None = None,
     ) -> CanonicalizationResult:
         """Two-tier match: cheap string match first, then embedding
         similarity. Three-way routing on the result."""
         normalized = _normalize_name(name)
         for node_id, data in self.graph.nodes(data=True):
+            if node_type is not None and data.get("type") != node_type.value:
+                continue
             if _normalize_name(data.get("name", "")) == normalized:
                 return CanonicalizationResult("auto_merge", node_id, 1.0)
 
@@ -168,6 +242,8 @@ class GraphManager:
 
         best_id, best_score = None, 0.0
         for node_id, data in self.graph.nodes(data=True):
+            if node_type is not None and data.get("type") != node_type.value:
+                continue
             candidate_embedding = data.get("entity_embedding")
             if not candidate_embedding:
                 continue
@@ -178,7 +254,123 @@ class GraphManager:
         if best_score >= CANONICALIZATION_HIGH:
             return CanonicalizationResult("auto_merge", best_id, best_score)
         if best_score >= CANONICALIZATION_LOW:
-            return CanonicalizationResult(
-                "needs_clarification", best_id, best_score
-            )
+            return CanonicalizationResult("needs_clarification", best_id, best_score)
         return CanonicalizationResult("new", best_id, best_score)
+
+    def apply_extraction_result(
+        self,
+        extraction: ExtractionResult,
+        *,
+        paper_name: str | None = None,
+        embedding_fn: Callable[[ExtractedEntity], list[float] | None] | None = None,
+    ) -> GraphIngestionReport:
+        """Persist structured extraction output with stable, retry-safe IDs."""
+
+        paper_node = Node(
+            id=extraction.paper_id,
+            type=NodeType.PAPER,
+            name=paper_name or extraction.paper_id,
+            description="Source paper",
+        )
+        self.add_node(paper_node)
+
+        entity_to_node_id: dict[str, str] = {}
+        node_writes: list[NodeWriteResult] = []
+        for entity in extraction.entities:
+            embedding = embedding_fn(entity) if embedding_fn is not None else None
+            canonical = self.canonicalize(
+                entity.name, embedding=embedding, node_type=entity.type
+            )
+            if canonical.decision == "auto_merge" and canonical.matched_node_id:
+                node_id = canonical.matched_node_id
+                reused = True
+            else:
+                node_id = self._stable_node_id(
+                    extraction.paper_id, entity.name, entity.type
+                )
+                self.add_node(
+                    Node(
+                        id=node_id,
+                        type=entity.type,
+                        name=entity.name,
+                        description=entity.description,
+                        entity_embedding=embedding,
+                    )
+                )
+                reused = False
+            entity_to_node_id[entity.name] = node_id
+            node_writes.append(
+                NodeWriteResult(
+                    entity_name=entity.name,
+                    node_id=node_id,
+                    decision=canonical.decision,
+                    score=canonical.score,
+                    reused_existing_node=reused,
+                )
+            )
+
+        edge_writes: list[EdgeWriteResult] = []
+        for relation in extraction.relations:
+            source_id = self._resolve_relation_endpoint(
+                extraction.paper_id, relation.source_entity, entity_to_node_id
+            )
+            target_id = self._resolve_relation_endpoint(
+                extraction.paper_id, relation.target_entity, entity_to_node_id
+            )
+            edge = Edge(
+                id=self._stable_edge_id(
+                    extraction.paper_id,
+                    source_id,
+                    target_id,
+                    relation.relation,
+                    relation.source_quote,
+                ),
+                source_id=source_id,
+                target_id=target_id,
+                type=relation.relation,
+                provenance=ProvenanceTag.EXTRACTED,
+                source_paper_id=extraction.paper_id,
+                source_section=relation.source_section,
+                source_quote=relation.source_quote,
+            )
+            self.add_edge(edge)
+            edge_writes.append(
+                EdgeWriteResult(
+                    relation=relation.relation.value,
+                    edge_id=edge.id,
+                    source_id=source_id,
+                    target_id=target_id,
+                )
+            )
+
+        return GraphIngestionReport(
+            paper_id=extraction.paper_id,
+            paper_node_id=paper_node.id,
+            node_writes=node_writes,
+            edge_writes=edge_writes,
+        )
+
+    def _resolve_relation_endpoint(
+        self,
+        paper_id: str,
+        name: str,
+        entity_to_node_id: dict[str, str],
+    ) -> str:
+        if name in entity_to_node_id:
+            return entity_to_node_id[name]
+
+        canonical = self.canonicalize(name, node_type=NodeType.CONCEPT)
+        if canonical.decision == "auto_merge" and canonical.matched_node_id:
+            return canonical.matched_node_id
+
+        node_id = self._stable_node_id(paper_id, name, NodeType.CONCEPT)
+        self.add_node(
+            Node(
+                id=node_id,
+                type=NodeType.CONCEPT,
+                name=name,
+                description="Implicit relation endpoint from extraction",
+            )
+        )
+        entity_to_node_id[name] = node_id
+        return node_id
