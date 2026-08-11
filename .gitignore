@@ -7,3 +7,12 @@ __pycache__/
 .DS_Store
 corpus/*.pdf
 corpus/.discarded-test-files/
+
+# GCP credential files - this project uses ADC (gcloud auth
+# application-default login), never a downloaded service account key, but
+# ignore the common patterns anyway in case one ever lands here.
+*-service-account*.json
+client_secret*.json
+*.pem
+*.key
+application_default_credentials.json
