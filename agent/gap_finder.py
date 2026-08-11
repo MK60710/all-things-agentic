@@ -39,9 +39,13 @@ class GapCandidate(BaseModel):
     explanation: str | None = None
 
 
+def _format_shared_context(evidence: list[str]) -> str:
+    return ", ".join(evidence) if evidence else "no shared neighbors"
+
+
 def _default_explain(name_a: str, name_b: str, evidence: list[str]) -> str:
     """Placeholder until wired to a real Gemini call inside the ADK agent."""
-    shared = ", ".join(evidence) if evidence else "no shared neighbors"
+    shared = _format_shared_context(evidence)
     return (
         f"{name_a} and {name_b} share context ({shared}) but have no direct "
         f"connection in the graph — worth checking if that's a real gap."
@@ -91,24 +95,37 @@ class GeminiExplainer:
         self._model = model
         self._timeout_ms = timeout_ms
         self._max_output_tokens = max_output_tokens
-        self._client = client or genai.Client(
-            vertexai=True,
-            project=project or os.environ.get("GOOGLE_CLOUD_PROJECT"),
-            location=location or os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1"),
-        )
+        self._project = project
+        self._location = location
+        # Constructed lazily on first call, inside the same try/except that
+        # covers generate_content - a bad ADC/project config previously
+        # raised here in __init__, outside any fallback path, contradicting
+        # this class's own promise that auth/config issues never break
+        # gap-finding.
+        self._client = client
+
+    def _get_client(self) -> genai.Client:
+        if self._client is None:
+            self._client = genai.Client(
+                vertexai=True,
+                project=self._project or os.environ.get("GOOGLE_CLOUD_PROJECT"),
+                location=self._location
+                or os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1"),
+            )
+        return self._client
 
     def __call__(self, name_a: str, name_b: str, evidence: list[str]) -> str:
         name_a = _sanitize_prompt_field(name_a)
         name_b = _sanitize_prompt_field(name_b)
         evidence = [_sanitize_prompt_field(e) for e in evidence]
-        shared = ", ".join(evidence) if evidence else "no shared neighbors"
+        shared = _format_shared_context(evidence)
         contents = (
             f"Entity A: {name_a}\n"
             f"Entity B: {name_b}\n"
             f"Shared context (common neighbors): {shared}"
         )
         try:
-            response = self._client.models.generate_content(
+            response = self._get_client().models.generate_content(
                 model=self._model,
                 contents=contents,
                 config=genai_types.GenerateContentConfig(
@@ -128,6 +145,9 @@ class GeminiExplainer:
             text = (response.text or "").strip()
             if text:
                 return text
+            logger.warning(
+                "GeminiExplainer got an empty response, falling back to template"
+            )
         except Exception:
             # Never let a Gemini outage/quota/config issue break gap-finding
             # itself (candidates already come from graph topology), but log
@@ -141,6 +161,12 @@ class GeminiExplainer:
 
 
 class GapFinder:
+    """explain_fn defaults to the zero-dependency template, not
+    GeminiExplainer - same "safe by default, opt-in for real" pattern as
+    ChunkOnlyStructuredExtractor in extraction_agent.py. The real ADK tool
+    wiring (not built yet) should construct GapFinder(gm,
+    explain_fn=GeminiExplainer()) explicitly."""
+
     def __init__(
         self,
         graph_manager: GraphManager,
