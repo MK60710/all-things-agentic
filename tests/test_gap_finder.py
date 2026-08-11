@@ -42,6 +42,18 @@ def _stub_explain(name_a: str, name_b: str, evidence: list[str]) -> str:
     return f"stub explanation: {name_a} / {name_b} / {evidence}"
 
 
+def test_gap_finder_defaults_to_template_not_gemini(fake_db):
+    """GapFinder's bare default must stay the zero-dependency template - a
+    caller with no explicit explain_fn should never trigger a Gemini
+    call/require GCP credentials just to construct GapFinder."""
+    gm, a, b, shared = _populated_graph(fake_db)
+    gf = GapFinder(gm)  # no explain_fn override
+
+    candidates = gf.find_candidates()
+
+    assert "share context" in candidates[0].explanation
+
+
 def test_find_candidates_surfaces_sparse_pair_with_evidence(fake_db):
     gm, a, b, shared = _populated_graph(fake_db)
     gf = GapFinder(gm, explain_fn=_stub_explain)
@@ -173,18 +185,38 @@ def test_gemini_explainer_strips_newlines_from_untrusted_fields():
     assert lines[1] == "Entity B: Attention"
 
 
-def test_gemini_explainer_falls_back_on_empty_response():
+def test_gemini_explainer_falls_back_on_empty_response(caplog):
     fake_client = _FakeGenaiClient(text="   ")
     explainer = GeminiExplainer(client=fake_client)
 
-    result = explainer("A", "B", [])
+    with caplog.at_level("WARNING"):
+        result = explainer("A", "B", [])
 
     assert "share context" in result  # the deterministic template's phrasing
+    # An empty response must be logged too, not just exceptions - otherwise
+    # this degrades silently with zero observability.
+    assert "empty response" in caplog.text
 
 
 def test_gemini_explainer_falls_back_on_exception():
     fake_client = _FakeGenaiClient(error=RuntimeError("quota exceeded"))
     explainer = GeminiExplainer(client=fake_client)
+
+    result = explainer("A", "B", ["Evidence"])
+
+    assert "share context" in result  # never raises, degrades to the template
+
+
+def test_gemini_explainer_falls_back_when_client_construction_fails(monkeypatch):
+    """A bad ADC/project config must not raise from __call__ just because
+    the client hadn't been constructed yet - construction is lazy and
+    happens inside the same try/except as the API call itself."""
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("could not resolve project for API calls")
+
+    monkeypatch.setattr("agent.gap_finder.genai.Client", _raise)
+    explainer = GeminiExplainer()  # no client injected - constructs lazily
 
     result = explainer("A", "B", ["Evidence"])
 
