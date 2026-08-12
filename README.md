@@ -71,3 +71,30 @@ print(context.text)
 `assemble_context` retrieves the strongest chunks, includes adjacent context,
 deduplicates overlaps, restores paper order, and renders paper/page/section
 labels. Its output can be shown directly or passed to an optional answer model.
+
+## Vertex structured extraction
+
+Vertex AI uses Application Default Credentials rather than an API key:
+
+```bash
+gcloud auth application-default login
+gcloud auth application-default set-quota-project "$GOOGLE_CLOUD_PROJECT"
+```
+
+```python
+from agent.extraction_agent import ExtractionAgent
+from agent.gemini_extractor import GeminiStructuredExtractor
+
+extractor = ExtractionAgent(
+    structured_extractor=GeminiStructuredExtractor(
+        project="all-things-agentic-hack",
+        location="global",
+    )
+)
+outcome = extractor.extract_one("paper-1", "paper.pdf")
+```
+
+The default model is `gemini-2.5-flash-lite` with thinking disabled and a
+2,048-token output cap. Calls are bounded by source-window and per-paper limits.
+Only relations with source quotes found in the supplied source window and valid
+ontology endpoint signatures are retained.
