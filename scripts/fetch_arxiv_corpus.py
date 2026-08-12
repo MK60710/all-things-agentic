@@ -71,7 +71,11 @@ def download_papers(papers: list[dict], out_dir: Path) -> list[dict]:
             response.raise_for_status()
             local_path.write_bytes(response.content)
             time.sleep(1)  # be polite to arXiv's servers
-        manifest.append({**paper, "local_path": str(local_path)})
+        try:
+            portable_path = local_path.relative_to(CORPUS_DIR.parent)
+        except ValueError:
+            portable_path = local_path
+        manifest.append({**paper, "local_path": portable_path.as_posix()})
     return manifest
 
 

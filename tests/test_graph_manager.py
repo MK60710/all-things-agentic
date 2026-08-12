@@ -2,8 +2,19 @@ from __future__ import annotations
 
 import uuid
 
-from agent.graph_manager import GraphManager
-from agent.schema import Edge, EdgeType, Node, NodeType, ProvenanceTag
+import pytest
+
+from agent.graph_manager import GraphManager, _cosine_similarity
+from agent.schema import (
+    Edge,
+    EdgeType,
+    ExtractionResult,
+    ExtractedEntity,
+    ExtractedRelation,
+    Node,
+    NodeType,
+    ProvenanceTag,
+)
 
 
 def _make_manager(fake_db) -> GraphManager:
@@ -99,6 +110,10 @@ def test_canonicalize_low_similarity_is_new(fake_db):
     assert result.decision == "new"
 
 
+def test_cosine_similarity_rejects_dimension_mismatch():
+    assert _cosine_similarity([1.0, 0.0, 0.0], [1.0, 0.0]) == 0.0
+
+
 def test_resolve_alias_merge_writes_same_as_edge(fake_db):
     gm = _make_manager(fake_db)
     canonical, alias = _node("LLM Agent"), _node("Language Model Agent")
@@ -150,3 +165,94 @@ def test_rehydrate_loads_existing_data(fake_db):
     # New GraphManager instance, same fake_db — simulates Cloud Run cold start.
     gm2 = _make_manager(fake_db)
     assert node.id in gm2.graph
+
+
+def test_apply_extraction_result_is_idempotent(fake_db):
+    gm = _make_manager(fake_db)
+    extraction = ExtractionResult(
+        paper_id="paper-1",
+        entities=[
+            ExtractedEntity(
+                name="Chain of Thought",
+                type=NodeType.CONCEPT,
+                description="Reasoning style",
+            ),
+            ExtractedEntity(
+                name="Reasoning",
+                type=NodeType.CONCEPT,
+                description="Inference process",
+            ),
+        ],
+        relations=[
+            ExtractedRelation(
+                source_entity="Chain of Thought",
+                relation=EdgeType.SUPPORTS,
+                target_entity="Reasoning",
+                source_quote="Chain of thought prompts can support reasoning.",
+                source_section="Introduction",
+            )
+        ],
+        chunks=["chunk one"],
+    )
+
+    first = gm.apply_extraction_result(extraction, paper_name="Paper Title")
+    second = gm.apply_extraction_result(extraction, paper_name="Paper Title")
+
+    assert first.paper_node_id != "paper-1"
+    assert len(first.node_writes) == 2
+    assert len(first.edge_writes) == 1
+    assert gm.graph.number_of_nodes() == 3
+    assert gm.graph.number_of_edges() == 1
+    assert second.edge_writes[0].edge_id == first.edge_writes[0].edge_id
+
+
+def test_relation_endpoint_uses_declared_entity_type(fake_db):
+    gm = _make_manager(fake_db)
+    extraction = ExtractionResult(
+        paper_id="paper/unsafe",
+        entities=[
+            ExtractedEntity(name="BERT", type=NodeType.MODEL, description="Model")
+        ],
+        relations=[
+            ExtractedRelation(
+                source_entity=" bert ",
+                source_type=NodeType.MODEL,
+                relation=EdgeType.USES,
+                target_entity="Attention",
+                target_type=NodeType.CONCEPT,
+                source_quote="BERT uses attention.",
+            )
+        ],
+    )
+
+    report = gm.apply_extraction_result(extraction)
+
+    model_id = report.node_writes[0].node_id
+    assert report.edge_writes[0].source_id == model_id
+    assert "/" not in report.paper_node_id
+
+
+def test_ambiguous_untyped_relation_endpoint_is_rejected(fake_db):
+    gm = _make_manager(fake_db)
+    extraction = ExtractionResult(
+        paper_id="paper-1",
+        entities=[
+            ExtractedEntity(
+                name="Attention", type=NodeType.METHOD, description="Method"
+            ),
+            ExtractedEntity(
+                name="Attention", type=NodeType.CONCEPT, description="Concept"
+            ),
+        ],
+        relations=[
+            ExtractedRelation(
+                source_entity="Attention",
+                relation=EdgeType.SUPPORTS,
+                target_entity="Reasoning",
+                source_quote="Attention supports reasoning.",
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="ambiguous relation endpoint"):
+        gm.apply_extraction_result(extraction)
