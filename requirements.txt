@@ -1,0 +1,11 @@
+google-adk>=1.0.0
+google-genai>=1.0.0
+google-cloud-firestore>=2.19.0
+networkx>=3.3
+pymupdf>=1.25.0
+pydantic>=2.9
+requests>=2.32
+
+# Optional local-semantic embeddings (opt-in ONNX model download, kept out
+# of the base install to match pyproject.toml's local-semantic extra):
+# fastembed>=0.7.0

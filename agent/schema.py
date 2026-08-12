@@ -8,7 +8,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from enum import Enum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class NodeType(str, Enum):
@@ -84,10 +84,32 @@ class ExtractedRelation(BaseModel):
     """
 
     source_entity: str
+    source_type: NodeType | None = None
     relation: EdgeType
     target_entity: str
+    target_type: NodeType | None = None
     source_quote: str
     source_section: str | None = None
+
+    @field_validator("source_quote")
+    @classmethod
+    def source_quote_must_contain_evidence(cls, value: str) -> str:
+        quote = value.strip()
+        if not quote:
+            raise ValueError("extracted relations require a non-empty source quote")
+        return quote
+
+
+class ExtractionChunk(BaseModel):
+    """A citation-ready chunk while retaining the legacy text-only field."""
+
+    text: str
+    ordinal: int
+    page_start: int | None = None
+    page_end: int | None = None
+    section: str | None = None
+    source: str = "pdf_text"
+    content_type: str = "prose"
 
 
 class ExtractionResult(BaseModel):
@@ -97,3 +119,4 @@ class ExtractionResult(BaseModel):
     entities: list[ExtractedEntity]
     relations: list[ExtractedRelation]
     chunks: list[str] = Field(default_factory=list)
+    chunk_metadata: list[ExtractionChunk] = Field(default_factory=list)
