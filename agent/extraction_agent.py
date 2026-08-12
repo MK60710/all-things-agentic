@@ -104,6 +104,26 @@ class ExtractionAgent:
             result = self._structured_extractor.extract(document)
             if result.paper_id != paper_id:
                 result = result.model_copy(update={"paper_id": paper_id})
+            if result.skipped_windows:
+                # A structured extractor can return a "successful" result
+                # that's actually partial - some of its source windows
+                # failed and were skipped rather than raising (see
+                # GeminiStructuredExtractor). Without this check, a
+                # partial extraction is indistinguishable from a clean
+                # one at the ExtractionOutcome.ok level, and a caller
+                # relying on fail_closed=False's chunks-only fallback for
+                # this scenario would never see it triggered.
+                issue = ExtractionIssue(
+                    paper_id=paper_id,
+                    stage="structured_extraction",
+                    message=(
+                        f"{result.skipped_windows} of the paper's source "
+                        "window(s) failed and were skipped; result is partial"
+                    ),
+                )
+                return ExtractionOutcome(
+                    paper_id=paper_id, document=document, result=result, issue=issue
+                )
             return ExtractionOutcome(paper_id=paper_id, document=document, result=result)
         except Exception as exc:
             issue = ExtractionIssue(
