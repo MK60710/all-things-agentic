@@ -9,9 +9,9 @@ surfaced next (the Day 16 verification checkpoint in the plan).
 
 from __future__ import annotations
 
+import json
 import logging
 import os
-import re
 import uuid
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -63,13 +63,14 @@ _GEMINI_SYSTEM_INSTRUCTION = (
 )
 
 
-def _sanitize_prompt_field(value: str) -> str:
-    """Strip newlines from untrusted entity/evidence text before it goes
-    into the Gemini prompt, so it can't fake being additional structured
-    lines. This is a narrower version of the same risk already fixed in
-    retrieval.py's assemble_context header - entity names ultimately trace
-    back to extracted, untrusted document content."""
-    return re.sub(r"[\r\n]+", " ", value).strip()
+def _escape_tag_delimiters(value: str) -> str:
+    """Escape the angle brackets that delimit the <gap_candidate> wrapper
+    below. json.dumps() escapes JSON-syntax characters (quotes, newlines),
+    not '<'/'>', so untrusted entity/evidence text - which ultimately traces
+    back to extracted document content - could otherwise close the tag
+    early and forge a fake payload of its own. Same fix, same reasoning, as
+    assemble_context's <source_metadata> wrapper in retrieval.py."""
+    return value.replace("<", "&lt;").replace(">", "&gt;")
 
 
 class GeminiExplainer:
@@ -115,14 +116,16 @@ class GeminiExplainer:
         return self._client
 
     def __call__(self, name_a: str, name_b: str, evidence: list[str]) -> str:
-        name_a = _sanitize_prompt_field(name_a)
-        name_b = _sanitize_prompt_field(name_b)
-        evidence = [_sanitize_prompt_field(e) for e in evidence]
         shared = _format_shared_context(evidence)
+        payload = {
+            "entity_a": _escape_tag_delimiters(name_a),
+            "entity_b": _escape_tag_delimiters(name_b),
+            "shared_context": _escape_tag_delimiters(shared),
+        }
         contents = (
-            f"Entity A: {name_a}\n"
-            f"Entity B: {name_b}\n"
-            f"Shared context (common neighbors): {shared}"
+            "<gap_candidate>"
+            + json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+            + "</gap_candidate>"
         )
         try:
             response = self._get_client().models.generate_content(
