@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import unicodedata
 from collections.abc import Iterable
@@ -10,7 +11,9 @@ from typing import Any
 
 from google import genai
 from google.genai import types
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
+
+logger = logging.getLogger(__name__)
 
 from agent.document_ingestion import DocumentIngestionResult
 from agent.schema import (
@@ -116,7 +119,22 @@ class GeminiStructuredExtractor:
         relations: dict[tuple[str, str, str, str], ExtractedRelation] = {}
 
         for source in windows[: self._max_calls_per_paper]:
-            semantic = self._extract_window(source)
+            try:
+                semantic = self._extract_window(source)
+            except ValidationError:
+                # A window unusually dense in entities/relations can have
+                # its JSON response cut off by max_output_tokens, producing
+                # invalid JSON (confirmed live: a real paper's window
+                # failed with "EOF while parsing a string"). Skip just this
+                # window rather than letting one truncated window discard
+                # every other window's already-successfully-extracted
+                # entities/relations for the whole paper.
+                logger.warning(
+                    "GeminiStructuredExtractor: window produced invalid/"
+                    "truncated JSON, skipping this window",
+                    exc_info=True,
+                )
+                continue
             verified = []
             for relation in semantic.relations:
                 if not has_valid_signature(relation):
@@ -182,7 +200,15 @@ class GeminiStructuredExtractor:
                 response_mime_type="application/json",
                 response_schema=SemanticExtraction,
                 temperature=0,
-                max_output_tokens=2048,
+                # 2048 was measured live against a real corpus paper: half
+                # its windows truncated mid-JSON (usage_metadata showed
+                # they hit the cap exactly). Real per-window usage on that
+                # paper ranged ~2300-5100 tokens; 8192 leaves headroom
+                # without being unbounded. A truncated call still gets
+                # billed and then fully discarded by the ValidationError
+                # handling below, so this cap being too low was strictly
+                # worse for cost too, not just correctness.
+                max_output_tokens=8192,
                 thinking_config=types.ThinkingConfig(thinking_budget=0),
             ),
         )
