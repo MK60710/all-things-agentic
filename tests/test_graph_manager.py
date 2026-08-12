@@ -120,7 +120,9 @@ def test_resolve_alias_merge_writes_same_as_edge(fake_db):
     gm.add_node(canonical)
     gm.add_node(alias)
     gm.resolve_alias(canonical.id, alias.id)
+    gm.resolve_alias(canonical.id, alias.id)
     edges = list(gm.graph.get_edge_data(alias.id, canonical.id).values())
+    assert len(edges) == 1
     assert edges[0]["type"] == EdgeType.SAME_AS.value
     assert edges[0]["provenance"] == ProvenanceTag.INFERRED.value
 
@@ -134,6 +136,9 @@ def test_resolve_alias_distinct_prevents_recollision(fake_db):
     gm.add_node(b)
     gm.resolve_alias(a.id, b.id, distinct=True)
     assert tuple(sorted((a.id, b.id))) in gm._known_distinct
+
+    rehydrated = _make_manager(fake_db)
+    assert tuple(sorted((a.id, b.id))) in rehydrated._known_distinct
 
 
 def test_find_sparse_pairs_requires_common_neighbor(fake_db):
@@ -256,3 +261,35 @@ def test_ambiguous_untyped_relation_endpoint_is_rejected(fake_db):
 
     with pytest.raises(ValueError, match="ambiguous relation endpoint"):
         gm.apply_extraction_result(extraction)
+
+
+def test_extracted_paper_entity_reuses_source_paper_node(fake_db):
+    gm = _make_manager(fake_db)
+    extraction = ExtractionResult(
+        paper_id="paper-1",
+        entities=[
+            ExtractedEntity(
+                name="Paper Title", type=NodeType.PAPER, description="Paper"
+            ),
+            ExtractedEntity(
+                name="Method X", type=NodeType.METHOD, description="Method"
+            ),
+        ],
+        relations=[
+            ExtractedRelation(
+                source_entity="Paper Title",
+                source_type=NodeType.PAPER,
+                relation=EdgeType.PROPOSES,
+                target_entity="Method X",
+                target_type=NodeType.METHOD,
+                source_quote="Paper Title proposes Method X.",
+            )
+        ],
+    )
+
+    report = gm.apply_extraction_result(extraction, paper_name="Paper Title")
+
+    assert gm.graph.number_of_nodes() == 2
+    assert report.node_writes[0].node_id == report.paper_node_id
+    assert report.node_writes[0].reused_existing_node is True
+    assert report.edge_writes[0].source_id == report.paper_node_id
