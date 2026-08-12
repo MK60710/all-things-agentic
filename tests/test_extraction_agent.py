@@ -63,6 +63,28 @@ class _FailingStructuredExtractor:
         raise RuntimeError("structured extraction failed")
 
 
+class _PartiallyFailingStructuredExtractor:
+    """Returns successfully (does not raise) but with skipped_windows set,
+    the shape GeminiStructuredExtractor produces when some of a paper's
+    windows failed and were skipped rather than discarding the whole
+    result."""
+
+    def extract(self, document: DocumentIngestionResult) -> ExtractionResult:
+        return ExtractionResult(
+            paper_id=document.paper_id,
+            entities=[
+                ExtractedEntity(
+                    name="Chain of Thought",
+                    type=NodeType.CONCEPT,
+                    description="Reasoning style",
+                ),
+            ],
+            relations=[],
+            chunks=document.chunks,
+            skipped_windows=2,
+        )
+
+
 def test_extract_one_uses_structured_extractor():
     agent = ExtractionAgent(
         document_extractor=_FakeDocumentExtractor(),
@@ -161,3 +183,24 @@ def test_extract_one_fails_closed_when_structuring_fails():
 
     assert outcome.result is None
     assert outcome.issue is not None
+
+
+def test_extract_one_reports_partial_result_as_not_ok():
+    """A structured extractor can return without raising but with
+    skipped_windows set (some source windows failed and were dropped) -
+    that must not be indistinguishable from a clean success at the
+    ExtractionOutcome.ok level, or fail_closed callers have no way to
+    detect the extraction was incomplete."""
+    agent = ExtractionAgent(
+        document_extractor=_FakeDocumentExtractor(),
+        structured_extractor=_PartiallyFailingStructuredExtractor(),
+    )
+
+    outcome = agent.extract_one("paper-1", "paper.pdf")
+
+    assert outcome.ok is False
+    assert outcome.result is not None
+    assert len(outcome.result.entities) == 1  # partial data still usable
+    assert outcome.issue is not None
+    assert outcome.issue.stage == "structured_extraction"
+    assert "2" in outcome.issue.message

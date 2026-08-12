@@ -11,7 +11,7 @@ from typing import Any
 
 from google import genai
 from google.genai import types
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
@@ -117,21 +117,28 @@ class GeminiStructuredExtractor:
         windows = list(self._windows(document.chunk_metadata, document.chunks))
         entities: dict[tuple[str, str], ExtractedEntity] = {}
         relations: dict[tuple[str, str, str, str], ExtractedRelation] = {}
+        skipped_windows = 0
 
         for source in windows[: self._max_calls_per_paper]:
             try:
                 semantic = self._extract_window(source)
-            except ValidationError:
-                # A window unusually dense in entities/relations can have
-                # its JSON response cut off by max_output_tokens, producing
-                # invalid JSON (confirmed live: a real paper's window
-                # failed with "EOF while parsing a string"). Skip just this
-                # window rather than letting one truncated window discard
-                # every other window's already-successfully-extracted
-                # entities/relations for the whole paper.
+            except Exception:
+                # Any per-window failure - truncated/invalid model JSON
+                # (ValidationError; confirmed live: a real paper's window
+                # failed with "EOF while parsing a string"), a transient
+                # Vertex AI error, timeout, or safety-filter block - must
+                # not discard every other window's already-successfully-
+                # extracted entities/relations for the whole paper.
+                # Catching broadly (not just ValidationError) matters: a
+                # narrower catch here would let a non-JSON failure on one
+                # window reproduce the exact same whole-paper data loss
+                # this handling exists to prevent, just via a different
+                # exception type. skipped_windows is surfaced on the
+                # result so a partial extraction is never mistaken for a
+                # clean one by callers.
+                skipped_windows += 1
                 logger.warning(
-                    "GeminiStructuredExtractor: window produced invalid/"
-                    "truncated JSON, skipping this window",
+                    "GeminiStructuredExtractor: window failed, skipping",
                     exc_info=True,
                 )
                 continue
@@ -163,6 +170,7 @@ class GeminiStructuredExtractor:
             relations=list(relations.values()),
             chunks=document.chunks,
             chunk_metadata=document.chunk_metadata,
+            skipped_windows=skipped_windows,
         )
 
     def _extract_window(self, source: str) -> SemanticExtraction:
