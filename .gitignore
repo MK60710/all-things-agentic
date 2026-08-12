@@ -7,3 +7,4 @@ __pycache__/
 .DS_Store
 corpus/*.pdf
 corpus/.discarded-test-files/
+docs/

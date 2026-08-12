@@ -115,6 +115,12 @@ class GraphManager:
             self.graph.add_edge(
                 data["source_id"], data["target_id"], key=doc.id, **data
             )
+        for doc in self._db.collection("canonicalization_corrections").stream():
+            data = doc.to_dict()
+            if data.get("decision") == "distinct":
+                self._known_distinct.add(
+                    tuple(sorted((data["first_node_id"], data["second_node_id"])))
+                )
 
     # ---- Write tools ----
 
@@ -150,10 +156,32 @@ class GraphManager:
         again later in the batch.
         """
         if distinct:
-            self._known_distinct.add(tuple(sorted((canonical_id, alias_id))))
+            pair = tuple(sorted((canonical_id, alias_id)))
+            self._known_distinct.add(pair)
+            correction_id = str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"canonicalization:distinct:{pair[0]}:{pair[1]}",
+                )
+            )
+            self._db.collection("canonicalization_corrections").document(
+                correction_id
+            ).set(
+                {
+                    "decision": "distinct",
+                    "first_node_id": pair[0],
+                    "second_node_id": pair[1],
+                },
+                merge=True,
+            )
             return
         edge = Edge(
-            id=str(uuid.uuid4()),
+            id=str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"same_as:{alias_id}:{canonical_id}",
+                )
+            ),
             source_id=alias_id,
             target_id=canonical_id,
             type=EdgeType.SAME_AS,
@@ -282,6 +310,20 @@ class GraphManager:
         entity_to_node_id: dict[tuple[str, NodeType], str] = {}
         node_writes: list[NodeWriteResult] = []
         for entity in extraction.entities:
+            if entity.type == NodeType.PAPER:
+                entity_to_node_id[
+                    (_normalize_name(entity.name), entity.type)
+                ] = paper_node.id
+                node_writes.append(
+                    NodeWriteResult(
+                        entity_name=entity.name,
+                        node_id=paper_node.id,
+                        decision="auto_merge",
+                        score=1.0,
+                        reused_existing_node=True,
+                    )
+                )
+                continue
             embedding = embedding_fn(entity) if embedding_fn is not None else None
             canonical = self.canonicalize(
                 entity.name, embedding=embedding, node_type=entity.type
