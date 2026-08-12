@@ -84,8 +84,10 @@ class ExtractedRelation(BaseModel):
     """
 
     source_entity: str
+    source_type: NodeType | None = None
     relation: EdgeType
     target_entity: str
+    target_type: NodeType | None = None
     source_quote: str
     source_section: str | None = None
 

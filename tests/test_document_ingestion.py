@@ -88,6 +88,8 @@ def test_pdf_text_extractor_falls_back_to_ocr(tmp_path, monkeypatch):
 
     assert result.used_ocr is True
     assert result.raw_text == "OCR recovered text"
+    assert result.pages[0].source == "ocr"
+    assert result.chunk_metadata[0].source == "ocr"
     assert "used_ocr_fallback" in result.warnings
     # Pages/chunks from this path must be labeled "ocr", not the default
     # "pdf_text" - downstream consumers rely on this to flag lower-
@@ -160,5 +162,21 @@ def test_pdf_text_extractor_fails_without_pdf(tmp_path, monkeypatch):
         extractor.extract("paper-missing", missing)
     except DocumentExtractionError as exc:
         assert "PDF not found" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("expected DocumentExtractionError")
+
+
+def test_pdf_text_extractor_rejects_path_outside_allowed_root(tmp_path):
+    allowed = tmp_path / "uploads"
+    allowed.mkdir()
+    outside = tmp_path / "private.pdf"
+    outside.write_bytes(b"%PDF-1.4 fake")
+
+    extractor = PdfTextExtractor(allowed_root=allowed)
+
+    try:
+        extractor.extract("paper-1", outside)
+    except DocumentExtractionError as exc:
+        assert "outside the allowed root" in str(exc)
     else:  # pragma: no cover - defensive
         raise AssertionError("expected DocumentExtractionError")

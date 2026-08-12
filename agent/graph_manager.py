@@ -180,6 +180,9 @@ class GraphManager:
             )
         )
 
+    def _stable_paper_node_id(self, paper_id: str) -> str:
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"paper:{paper_id}"))
+
     def _stable_edge_id(
         self,
         paper_id: str,
@@ -268,18 +271,15 @@ class GraphManager:
     ) -> GraphIngestionReport:
         """Persist structured extraction output with stable, retry-safe IDs."""
 
-        # paper_id is caller-supplied (an ADK tool call could eventually
-        # drive this per the module docstring), so it's hashed the same way
-        # as every other id here rather than used raw as a graph/Firestore id.
         paper_node = Node(
-            id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"node:paper:{extraction.paper_id}")),
+            id=self._stable_paper_node_id(extraction.paper_id),
             type=NodeType.PAPER,
             name=paper_name or extraction.paper_id,
             description="Source paper",
         )
         self.add_node(paper_node)
 
-        entity_to_node_id: dict[str, str] = {}
+        entity_to_node_id: dict[tuple[str, NodeType], str] = {}
         node_writes: list[NodeWriteResult] = []
         for entity in extraction.entities:
             embedding = embedding_fn(entity) if embedding_fn is not None else None
@@ -303,12 +303,7 @@ class GraphManager:
                     )
                 )
                 reused = False
-            # Relations only carry entity *names* (see ExtractedRelation), not
-            # types, so this map can't fully disambiguate two same-name,
-            # different-type entities from a single extraction. Keep the
-            # first occurrence deterministically rather than letting a later
-            # duplicate silently overwrite it depending on iteration order.
-            entity_to_node_id.setdefault(entity.name, node_id)
+            entity_to_node_id[(_normalize_name(entity.name), entity.type)] = node_id
             node_writes.append(
                 NodeWriteResult(
                     entity_name=entity.name,
@@ -322,10 +317,16 @@ class GraphManager:
         edge_writes: list[EdgeWriteResult] = []
         for relation in extraction.relations:
             source_id = self._resolve_relation_endpoint(
-                extraction.paper_id, relation.source_entity, entity_to_node_id
+                extraction.paper_id,
+                relation.source_entity,
+                relation.source_type,
+                entity_to_node_id,
             )
             target_id = self._resolve_relation_endpoint(
-                extraction.paper_id, relation.target_entity, entity_to_node_id
+                extraction.paper_id,
+                relation.target_entity,
+                relation.target_type,
+                entity_to_node_id,
             )
             edge = Edge(
                 id=self._stable_edge_id(
@@ -364,27 +365,40 @@ class GraphManager:
         self,
         paper_id: str,
         name: str,
-        entity_to_node_id: dict[str, str],
+        node_type: NodeType | None,
+        entity_to_node_id: dict[tuple[str, NodeType], str],
     ) -> str:
-        if name in entity_to_node_id:
-            return entity_to_node_id[name]
+        normalized = _normalize_name(name)
+        if node_type is not None:
+            exact = entity_to_node_id.get((normalized, node_type))
+            if exact is not None:
+                return exact
+        else:
+            matches = [
+                node_id
+                for (entity_name, _), node_id in entity_to_node_id.items()
+                if entity_name == normalized
+            ]
+            if len(set(matches)) == 1:
+                return matches[0]
+            if len(set(matches)) > 1:
+                raise ValueError(
+                    f"ambiguous relation endpoint {name!r}; source_type/target_type is required"
+                )
 
-        # No type is known for an implicit relation endpoint (relations only
-        # carry names), so search across all node types rather than
-        # restricting to CONCEPT, or an existing node of a different type
-        # (e.g. a MODEL) could never be matched here.
-        canonical = self.canonicalize(name, node_type=None)
+        canonical = self.canonicalize(name, node_type=node_type)
         if canonical.decision == "auto_merge" and canonical.matched_node_id:
             return canonical.matched_node_id
 
-        node_id = self._stable_node_id(paper_id, name, NodeType.CONCEPT)
+        resolved_type = node_type or NodeType.CONCEPT
+        node_id = self._stable_node_id(paper_id, name, resolved_type)
         self.add_node(
             Node(
                 id=node_id,
-                type=NodeType.CONCEPT,
+                type=resolved_type,
                 name=name,
                 description="Implicit relation endpoint from extraction",
             )
         )
-        entity_to_node_id[name] = node_id
+        entity_to_node_id[(normalized, resolved_type)] = node_id
         return node_id

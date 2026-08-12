@@ -58,6 +58,11 @@ class _FakeStructuredExtractor:
         )
 
 
+class _FailingStructuredExtractor:
+    def extract(self, document: DocumentIngestionResult) -> ExtractionResult:
+        raise RuntimeError("structured extraction failed")
+
+
 def test_extract_one_uses_structured_extractor():
     agent = ExtractionAgent(
         document_extractor=_FakeDocumentExtractor(),
@@ -130,3 +135,29 @@ def test_extract_batch_isolates_failure_per_paper():
     assert len(batch.failures) == 1
     assert batch.failures[0].paper_id == "paper-2"
     assert batch.failures[0].stage == "document_ingestion"
+
+
+def test_extract_one_can_degrade_to_chunks_when_structuring_fails():
+    agent = ExtractionAgent(
+        document_extractor=_FakeDocumentExtractor(),
+        structured_extractor=_FailingStructuredExtractor(),
+    )
+
+    outcome = agent.extract_one("paper-1", "paper.pdf", fail_closed=False)
+
+    assert outcome.result is not None
+    assert outcome.result.chunks == ["chunk one", "chunk two"]
+    assert outcome.issue is not None
+    assert outcome.issue.stage == "structured_extraction"
+
+
+def test_extract_one_fails_closed_when_structuring_fails():
+    agent = ExtractionAgent(
+        document_extractor=_FakeDocumentExtractor(),
+        structured_extractor=_FailingStructuredExtractor(),
+    )
+
+    outcome = agent.extract_one("paper-1", "paper.pdf", fail_closed=True)
+
+    assert outcome.result is None
+    assert outcome.issue is not None

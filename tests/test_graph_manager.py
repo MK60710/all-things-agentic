@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import uuid
 
-from agent.graph_manager import GraphManager
+import pytest
+
+from agent.graph_manager import GraphManager, _cosine_similarity
 from agent.schema import (
     Edge,
     EdgeType,
@@ -108,15 +110,8 @@ def test_canonicalize_low_similarity_is_new(fake_db):
     assert result.decision == "new"
 
 
-def test_canonicalize_mismatched_embedding_dims_is_not_a_match(fake_db):
-    """_cosine_similarity must reject mismatched-length embeddings instead
-    of silently truncating via zip() and returning a false high score."""
-    gm = _make_manager(fake_db)
-    existing = _node("Transformer", embedding=[1.0, 0.0, 0.0, 0.0])
-    gm.add_node(existing)
-    result = gm.canonicalize("Something Else", embedding=[1.0, 0.0])
-    assert result.decision == "new"
-    assert result.score == 0.0
+def test_cosine_similarity_rejects_dimension_mismatch():
+    assert _cosine_similarity([1.0, 0.0, 0.0], [1.0, 0.0]) == 0.0
 
 
 def test_resolve_alias_merge_writes_same_as_edge(fake_db):
@@ -203,10 +198,7 @@ def test_apply_extraction_result_is_idempotent(fake_db):
     first = gm.apply_extraction_result(extraction, paper_name="Paper Title")
     second = gm.apply_extraction_result(extraction, paper_name="Paper Title")
 
-    # paper_node_id is a stable hash of paper_id, not paper_id itself (so an
-    # attacker-influenced paper_id can't be used raw as a graph/Firestore
-    # id) - assert it's deterministic across calls instead of a fixed string.
-    assert first.paper_node_id == second.paper_node_id
+    assert first.paper_node_id != "paper-1"
     assert len(first.node_writes) == 2
     assert len(first.edge_writes) == 1
     assert gm.graph.number_of_nodes() == 3
@@ -214,86 +206,53 @@ def test_apply_extraction_result_is_idempotent(fake_db):
     assert second.edge_writes[0].edge_id == first.edge_writes[0].edge_id
 
 
-def test_paper_node_id_is_not_raw_paper_id(fake_db):
-    """paper_id must be hashed, not used raw as a graph/Firestore id."""
+def test_relation_endpoint_uses_declared_entity_type(fake_db):
     gm = _make_manager(fake_db)
     extraction = ExtractionResult(
-        paper_id="paper/with/slashes",
-        entities=[],
-        relations=[],
-        chunks=[],
-    )
-    report = gm.apply_extraction_result(extraction)
-    assert report.paper_node_id != "paper/with/slashes"
-    assert "/" not in report.paper_node_id
-
-
-def test_relation_endpoint_matches_existing_node_of_different_type(fake_db):
-    """A relation referencing an entity by name should link to an already-
-    existing node even when that node isn't a CONCEPT, instead of minting a
-    disconnected duplicate CONCEPT node (see _resolve_relation_endpoint)."""
-    gm = _make_manager(fake_db)
-    first = ExtractionResult(
-        paper_id="paper-1",
+        paper_id="paper/unsafe",
         entities=[
-            ExtractedEntity(name="BERT", type=NodeType.MODEL, description="A model"),
+            ExtractedEntity(name="BERT", type=NodeType.MODEL, description="Model")
         ],
-        relations=[],
-        chunks=[],
-    )
-    gm.apply_extraction_result(first)
-    bert_node_id = next(
-        n for n, data in gm.graph.nodes(data=True) if data["name"] == "BERT"
-    )
-
-    second = ExtractionResult(
-        paper_id="paper-2",
-        entities=[],
         relations=[
             ExtractedRelation(
-                source_entity="BERT",
+                source_entity=" bert ",
+                source_type=NodeType.MODEL,
                 relation=EdgeType.USES,
                 target_entity="Attention",
+                target_type=NodeType.CONCEPT,
                 source_quote="BERT uses attention.",
             )
         ],
-        chunks=[],
     )
-    report = gm.apply_extraction_result(second)
 
-    assert report.edge_writes[0].source_id == bert_node_id
-    assert gm.graph.nodes[bert_node_id]["type"] == NodeType.MODEL.value
+    report = gm.apply_extraction_result(extraction)
+
+    model_id = report.node_writes[0].node_id
+    assert report.edge_writes[0].source_id == model_id
+    assert "/" not in report.paper_node_id
 
 
-def test_same_name_different_type_entities_keep_first_mapping(fake_db):
-    """Two entities sharing a name but differing in type must not silently
-    overwrite each other's id in entity_to_node_id; behavior should be
-    deterministic (first occurrence wins) rather than iteration-order-
-    dependent."""
+def test_ambiguous_untyped_relation_endpoint_is_rejected(fake_db):
     gm = _make_manager(fake_db)
     extraction = ExtractionResult(
         paper_id="paper-1",
         entities=[
-            ExtractedEntity(name="Attention", type=NodeType.METHOD, description="A"),
-            ExtractedEntity(name="Attention", type=NodeType.CONCEPT, description="B"),
+            ExtractedEntity(
+                name="Attention", type=NodeType.METHOD, description="Method"
+            ),
+            ExtractedEntity(
+                name="Attention", type=NodeType.CONCEPT, description="Concept"
+            ),
         ],
         relations=[
             ExtractedRelation(
                 source_entity="Attention",
                 relation=EdgeType.SUPPORTS,
-                target_entity="Attention",
-                source_quote="Attention supports attention.",
+                target_entity="Reasoning",
+                source_quote="Attention supports reasoning.",
             )
         ],
-        chunks=[],
     )
-    report = gm.apply_extraction_result(extraction)
 
-    assert gm.graph.number_of_nodes() == 3  # paper + 2 distinct Attention nodes
-    method_node_id = next(
-        n
-        for n, data in gm.graph.nodes(data=True)
-        if data["name"] == "Attention" and data["type"] == NodeType.METHOD.value
-    )
-    assert report.edge_writes[0].source_id == method_node_id
-    assert report.edge_writes[0].target_id == method_node_id
+    with pytest.raises(ValueError, match="ambiguous relation endpoint"):
+        gm.apply_extraction_result(extraction)

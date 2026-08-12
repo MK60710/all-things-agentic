@@ -167,22 +167,18 @@ class PdfTextExtractor:
     ):
         self._ocr_fallback = ocr_fallback
         self._min_usable_chars = min_usable_chars
-        # Off by default so today's hardcoded-manifest caller is unaffected.
-        # Set this once pdf_path can come from anything other than the fixed
-        # corpus manifest, so extract() can't be pointed at an arbitrary
-        # local file (path traversal / arbitrary file read).
         self._allowed_root = Path(allowed_root).resolve() if allowed_root else None
 
     def extract(self, paper_id: str, pdf_path: str | Path) -> DocumentIngestionResult:
-        path = Path(pdf_path)
+        path = Path(pdf_path).resolve()
+        if self._allowed_root is not None and not path.is_relative_to(
+            self._allowed_root
+        ):
+            raise DocumentExtractionError(
+                f"PDF path is outside the allowed root: {path}"
+            )
         if not path.exists():
             raise DocumentExtractionError(f"PDF not found: {path}")
-        if self._allowed_root is not None:
-            resolved = path.resolve()
-            if self._allowed_root not in resolved.parents and resolved != self._allowed_root:
-                raise DocumentExtractionError(
-                    f"pdf_path {resolved} is outside the allowed root {self._allowed_root}"
-                )
 
         warnings: list[str] = []
         try:

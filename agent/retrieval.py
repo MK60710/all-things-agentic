@@ -8,6 +8,7 @@ without changing the index interface.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
 import uuid
@@ -30,14 +31,6 @@ _STOP_WORDS = {
 def _search_tokens(text: str) -> set[str]:
     tokens = re.findall(r"[a-z0-9]+", text.lower())
     return {token for token in tokens if token not in _STOP_WORDS}
-
-
-def _sanitize_header_field(value: str) -> str:
-    """Strip the delimiter characters that let extracted document text break
-    out of the '[Paper: ... | Section: ...]' structural header. This header
-    can be passed to an answer model (see README), so an untrusted PDF must
-    not be able to inject fake structure/instructions via its own text."""
-    return re.sub(r"[\[\]\r\n]", " ", value).strip()
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -140,19 +133,6 @@ class ChunkIndex:
     def upsert_paper(
         self, paper_id: str, chunks: list[str] | list[ExtractionChunk]
     ) -> list[str]:
-        # Re-processing a paper (fixed OCR, changed chunking params, etc.)
-        # must not leave the old chunk set behind, or search/context return
-        # duplicate and stale content for this paper indefinitely.
-        stale_ids = [
-            chunk_id
-            for chunk_id, record in self._records.items()
-            if record.paper_id == paper_id
-        ]
-        for chunk_id in stale_ids:
-            del self._records[chunk_id]
-            if self._db is not None:
-                self._db.collection("chunks").document(chunk_id).delete()
-
         prepared: list[tuple[ExtractionChunk, str, str]] = []
         for ordinal, value in enumerate(chunks):
             chunk = (
@@ -173,6 +153,20 @@ class ChunkIndex:
             prepared.append((chunk, normalized, chunk_id))
 
         chunk_ids = [chunk_id for _, _, chunk_id in prepared]
+        stale_ids = [
+            chunk_id
+            for chunk_id, record in self._records.items()
+            if record.paper_id == paper_id and chunk_id not in chunk_ids
+        ]
+        for chunk_id in stale_ids:
+            del self._records[chunk_id]
+        if self._db is not None:
+            persisted = self._db.collection("chunks")
+            matching = persisted.where("paper_id", "==", paper_id)
+            for snapshot in list(matching.stream()):
+                if snapshot.id not in chunk_ids:
+                    persisted.document(snapshot.id).delete()
+
         for index, (chunk, normalized, chunk_id) in enumerate(prepared):
             record = ChunkRecord(
                 id=chunk_id,
@@ -289,12 +283,17 @@ class ChunkIndex:
                 if record.page_start == record.page_end
                 else f"{record.page_start}-{record.page_end}"
             )
-            heading = f"[Paper: {_sanitize_header_field(record.paper_id)}"
+            metadata: dict[str, str] = {"paper_id": record.paper_id}
             if record.section:
-                heading += f" | Section: {_sanitize_header_field(record.section)}"
+                metadata["section"] = record.section
             if record.page_start is not None:
-                heading += f" | Page: {page}"
-            rendered = f"{heading}]\n{record.text}"
+                metadata["page"] = page
+            rendered = (
+                "<source_metadata>"
+                + json.dumps(metadata, ensure_ascii=True, separators=(",", ":"))
+                + "</source_metadata>\n"
+                + record.text
+            )
             if sections and used_characters + len(rendered) > max_characters:
                 break
             sections.append(rendered)
