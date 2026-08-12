@@ -33,6 +33,17 @@ def _search_tokens(text: str) -> set[str]:
     return {token for token in tokens if token not in _STOP_WORDS}
 
 
+def _escape_tag_delimiters(value: str) -> str:
+    """Escape the angle brackets that delimit assemble_context's
+    <source_metadata> wrapper. json.dumps() only escapes JSON-syntax
+    characters (quotes, backslashes) - it does nothing for '<'/'>', so an
+    untrusted paper_id/section/chunk text containing the literal string
+    "</source_metadata>" could still close the tag early and forge a fake
+    metadata block of its own. Every untrusted value placed near the tag
+    boundary needs this, not just the JSON-encoded fields."""
+    return value.replace("<", "&lt;").replace(">", "&gt;")
+
+
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
     if len(a) != len(b):
         return 0.0
@@ -283,16 +294,18 @@ class ChunkIndex:
                 if record.page_start == record.page_end
                 else f"{record.page_start}-{record.page_end}"
             )
-            metadata: dict[str, str] = {"paper_id": record.paper_id}
+            metadata: dict[str, str] = {
+                "paper_id": _escape_tag_delimiters(record.paper_id)
+            }
             if record.section:
-                metadata["section"] = record.section
+                metadata["section"] = _escape_tag_delimiters(record.section)
             if record.page_start is not None:
                 metadata["page"] = page
             rendered = (
                 "<source_metadata>"
                 + json.dumps(metadata, ensure_ascii=True, separators=(",", ":"))
                 + "</source_metadata>\n"
-                + record.text
+                + _escape_tag_delimiters(record.text)
             )
             if sections and used_characters + len(rendered) > max_characters:
                 break
