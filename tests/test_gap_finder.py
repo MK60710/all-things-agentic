@@ -286,3 +286,48 @@ def test_gap_finder_caches_explanation_across_calls(fake_db):
     gf.find_candidates()
 
     assert fake_client.models.call_count == 1  # not called again
+
+
+def test_gap_finder_retries_after_transient_gemini_failure(fake_db):
+    gm, a, b, shared = _populated_graph(fake_db)
+    fake_client = _FakeGenaiClient(error=RuntimeError("temporary outage"))
+    gf = GapFinder(gm, explain_fn=GeminiExplainer(client=fake_client))
+
+    first = gf.find_candidates()
+    assert "share context" in first[0].explanation
+
+    fake_client.models._error = None
+    fake_client.models._text = "Recovered Gemini explanation."
+    second = gf.find_candidates()
+
+    assert fake_client.models.call_count == 2
+    assert second[0].explanation == "Recovered Gemini explanation."
+
+
+def test_gap_finder_refreshes_explanation_when_graph_evidence_changes(fake_db):
+    gm, a, b, shared = _populated_graph(fake_db)
+    calls: list[list[str]] = []
+
+    def explain(name_a: str, name_b: str, evidence: list[str]) -> str:
+        calls.append(evidence)
+        return f"Evidence: {', '.join(evidence)}"
+
+    gf = GapFinder(gm, explain_fn=explain)
+    gf.find_candidates()
+
+    added = _node("New Shared Neighbor")
+    gm.add_node(added)
+    gm.add_edge(_edge(added.id, a.id))
+    gm.add_edge(_edge(added.id, b.id))
+    refreshed = gf.find_candidates(limit=10)
+    original_pair = next(
+        candidate
+        for candidate in refreshed
+        if {candidate.node_a_id, candidate.node_b_id} == {a.id, b.id}
+    )
+
+    assert any(
+        set(evidence) == {"Shared Neighbor", "New Shared Neighbor"}
+        for evidence in calls
+    )
+    assert "New Shared Neighbor" in original_pair.explanation
