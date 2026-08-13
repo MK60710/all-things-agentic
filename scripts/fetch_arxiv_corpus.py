@@ -73,8 +73,21 @@ def download_papers(papers: list[dict], out_dir: Path) -> list[dict]:
             time.sleep(1)  # be polite to arXiv's servers
         try:
             portable_path = local_path.relative_to(CORPUS_DIR.parent)
-        except ValueError:
-            portable_path = local_path
+        except ValueError as exc:
+            # This manifest gets committed - a silent fallback to the raw
+            # (potentially absolute) local_path here is exactly how a real
+            # absolute filesystem path leaked into git history once
+            # already (required a full-history rewrite to fix, and that
+            # rewrite still couldn't reach a closed PR's frozen ref on
+            # GitHub - see the 2026-08-13 security audit). Fail loudly
+            # instead: a non-default --out outside the repo needs a
+            # conscious decision, not a silent absolute-path commit.
+            raise SystemExit(
+                f"--out {out_dir} is outside the repo (not relative to "
+                f"{CORPUS_DIR.parent}) - refusing to write an absolute "
+                "path into manifest.json, since that file gets committed. "
+                "Use the default --out or a path inside the repo."
+            ) from exc
         manifest.append({**paper, "local_path": portable_path.as_posix()})
     return manifest
 
