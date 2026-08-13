@@ -29,6 +29,15 @@ logger = logging.getLogger(__name__)
 ExplainFn = Callable[[str, str, list[str]], str]
 
 
+class _ExplanationText(str):
+    """A string carrying whether it is safe for GapFinder to cache it."""
+
+    def __new__(cls, value: str, *, cacheable: bool):
+        instance = super().__new__(cls, value)
+        instance.cacheable = cacheable
+        return instance
+
+
 class GapCandidate(BaseModel):
     node_a_id: str
     node_b_id: str
@@ -147,7 +156,7 @@ class GeminiExplainer:
             )
             text = (response.text or "").strip()
             if text:
-                return text
+                return _ExplanationText(text, cacheable=True)
             logger.warning(
                 "GeminiExplainer got an empty response, falling back to template"
             )
@@ -160,7 +169,11 @@ class GeminiExplainer:
                 "GeminiExplainer call failed, falling back to template",
                 exc_info=True,
             )
-        return _default_explain(name_a, name_b, evidence)
+        # Preserve the string-returning ExplainFn API while marking transient
+        # fallbacks so GapFinder can retry Gemini on the next request.
+        return _ExplanationText(
+            _default_explain(name_a, name_b, evidence), cacheable=False
+        )
 
 
 class GapFinder:
@@ -184,7 +197,9 @@ class GapFinder:
         # find_candidates() again - without this, the same pair gets
         # re-explained by a fresh (paid) Gemini call every time even though
         # the explanation itself doesn't depend on the score/ranking.
-        self._explanation_cache: dict[tuple[str, str], str] = {}
+        self._explanation_cache: dict[
+            tuple[str, str, str, str, tuple[tuple[str, str], ...]], str
+        ] = {}
 
     def find_candidates(
         self, node_type: NodeType | None = None, limit: int = 5
@@ -215,19 +230,35 @@ class GapFinder:
         candidates.sort(key=lambda c: c.score, reverse=True)
         top = candidates[:limit]
         for c in top:
-            cache_key = tuple(sorted((c.node_a_id, c.node_b_id)))
+            # Explanations depend on names and shared evidence, not just the
+            # pair IDs. Including all prompt inputs prevents stale text after
+            # the mutable graph gains a neighbor or a node is renamed.
+            endpoints = sorted(
+                ((c.node_a_id, c.node_a_name), (c.node_b_id, c.node_b_name))
+            )
+            evidence = tuple(
+                sorted(
+                    (n, self._gm.graph.nodes[n].get("name", n))
+                    for n in c.common_neighbor_ids
+                )
+            )
+            cache_key = (
+                endpoints[0][0],
+                endpoints[0][1],
+                endpoints[1][0],
+                endpoints[1][1],
+                evidence,
+            )
             cached = self._explanation_cache.get(cache_key)
             if cached is not None:
                 c.explanation = cached
                 continue
-            evidence_names = [
-                self._gm.graph.nodes[n].get("name", n)
-                for n in c.common_neighbor_ids
-            ]
+            evidence_names = [name for _, name in evidence]
             c.explanation = self._explain_fn(
                 c.node_a_name, c.node_b_name, evidence_names
             )
-            self._explanation_cache[cache_key] = c.explanation
+            if getattr(c.explanation, "cacheable", True):
+                self._explanation_cache[cache_key] = c.explanation
         return top
 
     def record_feedback(
