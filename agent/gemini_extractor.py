@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import unicodedata
 from collections.abc import Iterable
@@ -11,6 +12,8 @@ from typing import Any
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 from agent.document_ingestion import DocumentIngestionResult
 from agent.schema import (
@@ -114,9 +117,31 @@ class GeminiStructuredExtractor:
         windows = list(self._windows(document.chunk_metadata, document.chunks))
         entities: dict[tuple[str, str], ExtractedEntity] = {}
         relations: dict[tuple[str, str, str, str], ExtractedRelation] = {}
+        skipped_windows = 0
 
         for source in windows[: self._max_calls_per_paper]:
-            semantic = self._extract_window(source)
+            try:
+                semantic = self._extract_window(source)
+            except Exception:
+                # Any per-window failure - truncated/invalid model JSON
+                # (ValidationError; confirmed live: a real paper's window
+                # failed with "EOF while parsing a string"), a transient
+                # Vertex AI error, timeout, or safety-filter block - must
+                # not discard every other window's already-successfully-
+                # extracted entities/relations for the whole paper.
+                # Catching broadly (not just ValidationError) matters: a
+                # narrower catch here would let a non-JSON failure on one
+                # window reproduce the exact same whole-paper data loss
+                # this handling exists to prevent, just via a different
+                # exception type. skipped_windows is surfaced on the
+                # result so a partial extraction is never mistaken for a
+                # clean one by callers.
+                skipped_windows += 1
+                logger.warning(
+                    "GeminiStructuredExtractor: window failed, skipping",
+                    exc_info=True,
+                )
+                continue
             verified = []
             for relation in semantic.relations:
                 if not has_valid_signature(relation):
@@ -145,6 +170,7 @@ class GeminiStructuredExtractor:
             relations=list(relations.values()),
             chunks=document.chunks,
             chunk_metadata=document.chunk_metadata,
+            skipped_windows=skipped_windows,
         )
 
     def _extract_window(self, source: str) -> SemanticExtraction:
@@ -182,7 +208,15 @@ class GeminiStructuredExtractor:
                 response_mime_type="application/json",
                 response_schema=SemanticExtraction,
                 temperature=0,
-                max_output_tokens=2048,
+                # 2048 was measured live against a real corpus paper: half
+                # its windows truncated mid-JSON (usage_metadata showed
+                # they hit the cap exactly). Real per-window usage on that
+                # paper ranged ~2300-5100 tokens; 8192 leaves headroom
+                # without being unbounded. A truncated call still gets
+                # billed and then fully discarded by the ValidationError
+                # handling below, so this cap being too low was strictly
+                # worse for cost too, not just correctness.
+                max_output_tokens=8192,
                 thinking_config=types.ThinkingConfig(thinking_budget=0),
             ),
         )
