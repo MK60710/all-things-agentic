@@ -120,3 +120,11 @@ class ExtractionResult(BaseModel):
     relations: list[ExtractedRelation]
     chunks: list[str] = Field(default_factory=list)
     chunk_metadata: list[ExtractionChunk] = Field(default_factory=list)
+    # Count of source windows a structured extractor failed to extract
+    # (truncated/invalid model output, API error, etc.) and skipped rather
+    # than letting take down the whole paper's result. A default-0 field so
+    # existing extractors (e.g. ChunkOnlyStructuredExtractor) that never
+    # experience this failure mode don't need to know about it, but
+    # ExtractionAgent checks it to avoid reporting a partial result as a
+    # clean, issue-free success.
+    skipped_windows: int = 0
