@@ -16,3 +16,4 @@ client_secret*.json
 *.key
 application_default_credentials.json
 docs/
+.claude/
