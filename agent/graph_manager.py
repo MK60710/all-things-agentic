@@ -8,6 +8,7 @@ can't trigger an unintended write through a read-path agent.
 
 from __future__ import annotations
 
+import logging
 import math
 import re
 import uuid
@@ -30,6 +31,8 @@ from agent.schema import (
     NodeType,
     ProvenanceTag,
 )
+
+logger = logging.getLogger(__name__)
 
 # Two-tier canonicalization thresholds. Above HIGH: auto-merge silently.
 # Below LOW: treat as genuinely new. In between: the concrete trigger
@@ -83,6 +86,11 @@ class GraphIngestionReport:
     paper_node_id: str
     node_writes: list[NodeWriteResult]
     edge_writes: list[EdgeWriteResult]
+    # Relations whose endpoint couldn't be resolved (e.g. an ambiguous
+    # untyped name matching more than one existing node) and were skipped
+    # rather than raising - see apply_extraction_result. Default 0 so
+    # existing callers/tests don't need to know about this field.
+    skipped_relations: int = 0
 
 
 class GraphManager:
@@ -357,19 +365,39 @@ class GraphManager:
             )
 
         edge_writes: list[EdgeWriteResult] = []
+        skipped_relations = 0
         for relation in extraction.relations:
-            source_id = self._resolve_relation_endpoint(
-                extraction.paper_id,
-                relation.source_entity,
-                relation.source_type,
-                entity_to_node_id,
-            )
-            target_id = self._resolve_relation_endpoint(
-                extraction.paper_id,
-                relation.target_entity,
-                relation.target_type,
-                entity_to_node_id,
-            )
+            try:
+                source_id = self._resolve_relation_endpoint(
+                    extraction.paper_id,
+                    relation.source_entity,
+                    relation.source_type,
+                    entity_to_node_id,
+                )
+                target_id = self._resolve_relation_endpoint(
+                    extraction.paper_id,
+                    relation.target_entity,
+                    relation.target_type,
+                    entity_to_node_id,
+                )
+            except ValueError:
+                # An untyped relation endpoint whose name matches more than
+                # one existing node in the graph is genuinely ambiguous
+                # (_resolve_relation_endpoint raises rather than guessing).
+                # By this point earlier entities/nodes in this same paper
+                # have already been durably written to Firestore via
+                # add_node - letting this exception propagate would abort
+                # the rest of the paper's relations with no report of what
+                # already landed. Skip just this one relation instead, the
+                # same per-unit isolation already applied to per-window
+                # extraction failures in gemini_extractor.py.
+                skipped_relations += 1
+                logger.warning(
+                    "GraphManager: relation endpoint ambiguous, skipping "
+                    "relation",
+                    exc_info=True,
+                )
+                continue
             edge = Edge(
                 id=self._stable_edge_id(
                     extraction.paper_id,
@@ -401,6 +429,7 @@ class GraphManager:
             paper_node_id=paper_node.id,
             node_writes=node_writes,
             edge_writes=edge_writes,
+            skipped_relations=skipped_relations,
         )
 
     def _resolve_relation_endpoint(

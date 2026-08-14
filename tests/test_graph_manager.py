@@ -237,7 +237,15 @@ def test_relation_endpoint_uses_declared_entity_type(fake_db):
     assert "/" not in report.paper_node_id
 
 
-def test_ambiguous_untyped_relation_endpoint_is_rejected(fake_db):
+def test_ambiguous_relation_endpoint_is_skipped_not_paper_fatal(fake_db):
+    """An ambiguous untyped relation endpoint used to raise ValueError
+    uncaught, aborting apply_extraction_result mid-write - by that point
+    other nodes in the same paper are already durably committed to
+    Firestore via add_node, so the exception discarded the rest of the
+    paper's relations with no report of what already landed. Must be
+    isolated to just the one ambiguous relation, the same per-unit
+    resilience already applied to per-window extraction failures in
+    gemini_extractor.py."""
     gm = _make_manager(fake_db)
     extraction = ExtractionResult(
         paper_id="paper-1",
@@ -248,6 +256,9 @@ def test_ambiguous_untyped_relation_endpoint_is_rejected(fake_db):
             ExtractedEntity(
                 name="Attention", type=NodeType.CONCEPT, description="Concept"
             ),
+            ExtractedEntity(
+                name="Reasoning", type=NodeType.CONCEPT, description="Concept"
+            ),
         ],
         relations=[
             ExtractedRelation(
@@ -255,12 +266,27 @@ def test_ambiguous_untyped_relation_endpoint_is_rejected(fake_db):
                 relation=EdgeType.SUPPORTS,
                 target_entity="Reasoning",
                 source_quote="Attention supports reasoning.",
-            )
+            ),
+            ExtractedRelation(
+                source_entity="Attention",
+                source_type=NodeType.CONCEPT,
+                relation=EdgeType.SUPPORTS,
+                target_entity="Reasoning",
+                target_type=NodeType.CONCEPT,
+                source_quote="Attention as a concept supports reasoning.",
+            ),
         ],
     )
 
-    with pytest.raises(ValueError, match="ambiguous relation endpoint"):
-        gm.apply_extraction_result(extraction)
+    report = gm.apply_extraction_result(extraction)
+
+    # The ambiguous relation (untyped "Attention" matches two nodes) is
+    # skipped and counted, not raised.
+    assert report.skipped_relations == 1
+    # The second, unambiguous (typed) relation still gets written - one
+    # bad relation doesn't take the rest of the paper down with it.
+    assert len(report.edge_writes) == 1
+    assert len(report.node_writes) == 3
 
 
 def test_extracted_paper_entity_reuses_source_paper_node(fake_db):
