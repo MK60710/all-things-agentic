@@ -15,8 +15,9 @@ import os
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -156,7 +157,7 @@ class GeminiExplainer:
                     vertexai=True,
                     project=self._project or os.environ.get("GOOGLE_CLOUD_PROJECT"),
                     location=self._location
-                    or os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1"),
+                    or os.environ.get("GOOGLE_CLOUD_LOCATION", "global"),
                 )
             return self._client
 
@@ -260,30 +261,59 @@ class GapFinder:
         self._explain_fn = explain_fn
         self._db = db_client
         self._node_boost: dict[str, float] = {}
-        self._max_explain_workers = max_explain_workers
+        # record_feedback writes are a non-atomic get-then-set, and
+        # find_candidates reads this concurrently with other pool work -
+        # both need to go through this lock.
+        self._boost_lock = threading.Lock()
+        # Persistent (instance-lifetime, not per-call) so two concurrent
+        # find_candidates() calls on the same GapFinder can share it - a
+        # per-call pool can't participate in the in-flight de-dup below,
+        # since a second call wouldn't have visibility into the first
+        # call's still-running pool.
+        self._executor = ThreadPoolExecutor(max_workers=max(1, max_explain_workers))
         # record_feedback is designed to trigger re-ranking, which calls
         # find_candidates() again - without this, the same pair gets
         # re-explained by a fresh (paid) Gemini call every time even though
         # the explanation itself doesn't depend on the score/ranking.
-        # Bounded (FIFO eviction, dicts preserve insertion order) - reused
-        # across a long research session, this would otherwise grow forever
-        # as the graph gains new candidate pairs.
+        # Bounded, LRU (OrderedDict + move_to_end on hit, evict oldest) -
+        # plain FIFO would evict a pair the user keeps re-ranking into top
+        # results just because other pairs were computed more recently,
+        # which is exactly the workload this cache exists to protect.
         self._max_cache_size = max_cache_size
-        self._explanation_cache: dict[
+        self._explanation_cache: OrderedDict[
             tuple[str, str, str, str, tuple[tuple[str, str], ...]], str
-        ] = {}
-        # Cache reads/writes happen from ThreadPoolExecutor worker threads
-        # in find_candidates below, plus potentially concurrent calls to
-        # find_candidates itself on the same GapFinder instance.
+        ] = OrderedDict()
+        # Cache/pending reads+writes happen from ThreadPoolExecutor worker
+        # threads, plus potentially concurrent calls to find_candidates
+        # itself on the same GapFinder instance.
         self._cache_lock = threading.Lock()
+        # In-flight de-dup: two concurrent find_candidates() calls that
+        # both miss on the same pair must not each fire their own (paid,
+        # non-deterministic at temperature=0.3) explain_fn call and race
+        # on which result the cache keeps - the second caller attaches to
+        # the first's already-submitted future instead.
+        self._pending: dict[
+            tuple[str, str, str, str, tuple[tuple[str, str], ...]], Future
+        ] = {}
 
     def _citations_for(self, candidate: GapCandidate) -> list[GapCitation]:
         """The edges connecting each shared neighbor to node_a/node_b -
         the actual paper/quote evidence behind why this pair surfaced,
-        not just their bare node ids."""
+        not just their bare node ids.
+
+        Not positionally aligned with the evidence_names list explain_fn
+        receives in find_candidates below: evidence_names has exactly one
+        entry per shared neighbor (its name, for the prompt), while a
+        single neighbor can produce 0, 1, or 2+ citations here depending
+        on how many qualifying edges it has to node_a/node_b. Correlate by
+        shared_node_id, never by list position.
+        """
         citations: list[GapCitation] = []
         for neighbor_id in candidate.common_neighbor_ids:
-            neighbor_name = self._gm.graph.nodes[neighbor_id].get(
+            # .get() with a default, not bracket indexing - get_incident_edges
+            # below already uses this same defensive pattern for the
+            # identical mutable-graph concern.
+            neighbor_name = self._gm.graph.nodes.get(neighbor_id, {}).get(
                 "name", neighbor_id
             )
             edge: IncidentEdge
@@ -307,7 +337,12 @@ class GapFinder:
                         relation=edge.relation,
                         source_paper_id=edge.source_paper_id,
                         source_section=edge.source_section,
-                        source_quote=edge.source_quote,
+                        # INFERRED edges (e.g. a SAME_AS merge) legitimately
+                        # have no source_quote - fall back to a synthesized
+                        # description instead of a blank string, matching
+                        # query_agent.py's QueryCitation for the same case.
+                        source_quote=edge.source_quote
+                        or f"{edge.source_name} {edge.relation} {edge.target_name}",
                     )
                 )
         return citations
@@ -324,9 +359,10 @@ class GapFinder:
             b_data = self._gm.graph.nodes[b_id]
             common_ids = list(nx.common_neighbors(undirected, a_id, b_id))
             base_score = float(len(common_ids))
-            boost = self._node_boost.get(a_id, 0.0) + self._node_boost.get(
-                b_id, 0.0
-            )
+            with self._boost_lock:
+                boost = self._node_boost.get(a_id, 0.0) + self._node_boost.get(
+                    b_id, 0.0
+                )
             candidates.append(
                 GapCandidate(
                     node_a_id=a_id,
@@ -347,7 +383,11 @@ class GapFinder:
             # cached explanation string doesn't carry evidence with it.
             c.citations = self._citations_for(c)
 
-        pending: list[tuple[GapCandidate, tuple, list[str]]] = []
+        # Each entry is either a future this call just submitted (is_owner
+        # True - only the owner cleans up self._pending and writes the
+        # cache) or an already in-flight future a concurrent
+        # find_candidates() call on the same pair submitted first.
+        awaiting: list[tuple[GapCandidate, tuple, Future, bool, list[str]]] = []
         for c in top:
             # Explanations depend on names and shared evidence, not just the
             # pair IDs. Including all prompt inputs prevents stale text after
@@ -373,47 +413,71 @@ class GapFinder:
                 endpoints[1][1],
                 evidence,
             )
+            evidence_names = [name for _, name in evidence]
+
             with self._cache_lock:
                 cached = self._explanation_cache.get(cache_key)
-            if cached is not None:
-                c.explanation = cached
-                continue
-            evidence_names = [name for _, name in evidence]
-            pending.append((c, cache_key, evidence_names))
+                if cached is not None:
+                    self._explanation_cache.move_to_end(cache_key)
+                    c.explanation = cached
+                    continue
+                # Two concurrent find_candidates() calls that both miss on
+                # the same pair must not each fire their own (paid,
+                # non-deterministic at temperature=0.3) explain_fn call -
+                # attach to the already-submitted future instead of
+                # resubmitting.
+                future = self._pending.get(cache_key)
+                is_owner = future is None
+                if is_owner:
+                    future = self._executor.submit(
+                        self._explain_fn,
+                        c.node_a_name,
+                        c.node_b_name,
+                        evidence_names,
+                    )
+                    self._pending[cache_key] = future
+            awaiting.append((c, cache_key, future, is_owner, evidence_names))
 
-        if pending:
-            # Each explain_fn call (typically a Gemini request) is
-            # independent - running them sequentially made total latency
-            # additive across every cache miss in a single find_candidates()
-            # call, which matters for what's meant to be an interactive tool.
-            # max(1, ...) - a caller passing max_explain_workers=0 to mean
-            # "minimal parallelism" should get sequential execution, not a
-            # ThreadPoolExecutor ValueError.
-            with ThreadPoolExecutor(
-                max_workers=max(1, min(len(pending), self._max_explain_workers))
-            ) as pool:
-                futures = {
-                    pool.submit(
-                        self._explain_fn, c.node_a_name, c.node_b_name, names
-                    ): (c, cache_key)
-                    for c, cache_key, names in pending
-                }
-                for future, (c, cache_key) in futures.items():
-                    c.explanation = future.result()
-                    # max_cache_size <= 0 means caching is disabled outright,
-                    # not "evict immediately then insert anyway" - len(...)
-                    # >= 0 is always true, which used to insert one entry
-                    # regardless of the configured limit.
+        for c, cache_key, future, is_owner, evidence_names in awaiting:
+            try:
+                c.explanation = future.result()
+            except Exception:
+                # Isolate one candidate's explain_fn failure from the rest
+                # of this batch instead of letting it abort every other
+                # already-submitted call's result (and silently drop their
+                # exceptions) - the same per-unit isolation this codebase
+                # applies to apply_extraction_result's skipped_relations
+                # and _extract_window's per-window failures. GeminiExplainer
+                # itself never raises; this only matters for a custom
+                # ExplainFn, a documented extension point.
+                logger.warning(
+                    "explain_fn raised for a candidate, falling back to "
+                    "the deterministic template",
+                    exc_info=True,
+                )
+                c.explanation = Explanation(
+                    _default_explain(c.node_a_name, c.node_b_name, evidence_names),
+                    cacheable=False,
+                )
+            if not is_owner:
+                continue
+            with self._cache_lock:
+                self._pending.pop(cache_key, None)
+                # max_cache_size <= 0 means caching is disabled outright,
+                # not "evict immediately then insert anyway" - a plain
+                # len(...) >= 0 check is always true, which used to insert
+                # one entry regardless of the configured limit.
+                if (
+                    getattr(c.explanation, "cacheable", True)
+                    and self._max_cache_size > 0
+                ):
                     if (
-                        getattr(c.explanation, "cacheable", True)
-                        and self._max_cache_size > 0
+                        cache_key not in self._explanation_cache
+                        and len(self._explanation_cache) >= self._max_cache_size
                     ):
-                        with self._cache_lock:
-                            if len(self._explanation_cache) >= self._max_cache_size:
-                                self._explanation_cache.pop(
-                                    next(iter(self._explanation_cache)), None
-                                )
-                            self._explanation_cache[cache_key] = c.explanation
+                        self._explanation_cache.popitem(last=False)
+                    self._explanation_cache[cache_key] = c.explanation
+                    self._explanation_cache.move_to_end(cache_key)
         return top
 
     def record_feedback(
@@ -422,8 +486,13 @@ class GapFinder:
         """Applied immediately to future rankings — the concrete mechanism
         behind "adapts to the user's thinking", not just a log entry."""
         delta = 1.0 if interesting else -1.0
-        self._node_boost[node_a_id] = self._node_boost.get(node_a_id, 0.0) + delta
-        self._node_boost[node_b_id] = self._node_boost.get(node_b_id, 0.0) + delta
+        with self._boost_lock:
+            self._node_boost[node_a_id] = (
+                self._node_boost.get(node_a_id, 0.0) + delta
+            )
+            self._node_boost[node_b_id] = (
+                self._node_boost.get(node_b_id, 0.0) + delta
+            )
 
         if self._db is not None:
             event_id = str(uuid.uuid4())

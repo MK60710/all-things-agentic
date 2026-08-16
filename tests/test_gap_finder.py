@@ -631,3 +631,157 @@ def test_gemini_explainer_client_construction_is_thread_safe(monkeypatch):
         t.join()
 
     assert construction_count["n"] == 1
+
+
+def test_concurrent_find_candidates_share_one_in_flight_call_on_the_same_pair(
+    fake_db,
+):
+    """Two concurrent find_candidates() calls that both miss on the same
+    pair must not each fire their own explain_fn call - the second must
+    attach to the first's already-submitted future instead of duplicating
+    the (paid, non-deterministic) work."""
+    import threading
+
+    gm, a, b, shared = _populated_graph(fake_db)
+    call_count = {"n": 0}
+    release = threading.Event()
+
+    def slow_explain(name_a: str, name_b: str, evidence: list[str]) -> str:
+        call_count["n"] += 1
+        release.wait(timeout=2)
+        return "the one explanation"
+
+    gf = GapFinder(gm, explain_fn=slow_explain)
+    results: list = [None, None]
+
+    def run(i: int) -> None:
+        results[i] = gf.find_candidates()
+
+    threads = [threading.Thread(target=run, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    time.sleep(0.05)  # let both threads reach the in-flight explain call
+    release.set()
+    for t in threads:
+        t.join()
+
+    assert call_count["n"] == 1  # not 2
+    assert results[0][0].explanation == "the one explanation"
+    assert results[1][0].explanation == "the one explanation"
+
+
+def test_one_candidates_explain_failure_does_not_discard_the_others(fake_db):
+    """A custom ExplainFn that raises for one candidate must not crash the
+    whole find_candidates() call and discard every other already-computed
+    result - only the failing candidate degrades to the template."""
+    gm = GraphManager(project_id="test-project", db_client=fake_db)
+    pair_ids = []
+    for i in range(3):
+        a, b, shared = _node(f"A{i}"), _node(f"B{i}"), _node(f"S{i}")
+        gm.add_node(a)
+        gm.add_node(b)
+        gm.add_node(shared)
+        gm.add_edge(_edge(shared.id, a.id))
+        gm.add_edge(_edge(shared.id, b.id))
+        pair_ids.append(a.name)
+
+    def flaky_explain(name_a: str, name_b: str, evidence: list[str]) -> str:
+        if name_a == "A1":
+            raise RuntimeError("boom")
+        return f"explanation for {name_a}"
+
+    gf = GapFinder(gm, explain_fn=flaky_explain)
+
+    candidates = gf.find_candidates(limit=10)
+
+    assert len(candidates) == 3  # nothing discarded
+    by_name = {c.node_a_name: c for c in candidates}
+    assert "share context" in by_name["A1"].explanation  # fell back cleanly
+    assert by_name["A0"].explanation == "explanation for A0"
+    assert by_name["A2"].explanation == "explanation for A2"
+
+
+def test_record_feedback_is_race_safe_under_concurrent_calls(fake_db):
+    """self._node_boost's get-then-set must not lose updates when
+    record_feedback is called concurrently."""
+    import threading
+
+    gm, a, b, shared = _populated_graph(fake_db)
+    gf = GapFinder(gm, explain_fn=_stub_explain)
+
+    threads = [
+        threading.Thread(
+            target=gf.record_feedback, args=(a.id, b.id, True)
+        )
+        for _ in range(20)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # 20 concurrent +1s on each of two nodes - a lost update would leave
+    # this short of 40.
+    assert gf._node_boost[a.id] + gf._node_boost[b.id] == 40.0
+
+
+def test_explanation_cache_refreshes_recency_on_hit(fake_db):
+    """FIFO would evict a pair the user keeps re-ranking into top results
+    just because other pairs were computed more recently - a cache hit
+    must count as recent use (LRU), not just insertion time."""
+    gm = GraphManager(project_id="test-project", db_client=fake_db)
+    pairs = {}
+    for name in ("one", "two", "three"):
+        a, b, shared = _node(f"A_{name}"), _node(f"B_{name}"), _node(f"S_{name}")
+        gm.add_node(a)
+        gm.add_node(b)
+        gm.add_node(shared)
+        gm.add_edge(_edge(shared.id, a.id))
+        gm.add_edge(_edge(shared.id, b.id))
+        pairs[name] = (a, b)
+
+    call_count = {"n": 0}
+
+    def counting_explain(name_a: str, name_b: str, evidence: list[str]) -> str:
+        call_count["n"] += 1
+        return f"explanation #{call_count['n']}"
+
+    gf = GapFinder(gm, explain_fn=counting_explain, max_cache_size=2)
+
+    def top_pair() -> tuple:
+        return gf.find_candidates(limit=1)[0]
+
+    a1, b1 = pairs["one"]
+    a2, b2 = pairs["two"]
+    a3, b3 = pairs["three"]
+
+    def boost(node_a, node_b, times: int) -> None:
+        for _ in range(times):
+            gf.record_feedback(node_a.id, node_b.id, True)
+
+    # Each stage's score strictly exceeds every prior stage's, so which
+    # pair is "top" is unambiguous regardless of sort stability/tie-break.
+    boost(a1, b1, 1)  # score 3
+    assert top_pair().node_a_name == "A_one"  # cache: {one}
+    assert call_count["n"] == 1
+
+    boost(a2, b2, 3)  # score 7
+    assert top_pair().node_a_name == "A_two"  # cache: {one, two}
+    assert call_count["n"] == 2
+
+    boost(a1, b1, 3)  # cumulative 4 calls, score 9
+    result = top_pair()  # re-hits "one" - cache hit, refreshes recency
+    assert result.node_a_name == "A_one"
+    assert call_count["n"] == 2  # no new call - served from cache
+
+    boost(a3, b3, 5)  # score 11
+    assert top_pair().node_a_name == "A_three"  # evicts "two" (LRU), not "one"
+    assert call_count["n"] == 3
+
+    boost(a1, b1, 2)  # cumulative 6 calls, score 13
+    assert top_pair().node_a_name == "A_one"  # still cached - protected by LRU
+    assert call_count["n"] == 3
+
+    boost(a2, b2, 5)  # cumulative 8 calls, score 17
+    assert top_pair().node_a_name == "A_two"  # was evicted - re-explained
+    assert call_count["n"] == 4
