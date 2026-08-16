@@ -12,8 +12,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 import uuid
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import networkx as nx
@@ -23,14 +25,22 @@ from pydantic import BaseModel
 
 from agent.graph_manager import GraphManager
 from agent.schema import NodeType
+from agent.text_utils import escape_tag_delimiters
 
 logger = logging.getLogger(__name__)
 
 ExplainFn = Callable[[str, str, list[str]], str]
 
 
-class _ExplanationText(str):
-    """A string carrying whether it is safe for GapFinder to cache it."""
+class Explanation(str):
+    """A string carrying whether it is safe for GapFinder to cache it.
+
+    A plain str return from an ExplainFn is always treated as cacheable
+    (the common case: a deterministic template, or a model call that
+    succeeded outright). Return this instead when an explanation must not
+    be cached - e.g. a fallback after a failure, empty response, or
+    truncation, where the same call should be retried on the next request
+    rather than permanently remembered."""
 
     def __new__(cls, value: str, *, cacheable: bool):
         instance = super().__new__(cls, value)
@@ -72,16 +82,6 @@ _GEMINI_SYSTEM_INSTRUCTION = (
 )
 
 
-def _escape_tag_delimiters(value: str) -> str:
-    """Escape the angle brackets that delimit the <gap_candidate> wrapper
-    below. json.dumps() escapes JSON-syntax characters (quotes, newlines),
-    not '<'/'>', so untrusted entity/evidence text - which ultimately traces
-    back to extracted document content - could otherwise close the tag
-    early and forge a fake payload of its own. Same fix, same reasoning, as
-    assemble_context's <source_metadata> wrapper in retrieval.py."""
-    return value.replace("<", "&lt;").replace(">", "&gt;")
-
-
 class GeminiExplainer:
     """Calls Gemini via Vertex AI to explain a candidate research gap.
 
@@ -101,12 +101,20 @@ class GeminiExplainer:
         location: str | None = None,
         timeout_ms: int = 15_000,
         max_output_tokens: int = 150,
+        # 0 (default) preserves the original always-retry-next-call
+        # behavior. A deployment that calls this repeatedly during a
+        # sustained outage should set this so a failure doesn't mean every
+        # candidate in every find_candidates() call blocks up to
+        # timeout_ms until the outage clears.
+        backoff_seconds: float = 0.0,
     ):
         self._model = model
         self._timeout_ms = timeout_ms
         self._max_output_tokens = max_output_tokens
         self._project = project
         self._location = location
+        self._backoff_seconds = backoff_seconds
+        self._retry_after: float = 0.0
         # Constructed lazily on first call, inside the same try/except that
         # covers generate_content - a bad ADC/project config previously
         # raised here in __init__, outside any fallback path, contradicting
@@ -125,11 +133,20 @@ class GeminiExplainer:
         return self._client
 
     def __call__(self, name_a: str, name_b: str, evidence: list[str]) -> str:
+        if self._backoff_seconds and time.monotonic() < self._retry_after:
+            logger.warning(
+                "GeminiExplainer is in backoff after a recent failure, "
+                "skipping the live call and falling back to template"
+            )
+            return Explanation(
+                _default_explain(name_a, name_b, evidence), cacheable=False
+            )
+
         shared = _format_shared_context(evidence)
         payload = {
-            "entity_a": _escape_tag_delimiters(name_a),
-            "entity_b": _escape_tag_delimiters(name_b),
-            "shared_context": _escape_tag_delimiters(shared),
+            "entity_a": escape_tag_delimiters(name_a),
+            "entity_b": escape_tag_delimiters(name_b),
+            "shared_context": escape_tag_delimiters(shared),
         }
         contents = (
             "<gap_candidate>"
@@ -155,11 +172,23 @@ class GeminiExplainer:
                 ),
             )
             text = (response.text or "").strip()
-            if text:
-                return _ExplanationText(text, cacheable=True)
-            logger.warning(
-                "GeminiExplainer got an empty response, falling back to template"
-            )
+            candidates = getattr(response, "candidates", None) or []
+            finish_reason = candidates[0].finish_reason if candidates else None
+            truncated = finish_reason == genai_types.FinishReason.MAX_TOKENS
+            if text and not truncated:
+                self._retry_after = 0.0
+                return Explanation(text, cacheable=True)
+            if truncated:
+                logger.warning(
+                    "GeminiExplainer response was truncated by "
+                    "max_output_tokens, falling back to template instead "
+                    "of caching a cut-off fragment"
+                )
+            else:
+                logger.warning(
+                    "GeminiExplainer got an empty response, falling back "
+                    "to template"
+                )
         except Exception:
             # Never let a Gemini outage/quota/config issue break gap-finding
             # itself (candidates already come from graph topology), but log
@@ -169,9 +198,11 @@ class GeminiExplainer:
                 "GeminiExplainer call failed, falling back to template",
                 exc_info=True,
             )
+        if self._backoff_seconds:
+            self._retry_after = time.monotonic() + self._backoff_seconds
         # Preserve the string-returning ExplainFn API while marking transient
         # fallbacks so GapFinder can retry Gemini on the next request.
-        return _ExplanationText(
+        return Explanation(
             _default_explain(name_a, name_b, evidence), cacheable=False
         )
 
@@ -188,15 +219,22 @@ class GapFinder:
         graph_manager: GraphManager,
         explain_fn: ExplainFn = _default_explain,
         db_client=None,
+        max_cache_size: int = 500,
+        max_explain_workers: int = 5,
     ):
         self._gm = graph_manager
         self._explain_fn = explain_fn
         self._db = db_client
         self._node_boost: dict[str, float] = {}
+        self._max_explain_workers = max_explain_workers
         # record_feedback is designed to trigger re-ranking, which calls
         # find_candidates() again - without this, the same pair gets
         # re-explained by a fresh (paid) Gemini call every time even though
         # the explanation itself doesn't depend on the score/ranking.
+        # Bounded (FIFO eviction, dicts preserve insertion order) - reused
+        # across a long research session, this would otherwise grow forever
+        # as the graph gains new candidate pairs.
+        self._max_cache_size = max_cache_size
         self._explanation_cache: dict[
             tuple[str, str, str, str, tuple[tuple[str, str], ...]], str
         ] = {}
@@ -229,6 +267,8 @@ class GapFinder:
 
         candidates.sort(key=lambda c: c.score, reverse=True)
         top = candidates[:limit]
+
+        pending: list[tuple[GapCandidate, tuple, list[str]]] = []
         for c in top:
             # Explanations depend on names and shared evidence, not just the
             # pair IDs. Including all prompt inputs prevents stale text after
@@ -236,6 +276,11 @@ class GapFinder:
             endpoints = sorted(
                 ((c.node_a_id, c.node_a_name), (c.node_b_id, c.node_b_name))
             )
+            # Sorted by (node_id, name) - not the traversal order
+            # common_neighbor_ids is returned in - because this tuple
+            # doubles as the cache key and must be identical across calls
+            # for the same underlying pair/evidence set regardless of
+            # networkx's iteration order that call.
             evidence = tuple(
                 sorted(
                     (n, self._gm.graph.nodes[n].get("name", n))
@@ -254,11 +299,30 @@ class GapFinder:
                 c.explanation = cached
                 continue
             evidence_names = [name for _, name in evidence]
-            c.explanation = self._explain_fn(
-                c.node_a_name, c.node_b_name, evidence_names
-            )
-            if getattr(c.explanation, "cacheable", True):
-                self._explanation_cache[cache_key] = c.explanation
+            pending.append((c, cache_key, evidence_names))
+
+        if pending:
+            # Each explain_fn call (typically a Gemini request) is
+            # independent - running them sequentially made total latency
+            # additive across every cache miss in a single find_candidates()
+            # call, which matters for what's meant to be an interactive tool.
+            with ThreadPoolExecutor(
+                max_workers=min(len(pending), self._max_explain_workers)
+            ) as pool:
+                futures = {
+                    pool.submit(
+                        self._explain_fn, c.node_a_name, c.node_b_name, names
+                    ): (c, cache_key)
+                    for c, cache_key, names in pending
+                }
+                for future, (c, cache_key) in futures.items():
+                    c.explanation = future.result()
+                    if getattr(c.explanation, "cacheable", True):
+                        if len(self._explanation_cache) >= self._max_cache_size:
+                            self._explanation_cache.pop(
+                                next(iter(self._explanation_cache))
+                            )
+                        self._explanation_cache[cache_key] = c.explanation
         return top
 
     def record_feedback(
