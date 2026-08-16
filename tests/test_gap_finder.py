@@ -13,14 +13,24 @@ def _node(name: str) -> Node:
     return Node(id=str(uuid.uuid4()), type=NodeType.CONCEPT, name=name)
 
 
-def _edge(source_id: str, target_id: str) -> Edge:
+def _edge(
+    source_id: str,
+    target_id: str,
+    *,
+    relation: EdgeType = EdgeType.SUPPORTS,
+    source_quote: str = "quote",
+    source_paper_id: str | None = None,
+    source_section: str | None = None,
+) -> Edge:
     return Edge(
         id=str(uuid.uuid4()),
         source_id=source_id,
         target_id=target_id,
-        type=EdgeType.SUPPORTS,
+        type=relation,
         provenance=ProvenanceTag.EXTRACTED,
-        source_quote="quote",
+        source_quote=source_quote,
+        source_paper_id=source_paper_id,
+        source_section=source_section,
     )
 
 
@@ -444,3 +454,104 @@ def test_gap_finder_explains_multiple_cache_misses_concurrently(fake_db):
     for c in candidates:
         key = frozenset((c.node_a_id, c.node_b_id))
         assert c.explanation == expected[key]
+
+
+def test_find_candidates_cites_the_edges_that_produced_the_evidence(fake_db):
+    """The Day 16 plan checkpoint requires a visible reasoning trace
+    (papers/edges cited), not just bare common_neighbor_ids."""
+    gm = GraphManager(project_id="test-project", db_client=fake_db)
+    a, b, shared = _node("Concept A"), _node("Concept B"), _node("Shared Neighbor")
+    gm.add_node(a)
+    gm.add_node(b)
+    gm.add_node(shared)
+    gm.add_edge(
+        _edge(
+            shared.id,
+            a.id,
+            relation=EdgeType.SUPPORTS,
+            source_quote="Shared Neighbor supports Concept A directly.",
+            source_paper_id="paper-a",
+            source_section="Results",
+        )
+    )
+    gm.add_edge(
+        _edge(
+            b.id,
+            shared.id,
+            relation=EdgeType.USES,
+            source_quote="Concept B uses Shared Neighbor as a component.",
+            source_paper_id="paper-b",
+            source_section="Methods",
+        )
+    )
+    gf = GapFinder(gm, explain_fn=_stub_explain)
+
+    candidate = gf.find_candidates()[0]
+
+    assert len(candidate.citations) == 2
+    by_side = {c.connects_to: c for c in candidate.citations}
+    assert by_side["node_a"].source_paper_id == "paper-a"
+    assert by_side["node_a"].source_section == "Results"
+    assert by_side["node_a"].relation == "SUPPORTS"
+    assert "supports Concept A directly" in by_side["node_a"].source_quote
+    assert by_side["node_b"].source_paper_id == "paper-b"
+    assert by_side["node_b"].relation == "USES"
+    assert "uses Shared Neighbor" in by_side["node_b"].source_quote
+    assert by_side["node_a"].shared_node_name == "Shared Neighbor"
+
+
+def test_citations_include_parallel_edges_between_the_same_pair(fake_db):
+    """A MultiDiGraph can hold more than one relation type between the same
+    two nodes - both are real evidence and both must be cited, not just
+    the first one found."""
+    gm = GraphManager(project_id="test-project", db_client=fake_db)
+    a, b, shared = _node("Concept A"), _node("Concept B"), _node("Shared Neighbor")
+    gm.add_node(a)
+    gm.add_node(b)
+    gm.add_node(shared)
+    gm.add_edge(
+        _edge(shared.id, a.id, relation=EdgeType.SUPPORTS, source_quote="quote 1")
+    )
+    gm.add_edge(
+        _edge(shared.id, a.id, relation=EdgeType.EXTENDS, source_quote="quote 2")
+    )
+    gm.add_edge(_edge(shared.id, b.id, source_quote="quote 3"))
+    gf = GapFinder(gm, explain_fn=_stub_explain)
+
+    candidate = gf.find_candidates()[0]
+
+    node_a_citations = [c for c in candidate.citations if c.connects_to == "node_a"]
+    assert {c.relation for c in node_a_citations} == {"SUPPORTS", "EXTENDS"}
+
+
+def test_citations_refresh_when_graph_gains_a_new_shared_neighbor(fake_db):
+    gm, a, b, shared = _populated_graph(fake_db)
+    gf = GapFinder(gm, explain_fn=_stub_explain)
+
+    before = gf.find_candidates()[0]
+    assert {c.shared_node_name for c in before.citations} == {"Shared Neighbor"}
+
+    added = _node("New Shared Neighbor")
+    gm.add_node(added)
+    gm.add_edge(_edge(added.id, a.id))
+    gm.add_edge(_edge(added.id, b.id))
+
+    after = gf.find_candidates()[0]
+    assert {c.shared_node_name for c in after.citations} == {
+        "Shared Neighbor",
+        "New Shared Neighbor",
+    }
+
+
+def test_citations_present_even_when_explanation_is_served_from_cache(fake_db):
+    """Citations must not go missing on a cache hit - they're topology
+    data, independent of whether explain_fn was actually called this
+    time."""
+    gm, a, b, shared = _populated_graph(fake_db)
+    gf = GapFinder(gm, explain_fn=_stub_explain)
+
+    gf.find_candidates()
+    cached = gf.find_candidates()[0]
+
+    assert len(cached.citations) == 2
+    assert {c.connects_to for c in cached.citations} == {"node_a", "node_b"}
