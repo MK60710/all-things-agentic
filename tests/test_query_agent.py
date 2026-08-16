@@ -38,6 +38,24 @@ def test_graph_evidence_is_preferred_and_cited(fake_db):
     assert agent.metrics == {"graph_hits": 1, "vector_fallbacks": 0}
 
 
+def test_low_relevance_graph_match_falls_back_to_chunk(fake_db):
+    """A single generic shared token shouldn't lock in a low-relevance
+    graph answer over a much more specific chunk match (the failure mode
+    behind min_graph_score)."""
+    graph = _graph(fake_db)
+    index = ChunkIndex()
+    index.upsert_paper(
+        "paper-2",
+        ["A retrieval method improves answer quality on the benchmark."],
+    )
+    agent = QueryAgent(index, graph)
+
+    result = agent.answer("What improves answer quality on the benchmark?")
+
+    assert result.retrieval_mode == "vector"
+    assert result.citations[0].paper_id == "paper-2"
+
+
 def test_chunk_retrieval_is_used_when_graph_has_no_match():
     index = ChunkIndex()
     index.upsert_paper(
@@ -53,11 +71,46 @@ def test_chunk_retrieval_is_used_when_graph_has_no_match():
     assert agent.metrics == {"graph_hits": 0, "vector_fallbacks": 1}
 
 
+def test_vector_citations_keep_the_top_scoring_hit():
+    """assemble_context orders hits by document position, not score - the
+    citation list must not silently drop the best match on truncation."""
+    index = ChunkIndex()
+    index.upsert_paper(
+        "paper-3",
+        [
+            "Unrelated background material about lab equipment.",
+            "A graph neural network improves node classification accuracy.",
+        ],
+    )
+    agent = QueryAgent(index, max_citations=1)
+
+    result = agent.answer("What improves node classification accuracy?")
+
+    assert result.retrieval_mode == "vector"
+    assert len(result.citations) == 1
+    assert "graph neural network" in result.citations[0].text
+
+
 def test_empty_retrieval_returns_no_results():
     result = QueryAgent(ChunkIndex()).answer("What is unrelated?")
 
     assert result.retrieval_mode == "no_results"
     assert result.citations == []
+
+
+def test_no_client_fallback_does_not_leak_prompt_markup():
+    """Without a Gemini client, the answer must be the citation text, not
+    the raw <source_metadata>-wrapped, angle-bracket-escaped context blob
+    built for Gemini's consumption."""
+    index = ChunkIndex()
+    index.upsert_paper(
+        "paper-5", ["The model scores 5 < 10 on the held-out benchmark."]
+    )
+    result = QueryAgent(index).answer("What does the model score?")
+
+    assert "<source_metadata>" not in result.answer
+    assert "&lt;" not in result.answer
+    assert "5 < 10" in result.answer
 
 
 def test_gemini_receives_retrieved_context():
@@ -80,7 +133,7 @@ def test_gemini_receives_retrieved_context():
     assert calls[0]["config"].temperature == 0
 
 
-def test_gemini_empty_response_is_safe():
+def test_gemini_empty_response_falls_back_to_evidence_summary():
     class FakeModels:
         def generate_content(self, **kwargs):
             return SimpleNamespace(text="")
@@ -92,4 +145,45 @@ def test_gemini_empty_response_is_safe():
         client=SimpleNamespace(models=FakeModels()),
     ).answer("What evidence is stored?")
 
-    assert result.answer == "The stored research did not provide a usable answer."
+    assert result.answer == "Based on the stored research:\n\nStored evidence."
+
+
+def test_gemini_call_failure_falls_back_instead_of_crashing():
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            raise RuntimeError("quota exceeded")
+
+    index = ChunkIndex()
+    index.upsert_paper("paper-6", ["Stored evidence about retries."])
+    result = QueryAgent(
+        index,
+        client=SimpleNamespace(models=FakeModels()),
+    ).answer("What is stored?")
+
+    assert result.retrieval_mode == "vector"
+    assert "Stored evidence about retries." in result.answer
+
+
+def test_gemini_response_text_property_raising_falls_back():
+    """The google-genai SDK can raise from the response.text property
+    itself (e.g. a safety-filtered response with no candidates), not just
+    return an empty string - the try/except must cover the property
+    access, not only the generate_content call."""
+
+    class RaisingResponse:
+        @property
+        def text(self):
+            raise ValueError("no candidates")
+
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            return RaisingResponse()
+
+    index = ChunkIndex()
+    index.upsert_paper("paper-7", ["Stored evidence about safety blocks."])
+    result = QueryAgent(
+        index,
+        client=SimpleNamespace(models=FakeModels()),
+    ).answer("What is stored?")
+
+    assert "Stored evidence about safety blocks." in result.answer
