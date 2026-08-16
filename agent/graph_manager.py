@@ -31,6 +31,7 @@ from agent.schema import (
     NodeType,
     ProvenanceTag,
 )
+from agent.text_utils import search_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,28 @@ class EdgeWriteResult:
 
 
 @dataclass
+class NodeSearchHit:
+    node_id: str
+    score: float
+    name: str
+    type: str
+    description: str
+
+
+@dataclass
+class IncidentEdge:
+    edge_id: str
+    source_id: str
+    target_id: str
+    source_name: str
+    target_name: str
+    relation: str
+    source_quote: str
+    source_paper_id: str | None
+    source_section: str | None
+
+
+@dataclass
 class GraphIngestionReport:
     paper_id: str
     paper_node_id: str
@@ -110,6 +133,7 @@ class GraphManager:
                 )
             self._db = firestore.Client(project=project_id, database=database)
         self._known_distinct: set[tuple[str, str]] = set()
+        self._node_token_cache: dict[str, set[str]] = {}
         self._rehydrate()
 
     def _rehydrate(self) -> None:
@@ -138,6 +162,10 @@ class GraphManager:
             node.model_dump(mode="json"), merge=True
         )
         self.graph.add_node(node.id, **node.model_dump(mode="json"))
+        # add_node is an upsert (name/description can change on retry with
+        # richer data) - drop any stale cached tokens so search_nodes below
+        # re-tokenizes from the current data on next lookup.
+        self._node_token_cache.pop(node.id, None)
         return node.id
 
     def add_edge(self, edge: Edge) -> str:
@@ -205,6 +233,90 @@ class GraphManager:
         return list(self.graph.successors(node_id)) + list(
             self.graph.predecessors(node_id)
         )
+
+    def _node_tokens(self, node_id: str, data: dict[str, Any]) -> set[str]:
+        cached = self._node_token_cache.get(node_id)
+        if cached is not None:
+            return cached
+        tokens = search_tokens(f"{data.get('name', '')} {data.get('description', '')}")
+        self._node_token_cache[node_id] = tokens
+        return tokens
+
+    def search_nodes(
+        self, query: str, *, limit: int = 8, min_score: float = 0.0
+    ) -> list[NodeSearchHit]:
+        """Lexical relevance search over node name+description.
+
+        The read-side counterpart to ChunkIndex.search's scoring/min_score
+        pattern in retrieval.py - callers get a real quality gate instead
+        of reaching into `.graph` themselves and treating any token overlap
+        as a match. Tokenization is cached per node (invalidated in
+        add_node) since node text is static between graph mutations and
+        this scan is O(number of nodes) per call.
+        """
+        query_tokens = search_tokens(query)
+        if not query_tokens:
+            return []
+        hits: list[NodeSearchHit] = []
+        for node_id, data in self.graph.nodes(data=True):
+            node_tokens = self._node_tokens(node_id, data)
+            if not node_tokens:
+                continue
+            overlap = query_tokens & node_tokens
+            if not overlap:
+                continue
+            score = len(overlap) / len(query_tokens)
+            if score >= min_score:
+                hits.append(
+                    NodeSearchHit(
+                        node_id=node_id,
+                        score=score,
+                        name=data.get("name", node_id),
+                        type=data.get("type", "UNKNOWN"),
+                        description=data.get("description", ""),
+                    )
+                )
+        hits.sort(key=lambda hit: (-hit.score, hit.node_id))
+        return hits[:limit]
+
+    def get_node(self, node_id: str) -> dict[str, Any] | None:
+        if node_id not in self.graph:
+            return None
+        return dict(self.graph.nodes[node_id])
+
+    def get_incident_edges(self, node_id: str) -> list[IncidentEdge]:
+        """All edges touching node_id, deduplicated (MultiDiGraph can
+        return the same edge from both an in- and out-edge query if it's a
+        self-loop)."""
+        if node_id not in self.graph:
+            return []
+        combined = list(
+            self.graph.in_edges(node_id, keys=True, data=True)
+        ) + list(self.graph.out_edges(node_id, keys=True, data=True))
+        seen: set[str] = set()
+        edges: list[IncidentEdge] = []
+        for source_id, target_id, edge_id, data in combined:
+            if edge_id in seen:
+                continue
+            seen.add(edge_id)
+            edges.append(
+                IncidentEdge(
+                    edge_id=edge_id,
+                    source_id=source_id,
+                    target_id=target_id,
+                    source_name=self.graph.nodes.get(source_id, {}).get(
+                        "name", source_id
+                    ),
+                    target_name=self.graph.nodes.get(target_id, {}).get(
+                        "name", target_id
+                    ),
+                    relation=data.get("type", "UNKNOWN"),
+                    source_quote=data.get("source_quote") or "",
+                    source_paper_id=data.get("source_paper_id"),
+                    source_section=data.get("source_section"),
+                )
+            )
+        return edges
 
     def _stable_node_id(
         self, paper_id: str, name: str, node_type: NodeType

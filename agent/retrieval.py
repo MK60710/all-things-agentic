@@ -17,31 +17,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from agent.schema import ExtractionChunk
+from agent.text_utils import escape_tag_delimiters as _escape_tag_delimiters
+from agent.text_utils import search_tokens as _search_tokens
 
 
 EmbeddingFn = Callable[[str], list[float]]
-
-_STOP_WORDS = {
-    "a", "an", "and", "are", "as", "at", "be", "by", "did", "do", "does",
-    "for", "from", "how", "in", "is", "it", "of", "on", "or", "that", "the",
-    "this", "to", "was", "were", "what", "when", "where", "which", "with",
-}
-
-
-def _search_tokens(text: str) -> set[str]:
-    tokens = re.findall(r"[a-z0-9]+", text.lower())
-    return {token for token in tokens if token not in _STOP_WORDS}
-
-
-def _escape_tag_delimiters(value: str) -> str:
-    """Escape the angle brackets that delimit assemble_context's
-    <source_metadata> wrapper. json.dumps() only escapes JSON-syntax
-    characters (quotes, backslashes) - it does nothing for '<'/'>', so an
-    untrusted paper_id/section/chunk text containing the literal string
-    "</source_metadata>" could still close the tag early and forge a fake
-    metadata block of its own. Every untrusted value placed near the tag
-    boundary needs this, not just the JSON-encoded fields."""
-    return value.replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
