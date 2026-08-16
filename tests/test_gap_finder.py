@@ -126,9 +126,15 @@ def test_feedback_writes_event_to_firestore(fake_db):
 
 
 class _FakeModels:
-    def __init__(self, text: str | None = None, error: Exception | None = None):
+    def __init__(
+        self,
+        text: str | None = None,
+        error: Exception | None = None,
+        finish_reason=None,
+    ):
         self._text = text
         self._error = error
+        self._finish_reason = finish_reason
         self.last_call: dict | None = None
         self.call_count = 0
 
@@ -137,12 +143,22 @@ class _FakeModels:
         self.last_call = {"model": model, "contents": contents, "config": config}
         if self._error is not None:
             raise self._error
-        return SimpleNamespace(text=self._text)
+        candidates = (
+            [SimpleNamespace(finish_reason=self._finish_reason)]
+            if self._finish_reason is not None
+            else None
+        )
+        return SimpleNamespace(text=self._text, candidates=candidates)
 
 
 class _FakeGenaiClient:
-    def __init__(self, text: str | None = None, error: Exception | None = None):
-        self.models = _FakeModels(text=text, error=error)
+    def __init__(
+        self,
+        text: str | None = None,
+        error: Exception | None = None,
+        finish_reason=None,
+    ):
+        self.models = _FakeModels(text=text, error=error, finish_reason=finish_reason)
 
 
 def test_gemini_explainer_returns_model_text():
@@ -331,3 +347,100 @@ def test_gap_finder_refreshes_explanation_when_graph_evidence_changes(fake_db):
         for evidence in calls
     )
     assert "New Shared Neighbor" in original_pair.explanation
+
+
+def test_gemini_explainer_does_not_cache_a_truncated_response(fake_db):
+    """A response cut off by max_output_tokens must not be permanently
+    remembered as if it were the real answer."""
+    from google.genai import types as genai_types
+
+    gm, a, b, shared = _populated_graph(fake_db)
+    fake_client = _FakeGenaiClient(
+        text="This explanation got cut off mid",
+        finish_reason=genai_types.FinishReason.MAX_TOKENS,
+    )
+    gf = GapFinder(gm, explain_fn=GeminiExplainer(client=fake_client))
+
+    first = gf.find_candidates()
+    assert "share context" in first[0].explanation  # template, not the cutoff
+
+    fake_client.models._finish_reason = None
+    fake_client.models._text = "A complete, untruncated explanation."
+    second = gf.find_candidates()
+
+    assert fake_client.models.call_count == 2  # retried, not served from cache
+    assert second[0].explanation == "A complete, untruncated explanation."
+
+
+def test_gemini_explainer_backoff_skips_live_call_after_failure():
+    """backoff_seconds is opt-in (default 0 preserves always-retry
+    behavior, covered by test_gap_finder_retries_after_transient_gemini_
+    failure) - set explicitly, a failure should suppress the next live
+    call instead of blocking on it again immediately."""
+    fake_client = _FakeGenaiClient(error=RuntimeError("outage"))
+    explainer = GeminiExplainer(client=fake_client, backoff_seconds=30.0)
+
+    first = explainer("A", "B", [])
+    assert "share context" in first
+    assert fake_client.models.call_count == 1
+
+    fake_client.models._error = None
+    fake_client.models._text = "Recovered."
+    second = explainer("A", "B", [])
+
+    assert fake_client.models.call_count == 1  # skipped, still in backoff
+    assert "share context" in second
+
+
+def test_gap_finder_explanation_cache_evicts_oldest_when_full(fake_db):
+    gm = GraphManager(project_id="test-project", db_client=fake_db)
+    pairs = []
+    for i in range(3):
+        a, b, shared = _node(f"A{i}"), _node(f"B{i}"), _node(f"S{i}")
+        gm.add_node(a)
+        gm.add_node(b)
+        gm.add_node(shared)
+        gm.add_edge(_edge(shared.id, a.id))
+        gm.add_edge(_edge(shared.id, b.id))
+        pairs.append((a, b))
+
+    call_count = {"n": 0}
+
+    def explain(name_a: str, name_b: str, evidence: list[str]) -> str:
+        call_count["n"] += 1
+        return f"explanation #{call_count['n']}"
+
+    gf = GapFinder(gm, explain_fn=explain, max_cache_size=2)
+    gf.find_candidates(limit=3)
+    assert call_count["n"] == 3
+
+    # Cache can hold only 2 - the first pair's entry was evicted, so
+    # asking again must re-explain instead of serving a stale/missing hit.
+    gf.find_candidates(limit=3)
+    assert call_count["n"] > 3
+
+
+def test_gap_finder_explains_multiple_cache_misses_concurrently(fake_db):
+    """Each cache-miss explain_fn call must still run and land on the
+    right candidate even when dispatched through the thread pool."""
+    gm = GraphManager(project_id="test-project", db_client=fake_db)
+    expected: dict[str, str] = {}
+    for i in range(4):
+        a, b, shared = _node(f"A{i}"), _node(f"B{i}"), _node(f"S{i}")
+        gm.add_node(a)
+        gm.add_node(b)
+        gm.add_node(shared)
+        gm.add_edge(_edge(shared.id, a.id))
+        gm.add_edge(_edge(shared.id, b.id))
+        expected[frozenset((a.id, b.id))] = f"explanation for {a.name}/{b.name}"
+
+    def explain(name_a: str, name_b: str, evidence: list[str]) -> str:
+        return f"explanation for {name_a}/{name_b}"
+
+    gf = GapFinder(gm, explain_fn=explain)
+    candidates = gf.find_candidates(limit=10)
+
+    assert len(candidates) == 4
+    for c in candidates:
+        key = frozenset((c.node_a_id, c.node_b_id))
+        assert c.explanation == expected[key]
