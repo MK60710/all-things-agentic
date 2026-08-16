@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from types import SimpleNamespace
 
@@ -555,3 +556,78 @@ def test_citations_present_even_when_explanation_is_served_from_cache(fake_db):
 
     assert len(cached.citations) == 2
     assert {c.connects_to for c in cached.citations} == {"node_a", "node_b"}
+
+
+def test_max_cache_size_zero_disables_caching_without_crashing(fake_db):
+    """len(cache) >= 0 is always true, so a naive eviction check tries to
+    pop from a possibly-empty dict when max_cache_size=0 - this must
+    disable caching outright instead of crashing."""
+    gm, a, b, shared = _populated_graph(fake_db)
+    call_count = {"n": 0}
+
+    def explain(name_a: str, name_b: str, evidence: list[str]) -> str:
+        call_count["n"] += 1
+        return f"explanation #{call_count['n']}"
+
+    gf = GapFinder(gm, explain_fn=explain, max_cache_size=0)
+
+    gf.find_candidates()
+    gf.find_candidates()
+
+    assert call_count["n"] == 2  # never cached, never crashed
+
+
+def test_max_explain_workers_zero_runs_without_crashing(fake_db):
+    """ThreadPoolExecutor rejects max_workers=0 - a caller passing this to
+    mean 'minimal parallelism' must still get a working (if sequential)
+    result, not a ValueError."""
+    gm = GraphManager(project_id="test-project", db_client=fake_db)
+    for i in range(3):
+        a, b, shared = _node(f"A{i}"), _node(f"B{i}"), _node(f"S{i}")
+        gm.add_node(a)
+        gm.add_node(b)
+        gm.add_node(shared)
+        gm.add_edge(_edge(shared.id, a.id))
+        gm.add_edge(_edge(shared.id, b.id))
+
+    gf = GapFinder(gm, explain_fn=_stub_explain, max_explain_workers=0)
+
+    candidates = gf.find_candidates(limit=3)
+
+    assert len(candidates) == 3
+    assert all(c.explanation is not None for c in candidates)
+
+
+def test_gemini_explainer_client_construction_is_thread_safe(monkeypatch):
+    """GapFinder dispatches explain_fn through a ThreadPoolExecutor, so the
+    same GeminiExplainer instance's lazy client construction must not race
+    - an artificial delay widens the window so an unsynchronized
+    check-then-set would reliably double-construct."""
+    import threading
+
+    construction_count = {"n": 0}
+    count_lock = threading.Lock()
+
+    class _SlowClient:
+        def __init__(self, **kwargs):
+            time.sleep(0.05)
+            with count_lock:
+                construction_count["n"] += 1
+            self.models = SimpleNamespace(
+                generate_content=lambda **kwargs: SimpleNamespace(
+                    text="ok", candidates=None
+                )
+            )
+
+    monkeypatch.setattr("agent.gap_finder.genai.Client", _SlowClient)
+    explainer = GeminiExplainer()  # no client injected - constructs lazily
+
+    threads = [
+        threading.Thread(target=explainer, args=("A", "B", [])) for _ in range(5)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert construction_count["n"] == 1

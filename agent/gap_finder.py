@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from collections.abc import Callable
@@ -133,6 +134,14 @@ class GeminiExplainer:
         self._location = location
         self._backoff_seconds = backoff_seconds
         self._retry_after: float = 0.0
+        # GapFinder.find_candidates dispatches explain_fn calls through a
+        # ThreadPoolExecutor, so the same GeminiExplainer instance is the
+        # documented intended wiring for concurrent __call__s - this lock
+        # protects lazy client construction and backoff-state mutation, the
+        # two bits of mutable instance state __call__ touches. It is never
+        # held across the actual network call, so concurrent requests still
+        # run in parallel.
+        self._lock = threading.Lock()
         # Constructed lazily on first call, inside the same try/except that
         # covers generate_content - a bad ADC/project config previously
         # raised here in __init__, outside any fallback path, contradicting
@@ -141,17 +150,22 @@ class GeminiExplainer:
         self._client = client
 
     def _get_client(self) -> genai.Client:
-        if self._client is None:
-            self._client = genai.Client(
-                vertexai=True,
-                project=self._project or os.environ.get("GOOGLE_CLOUD_PROJECT"),
-                location=self._location
-                or os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1"),
-            )
-        return self._client
+        with self._lock:
+            if self._client is None:
+                self._client = genai.Client(
+                    vertexai=True,
+                    project=self._project or os.environ.get("GOOGLE_CLOUD_PROJECT"),
+                    location=self._location
+                    or os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1"),
+                )
+            return self._client
 
     def __call__(self, name_a: str, name_b: str, evidence: list[str]) -> str:
-        if self._backoff_seconds and time.monotonic() < self._retry_after:
+        with self._lock:
+            in_backoff = (
+                self._backoff_seconds and time.monotonic() < self._retry_after
+            )
+        if in_backoff:
             logger.warning(
                 "GeminiExplainer is in backoff after a recent failure, "
                 "skipping the live call and falling back to template"
@@ -194,7 +208,8 @@ class GeminiExplainer:
             finish_reason = candidates[0].finish_reason if candidates else None
             truncated = finish_reason == genai_types.FinishReason.MAX_TOKENS
             if text and not truncated:
-                self._retry_after = 0.0
+                with self._lock:
+                    self._retry_after = 0.0
                 return Explanation(text, cacheable=True)
             if truncated:
                 logger.warning(
@@ -217,7 +232,8 @@ class GeminiExplainer:
                 exc_info=True,
             )
         if self._backoff_seconds:
-            self._retry_after = time.monotonic() + self._backoff_seconds
+            with self._lock:
+                self._retry_after = time.monotonic() + self._backoff_seconds
         # Preserve the string-returning ExplainFn API while marking transient
         # fallbacks so GapFinder can retry Gemini on the next request.
         return Explanation(
@@ -256,6 +272,10 @@ class GapFinder:
         self._explanation_cache: dict[
             tuple[str, str, str, str, tuple[tuple[str, str], ...]], str
         ] = {}
+        # Cache reads/writes happen from ThreadPoolExecutor worker threads
+        # in find_candidates below, plus potentially concurrent calls to
+        # find_candidates itself on the same GapFinder instance.
+        self._cache_lock = threading.Lock()
 
     def _citations_for(self, candidate: GapCandidate) -> list[GapCitation]:
         """The edges connecting each shared neighbor to node_a/node_b -
@@ -353,7 +373,8 @@ class GapFinder:
                 endpoints[1][1],
                 evidence,
             )
-            cached = self._explanation_cache.get(cache_key)
+            with self._cache_lock:
+                cached = self._explanation_cache.get(cache_key)
             if cached is not None:
                 c.explanation = cached
                 continue
@@ -365,8 +386,11 @@ class GapFinder:
             # independent - running them sequentially made total latency
             # additive across every cache miss in a single find_candidates()
             # call, which matters for what's meant to be an interactive tool.
+            # max(1, ...) - a caller passing max_explain_workers=0 to mean
+            # "minimal parallelism" should get sequential execution, not a
+            # ThreadPoolExecutor ValueError.
             with ThreadPoolExecutor(
-                max_workers=min(len(pending), self._max_explain_workers)
+                max_workers=max(1, min(len(pending), self._max_explain_workers))
             ) as pool:
                 futures = {
                     pool.submit(
@@ -376,12 +400,20 @@ class GapFinder:
                 }
                 for future, (c, cache_key) in futures.items():
                     c.explanation = future.result()
-                    if getattr(c.explanation, "cacheable", True):
-                        if len(self._explanation_cache) >= self._max_cache_size:
-                            self._explanation_cache.pop(
-                                next(iter(self._explanation_cache))
-                            )
-                        self._explanation_cache[cache_key] = c.explanation
+                    # max_cache_size <= 0 means caching is disabled outright,
+                    # not "evict immediately then insert anyway" - len(...)
+                    # >= 0 is always true, which used to insert one entry
+                    # regardless of the configured limit.
+                    if (
+                        getattr(c.explanation, "cacheable", True)
+                        and self._max_cache_size > 0
+                    ):
+                        with self._cache_lock:
+                            if len(self._explanation_cache) >= self._max_cache_size:
+                                self._explanation_cache.pop(
+                                    next(iter(self._explanation_cache)), None
+                                )
+                            self._explanation_cache[cache_key] = c.explanation
         return top
 
     def record_feedback(
