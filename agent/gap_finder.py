@@ -17,13 +17,14 @@ import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from typing import Literal
 
 import networkx as nx
 from google import genai
 from google.genai import types as genai_types
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from agent.graph_manager import GraphManager
+from agent.graph_manager import GraphManager, IncidentEdge
 from agent.schema import NodeType
 from agent.text_utils import escape_tag_delimiters
 
@@ -48,6 +49,22 @@ class Explanation(str):
         return instance
 
 
+class GapCitation(BaseModel):
+    """Provenance for one edge connecting a shared neighbor to either side
+    of a candidate pair - the concrete paper/quote evidence behind why two
+    nodes are considered a gap, not just their bare common_neighbor_ids.
+    Mirrors query_agent.py's QueryCitation for the same class of
+    graph-provenance data."""
+
+    shared_node_id: str
+    shared_node_name: str
+    connects_to: Literal["node_a", "node_b"]
+    relation: str
+    source_paper_id: str | None = None
+    source_section: str | None = None
+    source_quote: str = ""
+
+
 class GapCandidate(BaseModel):
     node_a_id: str
     node_b_id: str
@@ -56,6 +73,7 @@ class GapCandidate(BaseModel):
     common_neighbor_ids: list[str]
     score: float
     explanation: str | None = None
+    citations: list[GapCitation] = Field(default_factory=list)
 
 
 def _format_shared_context(evidence: list[str]) -> str:
@@ -239,6 +257,41 @@ class GapFinder:
             tuple[str, str, str, str, tuple[tuple[str, str], ...]], str
         ] = {}
 
+    def _citations_for(self, candidate: GapCandidate) -> list[GapCitation]:
+        """The edges connecting each shared neighbor to node_a/node_b -
+        the actual paper/quote evidence behind why this pair surfaced,
+        not just their bare node ids."""
+        citations: list[GapCitation] = []
+        for neighbor_id in candidate.common_neighbor_ids:
+            neighbor_name = self._gm.graph.nodes[neighbor_id].get(
+                "name", neighbor_id
+            )
+            edge: IncidentEdge
+            for edge in self._gm.get_incident_edges(neighbor_id):
+                other_id = (
+                    edge.target_id
+                    if edge.source_id == neighbor_id
+                    else edge.source_id
+                )
+                if other_id == candidate.node_a_id:
+                    side: Literal["node_a", "node_b"] = "node_a"
+                elif other_id == candidate.node_b_id:
+                    side = "node_b"
+                else:
+                    continue
+                citations.append(
+                    GapCitation(
+                        shared_node_id=neighbor_id,
+                        shared_node_name=neighbor_name,
+                        connects_to=side,
+                        relation=edge.relation,
+                        source_paper_id=edge.source_paper_id,
+                        source_section=edge.source_section,
+                        source_quote=edge.source_quote,
+                    )
+                )
+        return citations
+
     def find_candidates(
         self, node_type: NodeType | None = None, limit: int = 5
     ) -> list[GapCandidate]:
@@ -267,6 +320,12 @@ class GapFinder:
 
         candidates.sort(key=lambda c: c.score, reverse=True)
         top = candidates[:limit]
+
+        for c in top:
+            # Topology-derived, not model-derived - computed for every
+            # candidate regardless of explanation cache status, since a
+            # cached explanation string doesn't carry evidence with it.
+            c.citations = self._citations_for(c)
 
         pending: list[tuple[GapCandidate, tuple, list[str]]] = []
         for c in top:
