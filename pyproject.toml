@@ -21,3 +21,8 @@ dev = [
 local-semantic = [
     "fastembed>=0.7.0",
 ]
+
+[tool.pytest.ini_options]
+markers = [
+    "live: hits real Vertex AI (requires ADC credentials and GOOGLE_CLOUD_PROJECT); skipped unless RUN_LIVE_TESTS=1 is set",
+]
