@@ -75,6 +75,80 @@ def test_get_neighbors(fake_db):
     assert a.id in gm.get_neighbors(b.id)
 
 
+def test_search_nodes_ranks_by_token_overlap(fake_db):
+    gm = _make_manager(fake_db)
+    strong = _node("Sparse Attention Mechanism")
+    weak = _node("Mechanism For Data Loading")
+    gm.add_node(strong)
+    gm.add_node(weak)
+
+    hits = gm.search_nodes("sparse attention mechanism", min_score=0.0)
+
+    assert [hit.node_id for hit in hits[:2]] == [strong.id, weak.id]
+    assert hits[0].score > hits[1].score
+
+
+def test_search_nodes_min_score_gates_low_relevance_matches(fake_db):
+    gm = _make_manager(fake_db)
+    node = _node("Mechanism For Data Loading")
+    gm.add_node(node)
+
+    # Only "mechanism" overlaps out of 4 query tokens (score 0.25) - below
+    # a reasonable relevance bar, unlike the old any-overlap-wins behavior.
+    hits = gm.search_nodes(
+        "sparse attention scoring mechanism", min_score=0.4
+    )
+
+    assert hits == []
+
+
+def test_search_nodes_reflects_updated_node_data(fake_db):
+    """The per-node token cache must not serve stale tokens after an
+    add_node upsert changes a node's name/description."""
+    gm = _make_manager(fake_db)
+    node_id = str(uuid.uuid4())
+    gm.add_node(Node(id=node_id, type=NodeType.CONCEPT, name="Placeholder"))
+    assert gm.search_nodes("gradient clipping", min_score=0.5) == []
+
+    gm.add_node(
+        Node(id=node_id, type=NodeType.CONCEPT, name="Gradient Clipping")
+    )
+
+    hits = gm.search_nodes("gradient clipping", min_score=0.5)
+    assert [hit.node_id for hit in hits] == [node_id]
+
+
+def test_get_incident_edges_deduplicates_and_resolves_names(fake_db):
+    gm = _make_manager(fake_db)
+    a, b = _node("Method A"), _node("Metric B")
+    gm.add_node(a)
+    gm.add_node(b)
+    gm.add_edge(
+        Edge(
+            id=str(uuid.uuid4()),
+            source_id=a.id,
+            target_id=b.id,
+            type=EdgeType.USES,
+            provenance=ProvenanceTag.EXTRACTED,
+            source_paper_id="paper-1",
+            source_quote="quote",
+        )
+    )
+
+    edges_from_a = gm.get_incident_edges(a.id)
+    edges_from_b = gm.get_incident_edges(b.id)
+
+    assert len(edges_from_a) == 1
+    assert edges_from_a[0].source_name == "Method A"
+    assert edges_from_a[0].target_name == "Metric B"
+    assert edges_from_b == edges_from_a
+
+
+def test_get_node_returns_none_for_unknown_id(fake_db):
+    gm = _make_manager(fake_db)
+    assert gm.get_node("does-not-exist") is None
+
+
 def test_canonicalize_string_match_auto_merges(fake_db):
     gm = _make_manager(fake_db)
     existing = _node("Chain of Thought")
