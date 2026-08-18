@@ -101,10 +101,20 @@ class QueryAgent:
         min_graph_score: float = 0.4,
         timeout_ms: int = 15_000,
         max_output_tokens: int = 1024,
+        # disambiguation_margin/confident_score are QueryAgent's version of
+        # the same score-band decision graph_manager.py's
+        # CANONICALIZATION_HIGH/CANONICALIZATION_LOW already make for
+        # canonicalization - different shape (relative margin + a soft-use
+        # floor, vs. two absolute bands) because query-time ambiguity and
+        # write-time canonicalization aren't quite the same decision, but
+        # tuning one against real corpus data without checking the other
+        # can leave them meaning different things on the same 0-1 score
+        # scale. Not yet corpus-measured, same caveat as min_graph_score
+        # above.
+        #
         # How close the top two-or-more distinct node matches' scores need
         # to be to treat the query as genuinely ambiguous rather than
-        # picking the top one silently. Not yet corpus-measured, same
-        # caveat as min_graph_score above.
+        # picking the top one silently.
         disambiguation_margin: float = 0.1,
         max_disambiguation_candidates: int = 4,
         # The in-between, not-ambiguous-enough-to-ask case from the Part 5
@@ -154,12 +164,22 @@ class QueryAgent:
                 retrieval_mode="no_results",
             )
 
-        ambiguous_hits = self._check_query_ambiguity(cleaned_query)
+        graph_hits = (
+            self._graph.search_nodes(
+                cleaned_query,
+                limit=self._max_graph_nodes,
+                min_score=self._min_graph_score,
+            )
+            if self._graph is not None
+            else []
+        )
+
+        ambiguous_hits = self._check_query_ambiguity(graph_hits)
         if ambiguous_hits is not None:
             return self._ambiguous_result(cleaned_query, ambiguous_hits)
 
         graph_context, graph_citations, graph_best_score = self._graph_evidence(
-            cleaned_query
+            graph_hits
         )
         if graph_citations:
             self._metrics["graph_hits"] += 1
@@ -221,7 +241,9 @@ class QueryAgent:
             return "low"
         return "confident"
 
-    def _check_query_ambiguity(self, query: str) -> list[NodeSearchHit] | None:
+    def _check_query_ambiguity(
+        self, hits: list[NodeSearchHit]
+    ) -> list[NodeSearchHit] | None:
         """Return the close-scoring node matches if the query is genuinely
         ambiguous between two or more distinct entities, else None.
 
@@ -229,13 +251,11 @@ class QueryAgent:
         different entities even if they happen to share a name (e.g. the
         same word used as a CONCEPT in one paper and part of a METHOD name
         in another) - that's exactly the case worth asking about, not
-        picking the higher-scoring one silently.
+        picking the higher-scoring one silently. Takes hits rather than
+        the raw query so answer() can share one search_nodes scan with
+        _graph_evidence instead of paying the O(number of nodes) cost
+        twice per query.
         """
-        if self._graph is None:
-            return None
-        hits = self._graph.search_nodes(
-            query, limit=self._max_graph_nodes, min_score=self._min_graph_score
-        )
         if len(hits) < 2:
             return None
         top_score = hits[0].score
@@ -275,13 +295,8 @@ class QueryAgent:
         )
 
     def _graph_evidence(
-        self, query: str
+        self, hits: list[NodeSearchHit]
     ) -> tuple[str, list[QueryCitation], float | None]:
-        if self._graph is None:
-            return "", [], None
-        hits = self._graph.search_nodes(
-            query, limit=self._max_graph_nodes, min_score=self._min_graph_score
-        )
         if not hits:
             return "", [], None
 

@@ -364,6 +364,84 @@ def test_ambiguous_relation_endpoint_is_skipped_not_paper_fatal(fake_db):
     assert len(report.node_writes) == 3
 
 
+def test_search_nodes_excludes_merged_alias_nodes(fake_db):
+    """After resolve_alias merges an alias into a canonical node, the alias
+    must stop showing up as its own independent search hit - otherwise a
+    query that already got disambiguated once keeps looking ambiguous
+    forever, since search_nodes has no other way to know the two node ids
+    now refer to the same real-world entity."""
+    gm = _make_manager(fake_db)
+    canonical = _node("Fine-Tuning")
+    alias = _node("Parameter Tuning")
+    gm.add_node(canonical)
+    gm.add_node(alias)
+    assert len(gm.search_nodes("fine tuning parameter", min_score=0.0)) == 2
+
+    gm.resolve_alias(canonical.id, alias.id)
+
+    hits = gm.search_nodes("fine tuning parameter", min_score=0.0)
+    assert [hit.node_id for hit in hits] == [canonical.id]
+
+
+def test_search_nodes_still_returns_pairs_marked_distinct(fake_db):
+    """distinct=True must not exclude a node from search - only an actual
+    merge (SAME_AS edge) does. Two nodes correctly marked as different
+    things should both keep showing up."""
+    gm = _make_manager(fake_db)
+    a, b = _node("Concept A"), _node("Concept B")
+    gm.add_node(a)
+    gm.add_node(b)
+
+    gm.resolve_alias(a.id, b.id, distinct=True)
+
+    hits = gm.search_nodes("concept", min_score=0.0)
+    assert {hit.node_id for hit in hits} == {a.id, b.id}
+
+
+def test_needs_clarification_does_not_reask_a_pair_already_marked_distinct(fake_db):
+    """If the exact (candidate, provisional) pair apply_extraction_result
+    is about to ask a question for is already recorded as known-distinct
+    (e.g. a person already answered "no, genuinely different" for it in an
+    earlier attempt that didn't complete for unrelated reasons), it must
+    not register a duplicate identical question - resolve_alias's own
+    docstring promises the same question isn't asked again."""
+    gm = _make_manager(fake_db)
+    existing = _node("Fine-Tuning", embedding=[1.0, 0.0])
+    gm.add_node(existing)
+    orchestrator = ClarificationOrchestrator(graph_manager=gm)
+
+    extraction = ExtractionResult(
+        paper_id="paper-1",
+        entities=[
+            ExtractedEntity(
+                name="Parameter Tuning",
+                type=NodeType.CONCEPT,
+                description="A tuning approach",
+            )
+        ],
+        relations=[],
+    )
+    embedding_fn = lambda entity: [0.8, 0.6]  # needs_clarification band
+
+    # Pre-seed _known_distinct with exactly the pair this extraction is
+    # about to land on - the same deterministic id apply_extraction_result
+    # itself would compute for this paper_id/type/name.
+    provisional_id = gm._stable_node_id(
+        "paper-1", "Parameter Tuning", NodeType.CONCEPT
+    )
+    gm._known_distinct.add(tuple(sorted((existing.id, provisional_id))))
+
+    report = gm.apply_extraction_result(
+        extraction, embedding_fn=embedding_fn, clarification=orchestrator
+    )
+
+    # The node itself is still created (canonicalize() still says
+    # needs_clarification) - only the question is suppressed.
+    assert report.node_writes[0].node_id == provisional_id
+    assert report.node_writes[0].decision == "needs_clarification"
+    assert orchestrator.pending() == []
+
+
 def test_needs_clarification_still_creates_node_and_registers_question(fake_db):
     """The extraction-side clarification hook: a middle-band canonicalization
     match must still create the provisional node (so the batch never

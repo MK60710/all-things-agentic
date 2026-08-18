@@ -245,6 +245,16 @@ class GraphManager:
         self._node_token_cache[node_id] = tokens
         return tokens
 
+    def _is_merged_alias(self, node_id: str) -> bool:
+        """True if node_id has been resolved into another node via
+        resolve_alias(distinct=False) - a SAME_AS edge out of it means it's
+        superseded by its canonical target, not an independent entity
+        anymore."""
+        return any(
+            data.get("type") == EdgeType.SAME_AS.value
+            for _, _, data in self.graph.out_edges(node_id, data=True)
+        )
+
     def search_nodes(
         self, query: str, *, limit: int = 8, min_score: float = 0.0
     ) -> list[NodeSearchHit]:
@@ -255,13 +265,19 @@ class GraphManager:
         of reaching into `.graph` themselves and treating any token overlap
         as a match. Tokenization is cached per node (invalidated in
         add_node) since node text is static between graph mutations and
-        this scan is O(number of nodes) per call.
+        this scan is O(number of nodes) per call. Nodes already merged
+        into another node (resolve_alias(distinct=False)) are excluded -
+        otherwise a resolved entity_merge question keeps resurfacing the
+        same ambiguity on every later query, since the alias node would
+        still show up as an independent, separately-scored hit.
         """
         query_tokens = search_tokens(query)
         if not query_tokens:
             return []
         hits: list[NodeSearchHit] = []
         for node_id, data in self.graph.nodes(data=True):
+            if self._is_merged_alias(node_id):
+                continue
             node_tokens = self._node_tokens(node_id, data)
             if not node_tokens:
                 continue
@@ -469,16 +485,23 @@ class GraphManager:
                     )
                 )
                 reused = False
+                already_distinct = canonical.matched_node_id is not None and tuple(
+                    sorted((canonical.matched_node_id, node_id))
+                ) in self._known_distinct
                 if (
                     canonical.decision == "needs_clarification"
                     and canonical.matched_node_id
                     and clarification is not None
+                    and not already_distinct
                 ):
                     # The node is created either way so the batch never
                     # stalls on a person - this just tags the provisional
                     # node so a later answer can merge it via
                     # resolve_alias, same fix-it mechanism used for
-                    # manual corrections today.
+                    # manual corrections today. already_distinct guards a
+                    # retry of this exact pair (deterministic node_id) from
+                    # re-asking a question a person already answered
+                    # "no, genuinely different" for.
                     matched_data = self.graph.nodes.get(
                         canonical.matched_node_id, {}
                     )
