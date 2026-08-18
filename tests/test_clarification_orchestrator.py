@@ -7,6 +7,8 @@ import pytest
 from agent.clarification_orchestrator import (
     DISTINCT_OPTION_ID,
     ClarificationOrchestrator,
+    EntityMergeQuestion,
+    QueryDisambiguationQuestion,
 )
 from agent.graph_manager import GraphManager, NodeSearchHit
 from agent.schema import Node, NodeType
@@ -18,6 +20,48 @@ def _make_graph(fake_db) -> GraphManager:
 
 def _node(name: str) -> Node:
     return Node(id=str(uuid.uuid4()), type=NodeType.CONCEPT, name=name)
+
+
+def test_register_entity_merge_question_returns_the_discriminated_type(fake_db):
+    """provisional_node_id/candidate_node_id are required, non-optional
+    fields on EntityMergeQuestion specifically - not str | None on a
+    dataclass shared with query_disambiguation, which would let a
+    question ever exist with those unset even though answer() feeds them
+    straight into GraphManager.resolve_alias's non-Optional str params."""
+    orchestrator = ClarificationOrchestrator(graph_manager=_make_graph(fake_db))
+    question = orchestrator.register_entity_merge_question(
+        provisional_node_id="p", entity_name="X", candidate_node_id="c", candidate_name="Y"
+    )
+
+    assert isinstance(question, EntityMergeQuestion)
+    assert not isinstance(question, QueryDisambiguationQuestion)
+
+
+def test_entity_merge_question_requires_provisional_and_candidate_ids():
+    with pytest.raises(TypeError):
+        EntityMergeQuestion(
+            id="q1",
+            question="?",
+            options=[],
+            candidate_node_id="c",
+            # provisional_node_id omitted - must not silently default to None.
+        )
+
+
+def test_register_query_disambiguation_returns_the_discriminated_type(fake_db):
+    orchestrator = ClarificationOrchestrator()
+    question = orchestrator.register_query_disambiguation(
+        "what is attention?",
+        [NodeSearchHit(node_id="a", score=0.5, name="A", type="CONCEPT", description="")],
+    )
+
+    assert isinstance(question, QueryDisambiguationQuestion)
+    assert not isinstance(question, EntityMergeQuestion)
+
+
+def test_query_disambiguation_question_requires_query_text():
+    with pytest.raises(TypeError):
+        QueryDisambiguationQuestion(id="q1", question="?", options=[])
 
 
 def test_entity_merge_question_merge_answer_writes_same_as_edge(fake_db):
