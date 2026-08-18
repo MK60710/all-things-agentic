@@ -13,9 +13,12 @@ import math
 import re
 import uuid
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import networkx as nx
+
+if TYPE_CHECKING:
+    from agent.clarification_orchestrator import ClarificationOrchestrator
 
 try:
     from google.cloud import firestore
@@ -416,6 +419,7 @@ class GraphManager:
         *,
         paper_name: str | None = None,
         embedding_fn: Callable[[ExtractedEntity], list[float] | None] | None = None,
+        clarification: "ClarificationOrchestrator | None" = None,
     ) -> GraphIngestionReport:
         """Persist structured extraction output with stable, retry-safe IDs."""
 
@@ -465,6 +469,29 @@ class GraphManager:
                     )
                 )
                 reused = False
+                if (
+                    canonical.decision == "needs_clarification"
+                    and canonical.matched_node_id
+                    and clarification is not None
+                ):
+                    # The node is created either way so the batch never
+                    # stalls on a person - this just tags the provisional
+                    # node so a later answer can merge it via
+                    # resolve_alias, same fix-it mechanism used for
+                    # manual corrections today.
+                    matched_data = self.graph.nodes.get(
+                        canonical.matched_node_id, {}
+                    )
+                    clarification.register_entity_merge_question(
+                        provisional_node_id=node_id,
+                        entity_name=entity.name,
+                        candidate_node_id=canonical.matched_node_id,
+                        candidate_name=matched_data.get(
+                            "name", canonical.matched_node_id
+                        ),
+                        candidate_description=matched_data.get("description", ""),
+                        score=canonical.score,
+                    )
             entity_to_node_id[(_normalize_name(entity.name), entity.type)] = node_id
             node_writes.append(
                 NodeWriteResult(

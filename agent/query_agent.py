@@ -15,13 +15,14 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
 
+from agent.clarification_orchestrator import ClarificationOrchestrator
 from agent.graph_manager import GraphManager, IncidentEdge, NodeSearchHit
 from agent.retrieval import ChunkIndex
 from agent.text_utils import escape_tag_delimiters
 
 logger = logging.getLogger(__name__)
 
-RetrievalMode = Literal["graph", "vector", "no_results"]
+RetrievalMode = Literal["graph", "vector", "no_results", "ambiguous"]
 
 
 class QueryCitation(BaseModel):
@@ -37,12 +38,26 @@ class QueryCitation(BaseModel):
     node_ids: list[str] = Field(default_factory=list)
 
 
+class QueryCandidate(BaseModel):
+    """One of several plausible entities a query might mean, returned
+    instead of a guessed answer when the top graph matches are too close
+    to call - see QueryAgent._check_query_ambiguity."""
+
+    node_id: str
+    name: str
+    type: str
+    description: str
+    score: float
+
+
 class QueryResult(BaseModel):
     answer: str
     citations: list[QueryCitation] = Field(default_factory=list)
     retrieval_mode: RetrievalMode
     graph_hit_count: int = 0
     vector_fallback_count: int = 0
+    candidates: list[QueryCandidate] = Field(default_factory=list)
+    clarification_question_id: str | None = None
 
 
 class QueryAgent:
@@ -76,6 +91,13 @@ class QueryAgent:
         min_graph_score: float = 0.4,
         timeout_ms: int = 15_000,
         max_output_tokens: int = 1024,
+        # How close the top two-or-more distinct node matches' scores need
+        # to be to treat the query as genuinely ambiguous rather than
+        # picking the top one silently. Not yet corpus-measured, same
+        # caveat as min_graph_score above.
+        disambiguation_margin: float = 0.1,
+        max_disambiguation_candidates: int = 4,
+        clarification: ClarificationOrchestrator | None = None,
     ):
         self._chunks = chunk_index
         self._graph = graph_manager
@@ -86,6 +108,9 @@ class QueryAgent:
         self._min_graph_score = min_graph_score
         self._timeout_ms = timeout_ms
         self._max_output_tokens = max_output_tokens
+        self._disambiguation_margin = disambiguation_margin
+        self._max_disambiguation_candidates = max_disambiguation_candidates
+        self._clarification = clarification
         self._client = client
         if self._client is None and project is not None:
             self._client = genai.Client(
@@ -109,6 +134,10 @@ class QueryAgent:
                 answer="Please provide a research question.",
                 retrieval_mode="no_results",
             )
+
+        ambiguous_hits = self._check_query_ambiguity(cleaned_query)
+        if ambiguous_hits is not None:
+            return self._ambiguous_result(cleaned_query, ambiguous_hits)
 
         graph_context, graph_citations = self._graph_evidence(cleaned_query)
         if graph_citations:
@@ -158,6 +187,59 @@ class QueryAgent:
             citations=citations,
             retrieval_mode="vector",
             vector_fallback_count=1,
+        )
+
+    def _check_query_ambiguity(self, query: str) -> list[NodeSearchHit] | None:
+        """Return the close-scoring node matches if the query is genuinely
+        ambiguous between two or more distinct entities, else None.
+
+        search_nodes returns one hit per node, so two hits are always
+        different entities even if they happen to share a name (e.g. the
+        same word used as a CONCEPT in one paper and part of a METHOD name
+        in another) - that's exactly the case worth asking about, not
+        picking the higher-scoring one silently.
+        """
+        if self._graph is None:
+            return None
+        hits = self._graph.search_nodes(
+            query, limit=self._max_graph_nodes, min_score=self._min_graph_score
+        )
+        if len(hits) < 2:
+            return None
+        top_score = hits[0].score
+        close = [hit for hit in hits if top_score - hit.score <= self._disambiguation_margin]
+        if len(close) < 2:
+            return None
+        return close[: self._max_disambiguation_candidates]
+
+    def _ambiguous_result(
+        self, query: str, candidates: list[NodeSearchHit]
+    ) -> QueryResult:
+        options = [
+            QueryCandidate(
+                node_id=hit.node_id,
+                name=hit.name,
+                type=hit.type,
+                description=hit.description,
+                score=hit.score,
+            )
+            for hit in candidates
+        ]
+        question_id = None
+        if self._clarification is not None:
+            question_id = self._clarification.register_query_disambiguation(
+                query, candidates
+            ).id
+        names = ", ".join(f'"{option.name}"' for option in options)
+        answer = (
+            "There are multiple things in the stored research that could "
+            f"match this question: {names}. Which one did you mean?"
+        )
+        return QueryResult(
+            answer=answer,
+            retrieval_mode="ambiguous",
+            candidates=options,
+            clarification_question_id=question_id,
         )
 
     def _graph_evidence(self, query: str) -> tuple[str, list[QueryCitation]]:
