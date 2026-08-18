@@ -224,6 +224,62 @@ def test_ambiguous_query_registers_a_pending_question_when_orchestrator_given(fa
     assert {opt.id for opt in pending[0].options} == {"method", "concept"}
 
 
+def test_low_confidence_graph_match_is_flagged_not_hidden(fake_db):
+    """The in-between case from the Part 5 plan: a graph match that clears
+    min_graph_score but is still a soft one (2 of 5 query tokens) must not
+    look identical to a clean match - confidence should say so."""
+    graph = GraphManager(project_id="test", db_client=fake_db)
+    graph.add_node(
+        Node(id="n1", type=NodeType.METHOD, name="Sparse Retrieval System")
+    )
+    agent = QueryAgent(ChunkIndex(), graph)
+
+    result = agent.answer("sparse retrieval mechanism gradient clipping")
+
+    assert result.retrieval_mode == "graph"
+    assert result.confidence == "low"
+
+
+def test_confident_graph_match_is_not_flagged(fake_db):
+    graph = GraphManager(project_id="test", db_client=fake_db)
+    graph.add_node(
+        Node(id="n1", type=NodeType.METHOD, name="Memory Retrieval Method")
+    )
+    agent = QueryAgent(ChunkIndex(), graph)
+
+    result = agent.answer("memory retrieval method")
+
+    assert result.retrieval_mode == "graph"
+    assert result.confidence == "confident"
+
+
+def test_low_confidence_vector_match_is_flagged_not_hidden():
+    """Same in-between case on the chunk-retrieval side - only 1 of 3
+    query tokens present caps the score below 0.6 regardless of the
+    vector-similarity component, so this must always land as low."""
+    index = ChunkIndex()
+    index.upsert_paper("paper-1", ["Something about gradient descent."])
+    agent = QueryAgent(index)
+
+    result = agent.answer("gradient unrelated tangent")
+
+    assert result.retrieval_mode == "vector"
+    assert result.confidence == "low"
+
+
+def test_confident_vector_match_is_not_flagged():
+    """Full lexical overlap guarantees score >= 0.65 regardless of the
+    vector-similarity component, so this must always land as confident."""
+    index = ChunkIndex()
+    index.upsert_paper("paper-1", ["A paper about gradient descent methods."])
+    agent = QueryAgent(index)
+
+    result = agent.answer("gradient descent methods")
+
+    assert result.retrieval_mode == "vector"
+    assert result.confidence == "confident"
+
+
 def test_gemini_response_text_property_raising_falls_back():
     """The google-genai SDK can raise from the response.text property
     itself (e.g. a safety-filtered response with no candidates), not just

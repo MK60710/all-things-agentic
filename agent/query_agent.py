@@ -1,8 +1,13 @@
 """Read-only, graph-first research question answering.
 
 The Query Agent keeps retrieval deterministic and uses Gemini only to turn
-retrieved evidence into a concise answer.  It deliberately does not expose
-graph write operations or implement clarification orchestration.
+retrieved evidence into a concise answer. It deliberately does not expose
+graph write operations. When two or more distinct entities are plausibly
+what a query means, it returns that as a clarifying question instead of
+guessing (see _check_query_ambiguity) and optionally hands the question to
+a ClarificationOrchestrator (agent/clarification_orchestrator.py) - the
+question and answer still happen in the same exchange, so this stays
+read-only either way.
 """
 
 from __future__ import annotations
@@ -58,6 +63,11 @@ class QueryResult(BaseModel):
     vector_fallback_count: int = 0
     candidates: list[QueryCandidate] = Field(default_factory=list)
     clarification_question_id: str | None = None
+    # The in-between case from the Part 5 plan: "confident" is the default
+    # for no_results/ambiguous (those already carry their own explicit
+    # signal), "low" means graph/vector evidence was used but the best
+    # match's score was a soft one, not a clean one.
+    confidence: Literal["confident", "low"] = "confident"
 
 
 class QueryAgent:
@@ -97,6 +107,14 @@ class QueryAgent:
         # caveat as min_graph_score above.
         disambiguation_margin: float = 0.1,
         max_disambiguation_candidates: int = 4,
+        # The in-between, not-ambiguous-enough-to-ask case from the Part 5
+        # plan: a graph or chunk match that clears its retrieval threshold
+        # but is still a soft match, not a clean one. Below this, the
+        # result is used (it's still the best evidence available) but
+        # QueryResult.confidence is marked "low" instead of silently
+        # looking identical to a clean match. Same 0-1 scale as
+        # min_graph_score/NodeSearchHit.score and ChunkIndex hit scores.
+        confident_score: float = 0.6,
         clarification: ClarificationOrchestrator | None = None,
     ):
         self._chunks = chunk_index
@@ -110,6 +128,7 @@ class QueryAgent:
         self._max_output_tokens = max_output_tokens
         self._disambiguation_margin = disambiguation_margin
         self._max_disambiguation_candidates = max_disambiguation_candidates
+        self._confident_score = confident_score
         self._clarification = clarification
         self._client = client
         if self._client is None and project is not None:
@@ -139,7 +158,9 @@ class QueryAgent:
         if ambiguous_hits is not None:
             return self._ambiguous_result(cleaned_query, ambiguous_hits)
 
-        graph_context, graph_citations = self._graph_evidence(cleaned_query)
+        graph_context, graph_citations, graph_best_score = self._graph_evidence(
+            cleaned_query
+        )
         if graph_citations:
             self._metrics["graph_hits"] += 1
             answer = self._answer_with_gemini(
@@ -150,6 +171,7 @@ class QueryAgent:
                 citations=graph_citations,
                 retrieval_mode="graph",
                 graph_hit_count=1,
+                confidence=self._confidence_for(graph_best_score),
             )
 
         assembled = self._chunks.assemble_context(
@@ -187,7 +209,17 @@ class QueryAgent:
             citations=citations,
             retrieval_mode="vector",
             vector_fallback_count=1,
+            confidence=self._confidence_for(top_hits[0].score),
         )
+
+    def _confidence_for(self, best_score: float | None) -> Literal["confident", "low"]:
+        """The in-between case: a used match that isn't a clean one. The
+        score is carried through as data here rather than baked into the
+        answer text, since there's no frontend yet to decide how "low
+        confidence" should actually be shown."""
+        if best_score is not None and best_score < self._confident_score:
+            return "low"
+        return "confident"
 
     def _check_query_ambiguity(self, query: str) -> list[NodeSearchHit] | None:
         """Return the close-scoring node matches if the query is genuinely
@@ -242,14 +274,16 @@ class QueryAgent:
             clarification_question_id=question_id,
         )
 
-    def _graph_evidence(self, query: str) -> tuple[str, list[QueryCitation]]:
+    def _graph_evidence(
+        self, query: str
+    ) -> tuple[str, list[QueryCitation], float | None]:
         if self._graph is None:
-            return "", []
+            return "", [], None
         hits = self._graph.search_nodes(
             query, limit=self._max_graph_nodes, min_score=self._min_graph_score
         )
         if not hits:
-            return "", []
+            return "", [], None
 
         selected: list[QueryCitation] = []
         seen_edges: set[str] = set()
@@ -279,7 +313,10 @@ class QueryAgent:
                 break
 
         context = "\n\n".join(context_parts)[: self._max_context_characters]
-        return context, selected[: self._max_citations]
+        # hits is already sorted by descending score (search_nodes), so
+        # hits[0] is the best match regardless of which citations got
+        # truncated below max_citations.
+        return context, selected[: self._max_citations], hits[0].score
 
     @staticmethod
     def _citation_from_edge(edge: IncidentEdge) -> QueryCitation:
