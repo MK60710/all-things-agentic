@@ -176,6 +176,52 @@ def test_terminal_review_loop_answers_and_skips(fake_db):
     assert orchestrator.get(skip_this.id).status == "open"
 
 
+def test_terminal_review_loop_rejects_zero_instead_of_wrapping_to_last_option(fake_db):
+    """Options are shown 1-indexed. int("0") - 1 == -1, which Python list
+    indexing silently resolves to the last element instead of raising -
+    typing "0" (a plausible off-by-one typo) must not silently apply
+    whichever option happens to be last, e.g. the "no, genuinely
+    different" option on an entity_merge question, which triggers a real
+    resolve_alias(distinct=True) graph mutation the user never chose."""
+    gm = _make_graph(fake_db)
+    existing = _node("Fine-Tuning")
+    provisional = _node("Parameter Tuning")
+    gm.add_node(existing)
+    gm.add_node(provisional)
+
+    orchestrator = ClarificationOrchestrator(graph_manager=gm)
+    question = orchestrator.register_entity_merge_question(
+        provisional_node_id=provisional.id,
+        entity_name="Parameter Tuning",
+        candidate_node_id=existing.id,
+        candidate_name="Fine-Tuning",
+    )
+
+    answered = orchestrator.run_terminal_review_loop(
+        input_fn=lambda _: "0", print_fn=lambda *a: None
+    )
+
+    assert answered == 0
+    assert orchestrator.get(question.id).status == "open"
+    # No merge/distinct mutation should have happened.
+    assert gm.graph.get_edge_data(provisional.id, existing.id) is None
+    assert tuple(sorted((existing.id, provisional.id))) not in gm._known_distinct
+
+
+def test_terminal_review_loop_rejects_negative_choice(fake_db):
+    orchestrator = ClarificationOrchestrator(graph_manager=_make_graph(fake_db))
+    question = orchestrator.register_entity_merge_question(
+        provisional_node_id="p", entity_name="X", candidate_node_id="c", candidate_name="Y"
+    )
+
+    answered = orchestrator.run_terminal_review_loop(
+        input_fn=lambda _: "-1", print_fn=lambda *a: None
+    )
+
+    assert answered == 0
+    assert orchestrator.get(question.id).status == "open"
+
+
 def test_terminal_review_loop_handles_invalid_choice_gracefully(fake_db):
     orchestrator = ClarificationOrchestrator(graph_manager=_make_graph(fake_db))
     question = orchestrator.register_entity_merge_question(

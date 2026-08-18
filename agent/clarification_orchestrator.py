@@ -187,8 +187,16 @@ class ClarificationOrchestrator:
             if choice == "s":
                 continue
             try:
-                selected = question.options[int(choice) - 1]
-            except (ValueError, IndexError):
+                choice_number = int(choice)
+                if choice_number < 1 or choice_number > len(question.options):
+                    # int(choice) - 1 on "0" or a negative number is still
+                    # a valid Python list index (wraps to the end), so this
+                    # bound check has to happen before indexing - without
+                    # it, typing "0" silently selects the last option
+                    # instead of being rejected as invalid.
+                    raise ValueError(choice)
+                selected = question.options[choice_number - 1]
+            except ValueError:
                 print_fn("Not a valid choice, skipping.")
                 continue
             self.answer(question.id, selected.id)

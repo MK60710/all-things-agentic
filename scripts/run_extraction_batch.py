@@ -48,6 +48,9 @@ class _InProcessFirestore:
         def set(self, data: dict, merge: bool = True) -> None:
             self._store[self._doc_id] = data
 
+        def delete(self) -> None:
+            self._store.pop(self._doc_id, None)
+
     class _Snapshot:
         def __init__(self, doc_id: str, data: dict):
             self.id, self._data = doc_id, data

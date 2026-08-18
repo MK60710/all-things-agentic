@@ -280,6 +280,28 @@ def test_confident_vector_match_is_not_flagged():
     assert result.confidence == "confident"
 
 
+def test_answer_scans_search_nodes_only_once_per_query(fake_db):
+    """_check_query_ambiguity and _graph_evidence used to each call
+    GraphManager.search_nodes independently with identical arguments -
+    search_nodes has no request-level memoization (only per-node
+    tokenization is cached), so every graph-backed query paid its full
+    O(number of nodes) scan cost twice. They must now share one scan."""
+    graph = _graph(fake_db)
+    calls = []
+    original = graph.search_nodes
+
+    def counting_search_nodes(*args, **kwargs):
+        calls.append((args, kwargs))
+        return original(*args, **kwargs)
+
+    graph.search_nodes = counting_search_nodes
+    agent = QueryAgent(ChunkIndex(), graph)
+
+    agent.answer("How does the memory method use recall?")
+
+    assert len(calls) == 1
+
+
 def test_gemini_response_text_property_raising_falls_back():
     """The google-genai SDK can raise from the response.text property
     itself (e.g. a safety-filtered response with no candidates), not just
