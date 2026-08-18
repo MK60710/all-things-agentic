@@ -302,6 +302,50 @@ def test_answer_scans_search_nodes_only_once_per_query(fake_db):
     assert len(calls) == 1
 
 
+def test_record_feedback_boosts_a_node_above_a_higher_scoring_rival(fake_db):
+    """The concrete "adapts" behavior: negative feedback on the currently
+    winning node must be able to flip which node search_nodes' ambiguity
+    check treats as the clear top match on a later, identical query -
+    a log entry with no effect on ranking wouldn't satisfy this."""
+    graph = GraphManager(project_id="test", db_client=fake_db)
+    graph.add_node(
+        Node(id="strong", type=NodeType.METHOD, name="Retrieval Augmented Method")
+    )
+    graph.add_node(
+        Node(id="weak", type=NodeType.METHOD, name="Retrieval Method")
+    )
+    agent = QueryAgent(ChunkIndex(), graph)
+
+    before = agent.answer("retrieval augmented method")
+    assert before.citations[0].node_ids == ["strong"]
+
+    agent.record_feedback("strong", helpful=False)
+    agent.record_feedback("weak", helpful=True)
+    agent.record_feedback("weak", helpful=True)
+
+    after = agent.answer("retrieval augmented method")
+    assert after.citations[0].node_ids == ["weak"]
+
+
+def test_record_feedback_writes_a_durable_event_when_db_client_given(fake_db):
+    graph = _graph(fake_db)
+    agent = QueryAgent(ChunkIndex(), graph, db_client=fake_db)
+
+    agent.record_feedback("method", helpful=True)
+
+    events = list(fake_db.collection("feedback_events").stream())
+    assert len(events) == 1
+    data = events[0].to_dict()
+    assert data["type"] == "query_rating"
+    assert data["node_id"] == "method"
+    assert data["helpful"] is True
+
+
+def test_record_feedback_without_db_client_does_not_raise():
+    agent = QueryAgent(ChunkIndex())
+    agent.record_feedback("some-node", helpful=True)  # must not raise
+
+
 def test_gemini_response_text_property_raising_falls_back():
     """The google-genai SDK can raise from the response.text property
     itself (e.g. a safety-filtered response with no candidates), not just

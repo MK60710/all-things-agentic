@@ -13,7 +13,11 @@ read-only either way.
 from __future__ import annotations
 
 import logging
+import threading
+import uuid
 from collections import Counter
+from dataclasses import replace
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 from google import genai
@@ -126,6 +130,7 @@ class QueryAgent:
         # min_graph_score/NodeSearchHit.score and ChunkIndex hit scores.
         confident_score: float = 0.6,
         clarification: ClarificationOrchestrator | None = None,
+        db_client: Any | None = None,
     ):
         self._chunks = chunk_index
         self._graph = graph_manager
@@ -146,6 +151,12 @@ class QueryAgent:
                 vertexai=True, project=project, location=location
             )
         self._metrics: Counter[str] = Counter()
+        # record_feedback / _apply_boost: same pattern as GapFinder's
+        # _node_boost - "capture feedback so it adapts" only holds if a
+        # rating actually changes a future answer, not just a log entry.
+        self._db = db_client
+        self._node_boost: dict[str, float] = {}
+        self._boost_lock = threading.Lock()
 
     @property
     def metrics(self) -> dict[str, int]:
@@ -173,6 +184,7 @@ class QueryAgent:
             if self._graph is not None
             else []
         )
+        graph_hits = self._apply_boost(graph_hits)
 
         ambiguous_hits = self._check_query_ambiguity(graph_hits)
         if ambiguous_hits is not None:
@@ -240,6 +252,43 @@ class QueryAgent:
         if best_score is not None and best_score < self._confident_score:
             return "low"
         return "confident"
+
+    def _apply_boost(self, hits: list[NodeSearchHit]) -> list[NodeSearchHit]:
+        """Apply record_feedback's accumulated per-node adjustments and
+        re-sort - without the re-sort, a boosted node could deserve to
+        rank above an unboosted one but never actually get picked as the
+        top match, since everything downstream (citations, ambiguity
+        check, confidence) reads hits in score order."""
+        if not self._node_boost:
+            return hits
+        with self._boost_lock:
+            boosted = [
+                replace(hit, score=hit.score + self._node_boost.get(hit.node_id, 0.0))
+                for hit in hits
+            ]
+        boosted.sort(key=lambda hit: (-hit.score, hit.node_id))
+        return boosted
+
+    def record_feedback(self, node_id: str, helpful: bool) -> None:
+        """Applied immediately to future queries' graph-hit ranking - the
+        concrete mechanism behind "capture feedback so it adapts", not
+        just a log entry. Same shape as GapFinder.record_feedback:
+        an in-memory boost that takes effect right away, plus an optional
+        durable event write when a Firestore client is supplied."""
+        delta = 1.0 if helpful else -1.0
+        with self._boost_lock:
+            self._node_boost[node_id] = self._node_boost.get(node_id, 0.0) + delta
+
+        if self._db is not None:
+            event_id = str(uuid.uuid4())
+            self._db.collection("feedback_events").document(event_id).set(
+                {
+                    "type": "query_rating",
+                    "node_id": node_id,
+                    "helpful": helpful,
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                }
+            )
 
     def _check_query_ambiguity(
         self, hits: list[NodeSearchHit]

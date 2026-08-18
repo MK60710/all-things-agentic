@@ -86,6 +86,19 @@ class _InProcessFirestore:
         return _InProcessFirestore._Collection(self._collections.setdefault(name, {}))
 
 
+def entity_embedding_text(name: str, description: str, name_weight: int = 4) -> str:
+    """Text to feed a bag-of-hashed-tokens embedder for entity
+    canonicalization. Repeating the name biases the averaged vector toward
+    the one signal that actually distinguishes entities - without this, a
+    long generic description ("a large language model used in
+    experiments") can dominate the vector and make differently-named
+    entities in the same topical category (different metrics, different
+    model names) collide. Observed live: "Claude" vs "GPT-4o" and "F1
+    score" vs "Exact Match (EM) score" both false-positived into
+    needs_clarification before this weighting was added."""
+    return f"{' '.join([name] * name_weight)}: {description}"
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--corpus-dir", default="corpus")
@@ -149,7 +162,7 @@ def main() -> None:
     embedder = LocalHashingEmbedder()
 
     def entity_embedding_fn(entity) -> list[float]:
-        return embedder(f"{entity.name}: {entity.description}")
+        return embedder(entity_embedding_text(entity.name, entity.description))
 
     papers = [(path.stem, str(path)) for path in pdf_paths]
     print(f"Extracting {len(papers)} paper(s)...")
