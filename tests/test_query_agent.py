@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from agent.clarification_orchestrator import ClarificationOrchestrator
 from agent.graph_manager import GraphManager
 from agent.query_agent import QueryAgent
 from agent.retrieval import ChunkIndex
@@ -162,6 +163,65 @@ def test_gemini_call_failure_falls_back_instead_of_crashing():
 
     assert result.retrieval_mode == "vector"
     assert "Stored evidence about retries." in result.answer
+
+
+def _ambiguous_graph(fake_db) -> GraphManager:
+    """Two distinct nodes that both contain the query's only real token,
+    so search_nodes scores them identically - the concrete trigger for
+    QueryAgent's ambiguity check."""
+    graph = GraphManager(project_id="test", db_client=fake_db)
+    graph.add_node(
+        Node(
+            id="method",
+            type=NodeType.METHOD,
+            name="Attention Mechanism",
+            description="A method.",
+        )
+    )
+    graph.add_node(
+        Node(
+            id="concept",
+            type=NodeType.CONCEPT,
+            name="Attention Economy",
+            description="A concept.",
+        )
+    )
+    return graph
+
+
+def test_ambiguous_graph_matches_return_clarifying_question_not_a_guess(fake_db):
+    class FakeModels:
+        def generate_content(self, **kwargs):  # pragma: no cover - must not be called
+            raise AssertionError("Gemini must not be called for an ambiguous query")
+
+    agent = QueryAgent(
+        ChunkIndex(),
+        _ambiguous_graph(fake_db),
+        client=SimpleNamespace(models=FakeModels()),
+    )
+
+    result = agent.answer("attention")
+
+    assert result.retrieval_mode == "ambiguous"
+    assert {c.node_id for c in result.candidates} == {"method", "concept"}
+    assert result.citations == []
+    assert result.clarification_question_id is None  # no orchestrator was given
+
+
+def test_ambiguous_query_registers_a_pending_question_when_orchestrator_given(fake_db):
+    orchestrator = ClarificationOrchestrator()
+    agent = QueryAgent(
+        ChunkIndex(), _ambiguous_graph(fake_db), clarification=orchestrator
+    )
+
+    result = agent.answer("attention")
+
+    assert result.clarification_question_id is not None
+    pending = orchestrator.pending()
+    assert len(pending) == 1
+    assert pending[0].kind == "query_disambiguation"
+    assert pending[0].id == result.clarification_question_id
+    assert {opt.id for opt in pending[0].options} == {"method", "concept"}
 
 
 def test_gemini_response_text_property_raising_falls_back():

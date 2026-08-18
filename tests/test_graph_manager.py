@@ -4,6 +4,7 @@ import uuid
 
 import pytest
 
+from agent.clarification_orchestrator import ClarificationOrchestrator
 from agent.graph_manager import GraphManager, _cosine_similarity
 from agent.schema import (
     Edge,
@@ -361,6 +362,74 @@ def test_ambiguous_relation_endpoint_is_skipped_not_paper_fatal(fake_db):
     # bad relation doesn't take the rest of the paper down with it.
     assert len(report.edge_writes) == 1
     assert len(report.node_writes) == 3
+
+
+def test_needs_clarification_still_creates_node_and_registers_question(fake_db):
+    """The extraction-side clarification hook: a middle-band canonicalization
+    match must still create the provisional node (so the batch never
+    stalls waiting on a person) but also register a question when an
+    orchestrator is passed in."""
+    gm = _make_manager(fake_db)
+    existing = _node("Fine-Tuning", embedding=[1.0, 0.0])
+    gm.add_node(existing)
+    orchestrator = ClarificationOrchestrator(graph_manager=gm)
+
+    def embedding_fn(entity):
+        # cosine similarity to "Fine-Tuning" = 0.8, in the needs_clarification band
+        return [0.8, 0.6]
+
+    extraction = ExtractionResult(
+        paper_id="paper-1",
+        entities=[
+            ExtractedEntity(
+                name="Parameter Tuning",
+                type=NodeType.CONCEPT,
+                description="A tuning approach",
+            )
+        ],
+        relations=[],
+    )
+
+    report = gm.apply_extraction_result(
+        extraction, embedding_fn=embedding_fn, clarification=orchestrator
+    )
+
+    provisional_id = report.node_writes[0].node_id
+    assert provisional_id != existing.id
+    assert provisional_id in gm.graph  # node was still created, batch didn't stall
+
+    pending = orchestrator.pending()
+    assert len(pending) == 1
+    assert pending[0].kind == "entity_merge"
+    assert pending[0].provisional_node_id == provisional_id
+    assert pending[0].candidate_node_id == existing.id
+
+
+def test_needs_clarification_without_orchestrator_behaves_as_before(fake_db):
+    """clarification is optional - omitting it must not change behavior for
+    existing callers (no question registered, no error)."""
+    gm = _make_manager(fake_db)
+    existing = _node("Fine-Tuning", embedding=[1.0, 0.0])
+    gm.add_node(existing)
+
+    extraction = ExtractionResult(
+        paper_id="paper-1",
+        entities=[
+            ExtractedEntity(
+                name="Parameter Tuning",
+                type=NodeType.CONCEPT,
+                description="A tuning approach",
+            )
+        ],
+        relations=[],
+    )
+
+    report = gm.apply_extraction_result(
+        extraction, embedding_fn=lambda entity: [0.8, 0.6]
+    )
+
+    assert report.node_writes[0].node_id != existing.id
+    assert report.node_writes[0].decision == "needs_clarification"
 
 
 def test_extracted_paper_entity_reuses_source_paper_node(fake_db):
