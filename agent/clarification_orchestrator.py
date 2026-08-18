@@ -20,8 +20,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-QuestionKind = Literal["entity_merge", "query_disambiguation"]
-
 # Sentinel option id for "these are genuinely different things" on an
 # entity_merge question - distinct from any real node_id.
 DISTINCT_OPTION_ID = "distinct"
@@ -34,22 +32,45 @@ class ClarificationOption:
     description: str = ""
 
 
-@dataclass
-class PendingQuestion:
+@dataclass(kw_only=True)
+class _BaseQuestion:
     id: str
-    kind: QuestionKind
     question: str
     options: list[ClarificationOption]
     status: Literal["open", "answered"] = "open"
     answer_option_id: str | None = None
-    # entity_merge only: the node extraction already created (so the batch
-    # never stalls) and the existing node it might actually be the same as.
-    provisional_node_id: str | None = None
-    candidate_node_id: str | None = None
+
+
+@dataclass(kw_only=True)
+class EntityMergeQuestion(_BaseQuestion):
+    """A canonicalization decision that landed in the needs_clarification
+    band. provisional_node_id/candidate_node_id are real, required
+    node_ids (not str | None like a one-dataclass-for-both-kinds shape
+    would leave them) - answer() feeds both straight into
+    GraphManager.resolve_alias, which requires actual strings."""
+
+    kind: Literal["entity_merge"] = "entity_merge"
+    provisional_node_id: str
+    candidate_node_id: str
     score: float | None = None
-    # query_disambiguation only: the original query text, so a caller can
-    # re-run the query once an option is chosen.
-    query_text: str | None = None
+
+
+@dataclass(kw_only=True)
+class QueryDisambiguationQuestion(_BaseQuestion):
+    """Two or more distinct entities were plausibly what a query meant.
+    query_text is required (not the shared-dataclass's str | None) so a
+    caller re-running the query with the chosen option always has it."""
+
+    kind: Literal["query_disambiguation"] = "query_disambiguation"
+    query_text: str
+
+
+# A discriminated union rather than one dataclass with every field
+# optional - each kind's required fields are actually required at
+# construction time, and `if isinstance(question, EntityMergeQuestion)`
+# in answer() below is a real type narrowing, not just a convention no
+# type system enforces.
+PendingQuestion = EntityMergeQuestion | QueryDisambiguationQuestion
 
 
 class ClarificationOrchestrator:
@@ -77,10 +98,9 @@ class ClarificationOrchestrator:
         candidate_name: str,
         candidate_description: str = "",
         score: float | None = None,
-    ) -> PendingQuestion:
-        question = PendingQuestion(
+    ) -> EntityMergeQuestion:
+        question = EntityMergeQuestion(
             id=str(uuid.uuid4()),
-            kind="entity_merge",
             question=(
                 f'Extraction added "{entity_name}" as a new node. Is it '
                 f'actually the same as the existing "{candidate_name}"?'
@@ -105,10 +125,9 @@ class ClarificationOrchestrator:
 
     def register_query_disambiguation(
         self, query_text: str, candidates: "list[NodeSearchHit]"
-    ) -> PendingQuestion:
-        question = PendingQuestion(
+    ) -> QueryDisambiguationQuestion:
+        question = QueryDisambiguationQuestion(
             id=str(uuid.uuid4()),
-            kind="query_disambiguation",
             question=f'Which of these did you mean by "{query_text}"?',
             options=[
                 ClarificationOption(
@@ -145,7 +164,7 @@ class ClarificationOrchestrator:
                 f"{option_id!r} is not a valid option for {question_id!r}"
             )
 
-        if question.kind == "entity_merge":
+        if isinstance(question, EntityMergeQuestion):
             if self._graph is None:
                 raise RuntimeError(
                     "answering an entity_merge question requires a graph_manager"
