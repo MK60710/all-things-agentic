@@ -4,10 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from agent.graph_manager import GraphIngestionReport, GraphManager
 from agent.retrieval import ChunkIndex
 from agent.schema import ExtractionResult, ExtractedEntity
+
+if TYPE_CHECKING:
+    from agent.clarification_orchestrator import ClarificationOrchestrator
 
 
 @dataclass(frozen=True)
@@ -36,6 +40,7 @@ class ResearchStore:
         entity_embedding_fn: Callable[
             [ExtractedEntity], list[float] | None
         ] | None = None,
+        clarification: "ClarificationOrchestrator | None" = None,
     ) -> ResearchIngestionReport:
         chunk_ids = self._chunks.upsert_paper(
             extraction.paper_id,
@@ -47,6 +52,7 @@ class ResearchStore:
                 extraction,
                 paper_name=paper_name,
                 embedding_fn=entity_embedding_fn,
+                clarification=clarification,
             )
         return ResearchIngestionReport(
             paper_id=extraction.paper_id,
