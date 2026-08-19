@@ -148,6 +148,48 @@ def test_answer_clarification_invalid_option_returns_400(client, app_state):
     assert response.status_code == 400
 
 
+def test_papers_upload_returns_the_real_graph_writes_for_the_build_animation(
+    client, app_state, monkeypatch
+):
+    """new_nodes/new_edges must reflect GraphManager's actual post-
+    canonicalization writes (GraphIngestionReport.node_writes/edge_writes),
+    not a synthesized count - the frontend's live graph-building animation
+    renders exactly this data."""
+    from agent.document_ingestion import DocumentIngestionResult
+    from agent.extraction_agent import ExtractionOutcome
+    from agent.schema import ExtractedEntity, ExtractionResult
+
+    def fake_extract_one(paper_id, path, fail_closed=False):
+        return ExtractionOutcome(
+            paper_id=paper_id,
+            document=DocumentIngestionResult(
+                paper_id=paper_id, pdf_path=path, pages=[], raw_text="text", chunks=["text"]
+            ),
+            result=ExtractionResult(
+                paper_id=paper_id,
+                entities=[
+                    ExtractedEntity(name="GraphRAG", type=NodeType.METHOD, description="A method")
+                ],
+                relations=[],
+            ),
+        )
+
+    monkeypatch.setattr(app_state.extraction_agent, "extract_one", fake_extract_one)
+
+    response = client.post(
+        "/papers",
+        files={"file": ("paper.pdf", b"%PDF-1.4 fake", "application/pdf")},
+        data={"paper_id": "viz-test-paper"},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data["new_nodes"]) == 1
+    assert data["new_nodes"][0]["name"] == "GraphRAG"
+    assert data["new_nodes"][0]["type"] == "METHOD"
+    assert data["new_edges"] == []
+
+
 def test_papers_upload_and_ingest(client):
     pdf_bytes = b"%PDF-1.4 fake"
     response = client.post(
