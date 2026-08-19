@@ -383,6 +383,74 @@ def test_search_nodes_excludes_merged_alias_nodes(fake_db):
     assert [hit.node_id for hit in hits] == [canonical.id]
 
 
+def test_canonicalize_exact_match_excludes_merged_alias_nodes(fake_db):
+    """A merged-away alias node's name must not win canonicalize()'s exact-
+    string-match pass - otherwise a later entity matching that name gets
+    routed to the dead alias instead of the real canonical node, the same
+    class of bug search_nodes had before it gained this exclusion."""
+    gm = _make_manager(fake_db)
+    canonical = _node("Fine-Tuning")
+    alias = _node("Parameter Tuning")
+    gm.add_node(canonical)
+    gm.add_node(alias)
+    gm.resolve_alias(canonical.id, alias.id)
+
+    result = gm.canonicalize("Parameter Tuning")
+
+    assert result.decision == "new"  # not auto_merge against the dead alias
+
+
+def test_canonicalize_embedding_match_excludes_merged_alias_nodes(fake_db):
+    gm = _make_manager(fake_db)
+    canonical = _node("LLM Agent", embedding=[1.0, 0.0])
+    alias = _node("Language Model Agent", embedding=[1.0, 0.0])
+    gm.add_node(canonical)
+    gm.add_node(alias)
+    gm.resolve_alias(canonical.id, alias.id)
+
+    result = gm.canonicalize("Autonomous Agent", embedding=[1.0, 0.0])
+
+    # The alias had a perfect-similarity embedding but is merged away -
+    # canonicalize must not return it as the match.
+    assert result.matched_node_id != alias.id
+    assert result.matched_node_id == canonical.id
+
+
+def test_get_incident_edges_includes_merged_aliases_edges(fake_db):
+    """After a merge, the alias's own real extracted edges (which
+    resolve_alias never moves or copies onto the canonical node) must
+    still be reachable through the canonical node - otherwise they become
+    permanently invisible to graph evidence once search_nodes stops
+    returning the alias as its own hit."""
+    gm = _make_manager(fake_db)
+    canonical = _node("GPT-4")
+    alias = _node("GPT4")
+    other = _node("Some Benchmark")
+    gm.add_node(canonical)
+    gm.add_node(alias)
+    gm.add_node(other)
+    gm.add_edge(
+        Edge(
+            id=str(uuid.uuid4()),
+            source_id=alias.id,
+            target_id=other.id,
+            type=EdgeType.EVALUATES_ON,
+            provenance=ProvenanceTag.EXTRACTED,
+            source_quote="GPT4 is evaluated on Some Benchmark.",
+        )
+    )
+
+    gm.resolve_alias(canonical.id, alias.id)
+
+    edges = gm.get_incident_edges(canonical.id)
+    assert len(edges) == 1
+    assert edges[0].source_id == alias.id
+    assert edges[0].target_id == other.id
+    # The SAME_AS merge marker itself is not useful evidence and must not
+    # be surfaced as if it were a real extracted relation.
+    assert all(edge.relation != "SAME_AS" for edge in edges)
+
+
 def test_search_nodes_still_returns_pairs_marked_distinct(fake_db):
     """distinct=True must not exclude a node from search - only an actual
     merge (SAME_AS edge) does. Two nodes correctly marked as different
@@ -540,3 +608,49 @@ def test_extracted_paper_entity_reuses_source_paper_node(fake_db):
     assert report.node_writes[0].node_id == report.paper_node_id
     assert report.node_writes[0].reused_existing_node is True
     assert report.edge_writes[0].source_id == report.paper_node_id
+
+
+def test_concurrent_search_and_mutation_does_not_crash(fake_db):
+    """networkx's MultiDiGraph is not thread-safe - the FastAPI service
+    runs sync route handlers concurrently against one shared GraphManager
+    instance, so a concurrent add_node during search_nodes'
+    self.graph.nodes(data=True) iteration could previously raise
+    "RuntimeError: dictionary changed size during iteration" and turn a
+    normal request into a 500. Hammers both concurrently and asserts no
+    thread raised."""
+    import threading
+
+    gm = _make_manager(fake_db)
+    for i in range(20):
+        gm.add_node(_node(f"Seed Node {i}"))
+
+    errors: list[Exception] = []
+    stop = threading.Event()
+
+    def searcher() -> None:
+        while not stop.is_set():
+            try:
+                gm.search_nodes("seed node", min_score=0.0)
+            except Exception as exc:  # pragma: no cover - failure path only
+                errors.append(exc)
+                return
+
+    def writer() -> None:
+        for i in range(200):
+            try:
+                gm.add_node(_node(f"Concurrent Node {i}"))
+            except Exception as exc:  # pragma: no cover - failure path only
+                errors.append(exc)
+                return
+
+    threads = [threading.Thread(target=searcher) for _ in range(4)]
+    writer_thread = threading.Thread(target=writer)
+    for t in threads:
+        t.start()
+    writer_thread.start()
+    writer_thread.join()
+    stop.set()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"concurrent access raised: {errors}"

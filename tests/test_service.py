@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -154,6 +156,43 @@ def test_papers_upload_and_ingest(client):
     # assert the endpoint round-trips without crashing and returns one of
     # the two documented outcomes, not a specific text result.
     assert response.status_code in (200, 422)
+
+
+def test_papers_upload_rejects_path_traversal_in_paper_id(client, app_state, tmp_path):
+    """A client-supplied paper_id becomes a filename - without
+    sanitization, paper_id="../../../../tmp/evil" would let an upload
+    write outside upload_root before PdfTextExtractor's allowed_root
+    check ever runs (that check only guards the extraction read, not this
+    write). Confirms both that the traversal write never happens and that
+    nothing lands outside the upload root at all."""
+    pdf_bytes = b"%PDF-1.4 fake"
+    response = client.post(
+        "/papers",
+        files={"file": ("paper.pdf", pdf_bytes, "application/pdf")},
+        data={"paper_id": "../../../../tmp/evil"},
+    )
+    assert response.status_code in (200, 422)
+
+    escaped_path = tmp_path.parent / "evil.pdf"
+    assert not escaped_path.exists()
+    # Whatever got written landed inside the real, sanitized upload root.
+    written = list(Path(app_state.upload_root).glob("*.pdf"))
+    assert written
+    for path in written:
+        assert path.resolve().is_relative_to(Path(app_state.upload_root).resolve())
+
+
+def test_papers_upload_sanitizes_unsafe_paper_id_characters(client, app_state):
+    pdf_bytes = b"%PDF-1.4 fake"
+    response = client.post(
+        "/papers",
+        files={"file": ("paper.pdf", pdf_bytes, "application/pdf")},
+        data={"paper_id": "weird/name with spaces!*.pdf"},
+    )
+    assert response.status_code in (200, 422)
+    if response.status_code == 200:
+        # The sanitized id shouldn't contain the raw unsafe characters.
+        assert "/" not in response.json()["paper_id"]
 
 
 def test_require_api_key_rejects_wrong_key(client, monkeypatch):
