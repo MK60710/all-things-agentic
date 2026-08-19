@@ -4,6 +4,9 @@ networkx>=3.3
 pymupdf>=1.25.0
 pydantic>=2.9
 requests>=2.32
+fastapi>=0.115
+uvicorn[standard]>=0.32
+python-multipart>=0.0.9
 
 # Optional local-semantic embeddings (opt-in ONNX model download, kept out
 # of the base install to match pyproject.toml's local-semantic extra):
