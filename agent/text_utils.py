@@ -1,6 +1,7 @@
-"""Shared text-processing helpers for lexical search and untrusted-content
-prompt construction, used by retrieval.py, gemini_extractor.py,
-graph_manager.py, and query_agent.py.
+"""Shared text-processing helpers for lexical search, untrusted-content
+prompt construction, and entity-embedding input, used by retrieval.py,
+gemini_extractor.py, graph_manager.py, query_agent.py,
+scripts/run_extraction_batch.py, and service/state.py.
 
 Previously each of those files kept its own copy, and the copies had
 already drifted (gemini_extractor.py and retrieval.py each had their own
@@ -36,3 +37,16 @@ def escape_tag_delimiters(value: str) -> str:
     that appears to be outside the untrusted-evidence boundary. Every
     untrusted value placed near a tag boundary needs this."""
     return value.replace("<", "&lt;").replace(">", "&gt;")
+
+
+def entity_embedding_text(name: str, description: str, name_weight: int = 4) -> str:
+    """Text to feed a bag-of-hashed-tokens embedder for entity
+    canonicalization. Repeating the name biases the averaged vector toward
+    the one signal that actually distinguishes entities - without this, a
+    long generic description ("a large language model used in
+    experiments") can dominate the vector and make differently-named
+    entities in the same topical category (different metrics, different
+    model names) collide. Observed live: "Claude" vs "GPT-4o" and "F1
+    score" vs "Exact Match (EM) score" both false-positived into
+    needs_clarification before this weighting was added."""
+    return f"{' '.join([name] * name_weight)}: {description}"

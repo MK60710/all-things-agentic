@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from agent.clarification_orchestrator import ClarificationOrchestrator
 from agent.graph_manager import GraphManager
 from agent.query_agent import QueryAgent
 from agent.retrieval import ChunkIndex
@@ -162,6 +163,187 @@ def test_gemini_call_failure_falls_back_instead_of_crashing():
 
     assert result.retrieval_mode == "vector"
     assert "Stored evidence about retries." in result.answer
+
+
+def _ambiguous_graph(fake_db) -> GraphManager:
+    """Two distinct nodes that both contain the query's only real token,
+    so search_nodes scores them identically - the concrete trigger for
+    QueryAgent's ambiguity check."""
+    graph = GraphManager(project_id="test", db_client=fake_db)
+    graph.add_node(
+        Node(
+            id="method",
+            type=NodeType.METHOD,
+            name="Attention Mechanism",
+            description="A method.",
+        )
+    )
+    graph.add_node(
+        Node(
+            id="concept",
+            type=NodeType.CONCEPT,
+            name="Attention Economy",
+            description="A concept.",
+        )
+    )
+    return graph
+
+
+def test_ambiguous_graph_matches_return_clarifying_question_not_a_guess(fake_db):
+    class FakeModels:
+        def generate_content(self, **kwargs):  # pragma: no cover - must not be called
+            raise AssertionError("Gemini must not be called for an ambiguous query")
+
+    agent = QueryAgent(
+        ChunkIndex(),
+        _ambiguous_graph(fake_db),
+        client=SimpleNamespace(models=FakeModels()),
+    )
+
+    result = agent.answer("attention")
+
+    assert result.retrieval_mode == "ambiguous"
+    assert {c.node_id for c in result.candidates} == {"method", "concept"}
+    assert result.citations == []
+    assert result.clarification_question_id is None  # no orchestrator was given
+
+
+def test_ambiguous_query_registers_a_pending_question_when_orchestrator_given(fake_db):
+    orchestrator = ClarificationOrchestrator()
+    agent = QueryAgent(
+        ChunkIndex(), _ambiguous_graph(fake_db), clarification=orchestrator
+    )
+
+    result = agent.answer("attention")
+
+    assert result.clarification_question_id is not None
+    pending = orchestrator.pending()
+    assert len(pending) == 1
+    assert pending[0].kind == "query_disambiguation"
+    assert pending[0].id == result.clarification_question_id
+    assert {opt.id for opt in pending[0].options} == {"method", "concept"}
+
+
+def test_low_confidence_graph_match_is_flagged_not_hidden(fake_db):
+    """The in-between case from the Part 5 plan: a graph match that clears
+    min_graph_score but is still a soft one (2 of 5 query tokens) must not
+    look identical to a clean match - confidence should say so."""
+    graph = GraphManager(project_id="test", db_client=fake_db)
+    graph.add_node(
+        Node(id="n1", type=NodeType.METHOD, name="Sparse Retrieval System")
+    )
+    agent = QueryAgent(ChunkIndex(), graph)
+
+    result = agent.answer("sparse retrieval mechanism gradient clipping")
+
+    assert result.retrieval_mode == "graph"
+    assert result.confidence == "low"
+
+
+def test_confident_graph_match_is_not_flagged(fake_db):
+    graph = GraphManager(project_id="test", db_client=fake_db)
+    graph.add_node(
+        Node(id="n1", type=NodeType.METHOD, name="Memory Retrieval Method")
+    )
+    agent = QueryAgent(ChunkIndex(), graph)
+
+    result = agent.answer("memory retrieval method")
+
+    assert result.retrieval_mode == "graph"
+    assert result.confidence == "confident"
+
+
+def test_low_confidence_vector_match_is_flagged_not_hidden():
+    """Same in-between case on the chunk-retrieval side - only 1 of 3
+    query tokens present caps the score below 0.6 regardless of the
+    vector-similarity component, so this must always land as low."""
+    index = ChunkIndex()
+    index.upsert_paper("paper-1", ["Something about gradient descent."])
+    agent = QueryAgent(index)
+
+    result = agent.answer("gradient unrelated tangent")
+
+    assert result.retrieval_mode == "vector"
+    assert result.confidence == "low"
+
+
+def test_confident_vector_match_is_not_flagged():
+    """Full lexical overlap guarantees score >= 0.65 regardless of the
+    vector-similarity component, so this must always land as confident."""
+    index = ChunkIndex()
+    index.upsert_paper("paper-1", ["A paper about gradient descent methods."])
+    agent = QueryAgent(index)
+
+    result = agent.answer("gradient descent methods")
+
+    assert result.retrieval_mode == "vector"
+    assert result.confidence == "confident"
+
+
+def test_answer_scans_search_nodes_only_once_per_query(fake_db):
+    """_check_query_ambiguity and _graph_evidence used to each call
+    GraphManager.search_nodes independently with identical arguments -
+    search_nodes has no request-level memoization (only per-node
+    tokenization is cached), so every graph-backed query paid its full
+    O(number of nodes) scan cost twice. They must now share one scan."""
+    graph = _graph(fake_db)
+    calls = []
+    original = graph.search_nodes
+
+    def counting_search_nodes(*args, **kwargs):
+        calls.append((args, kwargs))
+        return original(*args, **kwargs)
+
+    graph.search_nodes = counting_search_nodes
+    agent = QueryAgent(ChunkIndex(), graph)
+
+    agent.answer("How does the memory method use recall?")
+
+    assert len(calls) == 1
+
+
+def test_record_feedback_boosts_a_node_above_a_higher_scoring_rival(fake_db):
+    """The concrete "adapts" behavior: negative feedback on the currently
+    winning node must be able to flip which node search_nodes' ambiguity
+    check treats as the clear top match on a later, identical query -
+    a log entry with no effect on ranking wouldn't satisfy this."""
+    graph = GraphManager(project_id="test", db_client=fake_db)
+    graph.add_node(
+        Node(id="strong", type=NodeType.METHOD, name="Retrieval Augmented Method")
+    )
+    graph.add_node(
+        Node(id="weak", type=NodeType.METHOD, name="Retrieval Method")
+    )
+    agent = QueryAgent(ChunkIndex(), graph)
+
+    before = agent.answer("retrieval augmented method")
+    assert before.citations[0].node_ids == ["strong"]
+
+    agent.record_feedback("strong", helpful=False)
+    agent.record_feedback("weak", helpful=True)
+    agent.record_feedback("weak", helpful=True)
+
+    after = agent.answer("retrieval augmented method")
+    assert after.citations[0].node_ids == ["weak"]
+
+
+def test_record_feedback_writes_a_durable_event_when_db_client_given(fake_db):
+    graph = _graph(fake_db)
+    agent = QueryAgent(ChunkIndex(), graph, db_client=fake_db)
+
+    agent.record_feedback("method", helpful=True)
+
+    events = list(fake_db.collection("feedback_events").stream())
+    assert len(events) == 1
+    data = events[0].to_dict()
+    assert data["type"] == "query_rating"
+    assert data["node_id"] == "method"
+    assert data["helpful"] is True
+
+
+def test_record_feedback_without_db_client_does_not_raise():
+    agent = QueryAgent(ChunkIndex())
+    agent.record_feedback("some-node", helpful=True)  # must not raise
 
 
 def test_gemini_response_text_property_raising_falls_back():
