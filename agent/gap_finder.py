@@ -192,7 +192,11 @@ class GeminiExplainer:
                 contents=contents,
                 config=genai_types.GenerateContentConfig(
                     system_instruction=_GEMINI_SYSTEM_INSTRUCTION,
-                    temperature=0.3,
+                    # Every other Gemini call in this codebase already uses
+                    # temperature=0 - this was the one inconsistent spot,
+                    # meaning the same gap pair could get a different
+                    # explanation across requests with nothing else changed.
+                    temperature=0,
                     max_output_tokens=self._max_output_tokens,
                     http_options=genai_types.HttpOptions(timeout=self._timeout_ms),
                     # gemini-2.5-flash's "thinking" tokens count against
@@ -288,9 +292,8 @@ class GapFinder:
         # itself on the same GapFinder instance.
         self._cache_lock = threading.Lock()
         # In-flight de-dup: two concurrent find_candidates() calls that
-        # both miss on the same pair must not each fire their own (paid,
-        # non-deterministic at temperature=0.3) explain_fn call and race
-        # on which result the cache keeps - the second caller attaches to
+        # both miss on the same pair must not each fire their own (paid)
+        # explain_fn call and race on which result the cache keeps - the second caller attaches to
         # the first's already-submitted future instead.
         self._pending: dict[
             tuple[str, str, str, str, tuple[tuple[str, str], ...]], Future
@@ -440,9 +443,8 @@ class GapFinder:
                     c.explanation = cached
                     continue
                 # Two concurrent find_candidates() calls that both miss on
-                # the same pair must not each fire their own (paid,
-                # non-deterministic at temperature=0.3) explain_fn call -
-                # attach to the already-submitted future instead of
+                # the same pair must not each fire their own (paid) explain_fn
+                # call - attach to the already-submitted future instead of
                 # resubmitting.
                 future = self._pending.get(cache_key)
                 is_owner = future is None

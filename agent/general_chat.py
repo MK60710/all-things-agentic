@@ -63,7 +63,13 @@ class GeneralChatAgent:
                     "normally when no paper is attached. Be honest about uncertainty, "
                     "and do not claim to have read a paper unless its contents were supplied."
                 ),
-                temperature=0.4,
+                # Every other Gemini call in this codebase (extraction,
+                # QueryAgent's answer synthesis) already uses temperature=0.
+                # This was the one inconsistent spot - it's also the exact
+                # path that produced two different answers (one hallucinated,
+                # one a decline) to the identical MIA question before the
+                # routing fix sent that query to QueryAgent instead.
+                temperature=0,
                 max_output_tokens=self._max_output_tokens,
                 http_options=types.HttpOptions(timeout=self._timeout_ms),
             ),
