@@ -6,64 +6,56 @@ paper; subsequent answers then use that paper as context and show citations.
 
 ## Run locally
 
+Start the FastAPI backend first (see the repository root `README.md`), then:
+
 ```bash
 npm install
 npm run dev
 ```
 
-Open `http://localhost:3000`. Without an API URL, the interface uses the
-included paper library and sample grounded answers.
+Open `http://localhost:3000`.
 
 ## Connect the Python service
 
-Create `.env.local`:
+Create `.env.local` (see `.env.local.example`):
 
 ```bash
-NEXT_PUBLIC_API_URL=http://localhost:8000
+BACKEND_API_URL=http://127.0.0.1:8080
+NEXT_PUBLIC_API_URL=http://127.0.0.1:8080
+API_SHARED_SECRET=<same value the backend's API_SHARED_SECRET is set to>
 ```
 
-General chat uses the repository's existing `hello_world` Google ADK agent
-with Gemini on Vertex AI. Start the ADK server from the repository root:
+`BACKEND_API_URL` is what the Next.js server routes call (falls back to
+`NEXT_PUBLIC_API_URL` if unset). `NEXT_PUBLIC_API_URL` is also read directly
+by the browser for the PDF upload request. `API_SHARED_SECRET` stays
+server-side only and is attached as an `X-API-Key` header - the browser
+never sees it.
 
-```bash
-GOOGLE_GENAI_USE_VERTEXAI=TRUE \
-GOOGLE_CLOUD_PROJECT=all-things-agentic-hack \
-GOOGLE_CLOUD_LOCATION=global \
-adk api_server --session_service_uri=memory:// .
-```
+All research features go through Next.js server routes, which proxy to the
+FastAPI backend (`service/app.py`) rather than being called from the browser
+directly:
 
-The Next.js `/api/chat` route handles ADK session creation and `/run` calls.
-Point it at the ADK server before starting Next.js:
+- `POST /api/chat` -> backend `POST /chat` - general chat, or paper-grounded
+  chat when `paper_id` is set; carries conversation history both ways
+- `POST /api/papers/arxiv` -> backend `POST /papers/arxiv` - fetch and
+  ingest a paper by arXiv id
+- `POST /api/papers/upload-token` -> backend `POST /papers/upload-token` -
+  issues a short-lived, single-use upload token
+- `GET /api/papers/search` - queries the public arXiv API directly; no
+  backend involved
 
-```bash
-ADK_API_URL=http://localhost:8000
-ADK_APP_NAME=hello_world
-```
+PDF upload is the one path that skips the Next.js proxy: the browser
+uploads straight to the backend's `POST /papers`, authenticated with the
+token from `/api/papers/upload-token` in an `X-Upload-Token` header, so the
+permanent `API_SHARED_SECRET` never reaches client-side JS.
 
-The remaining paper features use the research service configured through
-`NEXT_PUBLIC_API_URL`:
+The `/api/chat` response matches `QueryResult` from `agent/query_agent.py`:
+`answer`, `citations`, `retrieval_mode`, plus optional
+clarification/candidate fields.
 
-- `POST /papers/upload` for multipart PDF ingestion
-- `POST /query` for paper-grounded questions
-
-The general chat request contains the new message and conversation history.
-The paper query contains the question plus the active paper metadata:
-
-```json
-{
-  "query": "How does graph memory improve retrieval?",
-  "paper_id": "paper-id",
-  "paper": { "id": "paper-id", "title": "Paper title" }
-}
-```
-
-The response matches `QueryResult` from `agent/query_agent.py`: `answer`,
-`citations`, and `retrieval_mode`.
-
-Online discovery is implemented by the frontend's `/api/papers/search` route,
-which searches arXiv. When the Python API is absent, the controls remain fully
-interactive and the interface reports that Gemini or ingestion is not
-connected instead of returning a fabricated answer.
+When the Python API is absent, the controls remain fully interactive and
+the interface reports that the backend is not connected instead of
+returning a fabricated answer.
 
 ## Checks
 
