@@ -341,6 +341,29 @@ def test_record_feedback_writes_a_durable_event_when_db_client_given(fake_db):
     assert data["helpful"] is True
 
 
+def test_node_boost_rehydrates_from_feedback_events_on_construction(fake_db):
+    """Regression: feedback_events was written for durability but never
+    read back, so 'capture feedback so it adapts' only held for the
+    lifetime of one running process - a restart silently forgot every
+    rating a user had given. A fresh QueryAgent pointed at the same
+    db_client must already reflect prior feedback, with no record_feedback
+    call on the new instance."""
+    graph = GraphManager(project_id="test", db_client=fake_db)
+    graph.add_node(
+        Node(id="strong", type=NodeType.METHOD, name="Retrieval Augmented Method")
+    )
+    graph.add_node(Node(id="weak", type=NodeType.METHOD, name="Retrieval Method"))
+    first_process = QueryAgent(ChunkIndex(), graph, db_client=fake_db)
+    first_process.record_feedback("strong", helpful=False)
+    first_process.record_feedback("weak", helpful=True)
+    first_process.record_feedback("weak", helpful=True)
+
+    restarted = QueryAgent(ChunkIndex(), graph, db_client=fake_db)
+
+    after_restart = restarted.answer("retrieval augmented method")
+    assert after_restart.citations[0].node_ids == ["weak"]
+
+
 def test_record_feedback_without_db_client_does_not_raise():
     agent = QueryAgent(ChunkIndex())
     agent.record_feedback("some-node", helpful=True)  # must not raise

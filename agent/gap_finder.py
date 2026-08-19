@@ -295,6 +295,24 @@ class GapFinder:
         self._pending: dict[
             tuple[str, str, str, str, tuple[tuple[str, str], ...]], Future
         ] = {}
+        # Without this, "adapts to the user's thinking" only held for the
+        # lifetime of one running process - feedback_events was written for
+        # durability but never read back, so a restart silently forgot every
+        # rating a user had given.
+        if self._db is not None:
+            self._rehydrate_node_boost()
+
+    def _rehydrate_node_boost(self) -> None:
+        for event in self._db.collection("feedback_events").where(
+            "type", "==", "gap_rating"
+        ).stream():
+            data = event.to_dict()
+            a_id, b_id = data.get("node_a_id"), data.get("node_b_id")
+            if not a_id or not b_id:
+                continue
+            delta = 1.0 if data.get("interesting") else -1.0
+            self._node_boost[a_id] = self._node_boost.get(a_id, 0.0) + delta
+            self._node_boost[b_id] = self._node_boost.get(b_id, 0.0) + delta
 
     def _citations_for(self, candidate: GapCandidate) -> list[GapCitation]:
         """The edges connecting each shared neighbor to node_a/node_b -

@@ -158,6 +158,23 @@ class QueryAgent:
         self._db = db_client
         self._node_boost: dict[str, float] = {}
         self._boost_lock = threading.Lock()
+        # Without this, "capture feedback so it adapts" only held for the
+        # lifetime of one running process - feedback_events was written for
+        # durability but never read back, so a restart silently forgot every
+        # rating a user had given.
+        if self._db is not None:
+            self._rehydrate_node_boost()
+
+    def _rehydrate_node_boost(self) -> None:
+        for event in self._db.collection("feedback_events").where(
+            "type", "==", "query_rating"
+        ).stream():
+            data = event.to_dict()
+            node_id = data.get("node_id")
+            if not node_id:
+                continue
+            delta = 1.0 if data.get("helpful") else -1.0
+            self._node_boost[node_id] = self._node_boost.get(node_id, 0.0) + delta
 
     @property
     def metrics(self) -> dict[str, int]:
