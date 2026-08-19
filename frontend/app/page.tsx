@@ -1,9 +1,9 @@
 "use client";
 
 import { ChangeEvent, DragEvent, FormEvent, useEffect, useRef, useState } from "react";
-import { askAssistant, searchPapers, uploadPaper } from "@/lib/api";
+import { askAssistant, ingestArxivPaper, searchPapers, uploadPaper } from "@/lib/api";
 import type { ChatHistoryItem, PaperContext, PaperSearchResult } from "@/lib/api";
-import type { Citation } from "@/lib/types";
+import type { Citation, QueryResponse } from "@/lib/types";
 
 type IconName = "atlas" | "plus" | "send" | "spark" | "paper" | "search" | "upload" | "close" | "quote" | "check" | "globe";
 type AddMode = "choose" | "upload" | "search";
@@ -13,6 +13,8 @@ interface Message {
   role: "user" | "assistant";
   text: string;
   citations?: Citation[];
+  confidence?: QueryResponse["confidence"];
+  candidates?: QueryResponse["candidates"];
   notice?: boolean;
 }
 
@@ -34,19 +36,10 @@ function Icon({ name, size = 19 }: { name: IconName; size?: number }) {
   return <svg aria-hidden="true" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">{icons[name]}</svg>;
 }
 
-function localGeneralFallback(): string {
-  return "The chat interface is working, but the Gemini chat service is not connected in this environment yet. Set NEXT_PUBLIC_API_URL to the service that exposes /chat; Atlas will then use the regular Gemini agent for general conversation.";
-}
-
-function localPaperFallback(paper: PaperContext): string {
-  return `“${paper.title}” is attached, but this local frontend does not have a running paper-ingestion service. Connect NEXT_PUBLIC_API_URL to the backend /papers/upload and /query routes to answer from the paper itself.`;
-}
-
 export default function Home() {
   const fileInput = useRef<HTMLInputElement>(null);
   const composerInput = useRef<HTMLTextAreaElement>(null);
   const chatEnd = useRef<HTMLDivElement>(null);
-  const sessionId = useRef("");
   const [messages, setMessages] = useState<Message[]>([]);
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
@@ -58,12 +51,16 @@ export default function Home() {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<PaperSearchResult[]>([]);
   const [searching, setSearching] = useState(false);
+  const [ingestingId, setIngestingId] = useState<string | null>(null);
   const [searchError, setSearchError] = useState("");
   const [expandedCitation, setExpandedCitation] = useState<string | null>(null);
 
   useEffect(() => { chatEnd.current?.scrollIntoView({ behavior: "smooth" }); }, [messages, loading]);
   useEffect(() => {
-    sessionId.current = crypto.randomUUID();
+    const savedPaper = window.localStorage.getItem("atlas-active-paper");
+    if (savedPaper) {
+      try { setPaper(JSON.parse(savedPaper) as PaperContext); } catch { window.localStorage.removeItem("atlas-active-paper"); }
+    }
     composerInput.current?.focus();
   }, []);
 
@@ -72,18 +69,22 @@ export default function Home() {
     const question = suggested.trim();
     if (!question || loading) return;
 
-    const history: ChatHistoryItem[] = messages.filter((message) => !message.notice).map(({ role, text }) => ({ role, text }));
+    const history: ChatHistoryItem[] = messages
+      .filter((message) => !message.notice)
+      .slice(-20)
+      .map(({ role, text }) => ({ role, text: text.slice(0, 8000) }));
     setMessages((current) => [...current, { id: crypto.randomUUID(), role: "user", text: question }]);
     setQuery("");
     setLoading(true);
     try {
-      const response = await askAssistant(question, history, paper, sessionId.current || crypto.randomUUID());
+      const response = await askAssistant(question, history, paper);
       setMessages((current) => [...current, {
         id: crypto.randomUUID(),
         role: "assistant",
-        text: response?.answer ?? (paper ? localPaperFallback(paper) : localGeneralFallback()),
-        citations: response?.citations,
-        notice: !response,
+        text: response.answer,
+        citations: response.citations,
+        confidence: response.confidence,
+        candidates: response.candidates,
       }]);
     } catch (error) {
       setMessages((current) => [...current, {
@@ -115,12 +116,7 @@ export default function Home() {
     setUploadError("");
     try {
       const uploaded = await uploadPaper(file);
-      const context = uploaded ?? {
-        id: `local:${Date.now()}`,
-        title: file.name.replace(/\.pdf$/i, ""),
-        authors: "Uploaded PDF",
-      };
-      attachPaper(context);
+      attachPaper(uploaded);
     } catch (error) {
       setUploadError(error instanceof Error ? error.message : "Upload failed.");
     } finally {
@@ -131,6 +127,7 @@ export default function Home() {
 
   function attachPaper(nextPaper: PaperContext) {
     setPaper(nextPaper);
+    window.localStorage.setItem("atlas-active-paper", JSON.stringify(nextPaper));
     setMessages((current) => [...current, { id: crypto.randomUUID(), role: "assistant", text: `I’ve added “${nextPaper.title}” to this conversation. Ask me to summarize it, explain a section, or examine its evidence.`, notice: true }]);
     setAddOpen(false);
     setAddMode("choose");
@@ -140,6 +137,7 @@ export default function Home() {
   function removePaper() {
     const title = paper?.title;
     setPaper(null);
+    window.localStorage.removeItem("atlas-active-paper");
     setMessages((current) => [...current, { id: crypto.randomUUID(), role: "assistant", text: `Paper context removed${title ? `: “${title}”` : ""}. We’re back to general Gemini chat.`, notice: true }]);
   }
 
@@ -158,6 +156,19 @@ export default function Home() {
       setSearchResults([]);
     } finally {
       setSearching(false);
+    }
+  }
+
+  async function addArxivPaper(result: PaperSearchResult) {
+    if (ingestingId) return;
+    setIngestingId(result.id);
+    setSearchError("");
+    try {
+      attachPaper(await ingestArxivPaper(result));
+    } catch (error) {
+      setSearchError(error instanceof Error ? error.message : "Could not read this paper.");
+    } finally {
+      setIngestingId(null);
     }
   }
 
@@ -196,6 +207,8 @@ export default function Home() {
                 <div className="message-body">
                   {message.role === "assistant" && <small>{message.notice ? "Atlas" : "Gemini"}</small>}
                   <p>{message.text}</p>
+                  {message.confidence === "low" && <span className="confidence-note">Low-confidence match — check the sources below.</span>}
+                  {message.candidates && message.candidates.length > 0 && <div className="candidate-list">{message.candidates.map((candidate) => <div key={candidate.node_id}><strong>{candidate.name}</strong><small>{candidate.type}</small>{candidate.description && <p>{candidate.description}</p>}</div>)}</div>}
                   {message.citations && message.citations.length > 0 && <div className="citations">{message.citations.map((citation, index) => {
                     const key = `${message.id}-${index}`;
                     return <div key={key}><button onClick={() => setExpandedCitation(expandedCitation === key ? null : key)}><Icon name="quote" size={13}/>{citation.section ?? "Source"} · p. {citation.page_start ?? "—"}</button>{expandedCitation === key && <blockquote>“{citation.text}”</blockquote>}</div>;
@@ -213,7 +226,7 @@ export default function Home() {
         {paper && <div className="paper-context-chip"><Icon name="paper" size={14}/><span>Using <strong>{paper.title}</strong></span><button onClick={removePaper}><Icon name="close" size={13}/></button></div>}
         <form className="composer" onSubmit={(event) => ask(event)}>
           <button type="button" className="composer-add" onClick={() => openAddPaper()} aria-label="Add a paper"><Icon name="plus" size={19}/></button>
-          <textarea ref={composerInput} value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void ask(); } }} rows={1} placeholder={paper ? "Ask anything about this paper…" : "Message Gemini…"}/>
+          <textarea ref={composerInput} value={query} maxLength={8000} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void ask(); } }} rows={1} placeholder={paper ? "Ask anything about this paper…" : "Message Gemini…"}/>
           <button type="submit" className="send-button" disabled={!query.trim() || loading} aria-label="Send"><Icon name="send" size={18}/></button>
         </form>
         <small className="composer-hint">Gemini can make mistakes. Paper answers include sources when available.</small>
@@ -242,7 +255,7 @@ export default function Home() {
             <button className="back-button" onClick={() => setAddMode("choose")}>← Back</button>
             <form onSubmit={runSearch}><Icon name="search" size={18}/><input autoFocus value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Search by title, author, or topic…"/><button disabled={searchQuery.trim().length < 2 || searching}>{searching ? "Searching…" : "Search"}</button></form>
             {searchError && <p className="form-error">{searchError}</p>}
-            <div className="search-results">{searchResults.map((result) => <article key={result.id}><div><span>arXiv</span><small>{result.published}</small></div><h3>{result.title}</h3><p>{result.authors}</p><button onClick={() => attachPaper(result)}>Add to chat</button></article>)}</div>
+            <div className="search-results">{searchResults.map((result) => <article key={result.id}><div><span>arXiv</span><small>{result.published}</small></div><h3>{result.title}</h3><p>{result.authors}</p><button disabled={Boolean(ingestingId)} onClick={() => void addArxivPaper(result)}>{ingestingId === result.id ? "Reading…" : "Add to chat"}</button></article>)}</div>
           </div>}
         </section>
       </div>}
