@@ -30,10 +30,13 @@ gcloud run deploy all-things-agentic-api \
 ```
 
 `--min-instances=1 --max-instances=1` is not a tuning choice - it's
-required. See `service/state.py`'s module docstring: `ChunkIndex` and
-`ClarificationOrchestrator` are in-memory only, no Firestore rehydration,
-so more than one running instance would split state across processes
-that can't see each other's data.
+required. `GraphManager`, `ChunkIndex`, and `ClarificationOrchestrator` all
+rehydrate from Firestore at process startup (see `service/state.py`'s
+module docstring), but that's a startup-only read, not a live subscription -
+an already-running instance never sees writes another instance makes after
+both have started. More than one concurrently running instance would still
+let two requests diverge mid-session (e.g. one instance ingests a paper the
+other never sees) until the next cold start re-rehydrates them.
 
 ## Verifying it after deploy
 
@@ -66,8 +69,9 @@ error-shaped 200 isn't a real pass.
 - A real `gcloud builds submit` confirming the Dockerfile builds and
   pushes cleanly (image deleted afterward - build-only, this repo's
   session never ran or deployed that image).
-- 150 automated tests, including 13 FastAPI `TestClient` tests with no
-  live GCP dependency (`tests/test_service.py`).
+- 174 automated tests (172 passed, 2 skipped - real-Vertex-AI-only),
+  including 23 FastAPI `TestClient` tests with no live GCP dependency
+  (`tests/test_service.py`).
 
 Not tested: the actual deployed Cloud Run URL, multiple concurrent
 users/instances, or anything past a single file per `/papers` request.
