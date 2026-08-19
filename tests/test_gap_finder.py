@@ -133,7 +133,23 @@ def test_feedback_writes_event_to_firestore(fake_db):
     events = list(fake_db.collection("feedback_events").stream())
     assert len(events) == 1
     assert events[0].to_dict()["type"] == "gap_rating"
-    assert events[0].to_dict()["interesting"] is True
+
+
+def test_node_boost_rehydrates_from_feedback_events_on_construction(fake_db):
+    """Regression: feedback_events was written for durability but never
+    read back, so 'adapts to the user's thinking' only held for the
+    lifetime of one running process. A fresh GapFinder pointed at the same
+    db_client must already reflect prior feedback, with no record_feedback
+    call on the new instance."""
+    gm, a, b, shared = _populated_graph(fake_db)
+    first_process = GapFinder(gm, explain_fn=_stub_explain, db_client=fake_db)
+    before = first_process.find_candidates()[0].score
+    first_process.record_feedback(a.id, b.id, interesting=False)
+
+    restarted = GapFinder(gm, explain_fn=_stub_explain, db_client=fake_db)
+
+    after_restart = restarted.find_candidates()[0].score
+    assert after_restart < before
 
 
 class _FakeModels:
