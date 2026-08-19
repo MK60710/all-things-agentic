@@ -1,4 +1,4 @@
-import type { GapCandidate, PendingQuestion, QueryResponse } from "./types";
+import type { GapCandidate, GraphVizEdge, GraphVizNode, PendingQuestion, QueryResponse } from "./types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL;
 
@@ -17,6 +17,11 @@ export interface PaperContext {
 
 export interface PaperSearchResult extends PaperContext {
   published?: string;
+}
+
+export interface PaperIngestResult extends PaperContext {
+  new_nodes: GraphVizNode[];
+  new_edges: GraphVizEdge[];
 }
 
 export async function askAssistant(
@@ -43,7 +48,7 @@ export async function askAssistant(
   };
 }
 
-export async function uploadPaper(file: File): Promise<PaperContext> {
+export async function uploadPaper(file: File): Promise<PaperIngestResult> {
   if (!API_URL) throw new Error("NEXT_PUBLIC_API_URL is not configured");
   const tokenResponse = await fetch("/api/papers/upload-token", { method: "POST" });
   const tokenData = await tokenResponse.json() as { token?: string; max_bytes?: number; error?: string };
@@ -61,12 +66,12 @@ export async function uploadPaper(file: File): Promise<PaperContext> {
     headers: { "X-Upload-Token": tokenData.token },
     body,
   });
-  const data = await response.json() as PaperContext & { detail?: string };
+  const data = await response.json() as PaperIngestResult & { detail?: string };
   if (!response.ok) throw new Error(data.detail ?? `Paper upload failed (${response.status})`);
   return data;
 }
 
-export async function ingestArxivPaper(paper: PaperSearchResult): Promise<PaperContext> {
+export async function ingestArxivPaper(paper: PaperSearchResult): Promise<PaperIngestResult> {
   const response = await fetch("/api/papers/arxiv", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -78,7 +83,7 @@ export async function ingestArxivPaper(paper: PaperSearchResult): Promise<PaperC
       pdfUrl: paper.pdfUrl,
     }),
   });
-  const data = await response.json() as PaperContext & { error?: string };
+  const data = await response.json() as PaperIngestResult & { error?: string };
   if (!response.ok) throw new Error(data.error ?? "Could not ingest the arXiv paper");
   return data;
 }
