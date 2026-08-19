@@ -303,6 +303,23 @@ def test_arxiv_ingest_rejects_invalid_identifier_before_download(client, monkeyp
     assert response.status_code == 400
 
 
+def test_arxiv_ingest_has_the_same_path_traversal_guard_as_upload(client, monkeypatch):
+    """Regression: ingest_arxiv built its destination path with no
+    is_relative_to check, unlike upload_paper's identical write pattern -
+    _ARXIV_ID's regex makes this unreachable via a real arXiv id today,
+    so exercise it directly by making _sanitize_paper_id (the layer the
+    regex is supposed to make redundant) return something unsafe, proving
+    the second, independent guard is actually there and would catch it."""
+    monkeypatch.setattr(
+        "service.routers.papers._sanitize_paper_id", lambda raw: "../../../../tmp/evil"
+    )
+    response = client.post(
+        "/papers/arxiv",
+        json={"arxiv_id": "2306.14753", "title": "Test"},
+    )
+    assert response.status_code == 400
+
+
 def test_local_frontend_origin_is_allowed_by_cors(client):
     response = client.options(
         "/chat",
