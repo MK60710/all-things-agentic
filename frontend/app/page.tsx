@@ -78,10 +78,31 @@ export default function Home() {
   const shownGapKeys = useRef<Set<string>>(new Set());
 
   useEffect(() => { chatEnd.current?.scrollIntoView({ behavior: "smooth" }); }, [messages, loading]);
+  // Conversation history is otherwise plain React state - a refresh meant
+  // literally starting over, the opposite of "persistent memory... instead
+  // of starting over each time".
+  useEffect(() => {
+    window.localStorage.setItem("atlas-messages", JSON.stringify(messages));
+  }, [messages]);
   useEffect(() => {
     const savedPaper = window.localStorage.getItem("atlas-active-paper");
     if (savedPaper) {
       try { setPaper(JSON.parse(savedPaper) as PaperContext); } catch { window.localStorage.removeItem("atlas-active-paper"); }
+    }
+    const savedMessages = window.localStorage.getItem("atlas-messages");
+    if (savedMessages) {
+      try {
+        const restored = JSON.parse(savedMessages) as Message[];
+        // Seed the dedup trackers directly from restored history (not from
+        // messages state, which won't have committed yet) so checkGuidance
+        // below doesn't re-post a clarification/gap card that's already
+        // sitting in the restored conversation.
+        restored.forEach((message) => {
+          if (message.clarification) shownClarificationIds.current.add(message.clarification.id);
+          message.gaps?.forEach((candidate) => shownGapKeys.current.add(gapKey(candidate)));
+        });
+        setMessages(restored);
+      } catch { window.localStorage.removeItem("atlas-messages"); }
     }
     composerInput.current?.focus();
     void checkGuidance();
