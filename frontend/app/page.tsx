@@ -141,7 +141,12 @@ export default function Home() {
   function askAboutGap(candidate: GapCandidate) {
     const question = `How does ${candidate.node_a_name} relate to ${candidate.node_b_name}?${candidate.explanation ? ` (${candidate.explanation})` : ""}`;
     void recordGapFeedback(candidate.node_a_id, candidate.node_b_id, true).catch(() => {});
-    void ask(undefined, question);
+    // Gaps come from GapFinder, which reasons over the whole graph, not any
+    // one paper - explicitly ignore whatever paper happens to be attached
+    // right now, or this silently re-scopes the question to it and can
+    // wrongly report "no information" for evidence that's real but lives
+    // in a different paper.
+    void ask(undefined, question, null);
   }
 
   function dismissGap(candidate: GapCandidate) {
@@ -149,10 +154,11 @@ export default function Home() {
     void recordGapFeedback(candidate.node_a_id, candidate.node_b_id, false).catch(() => {});
   }
 
-  async function ask(event?: FormEvent, suggested = query) {
+  async function ask(event?: FormEvent, suggested = query, paperOverride?: PaperContext | null) {
     event?.preventDefault();
     const question = suggested.trim();
     if (!question || loading) return;
+    const effectivePaper = paperOverride === undefined ? paper : paperOverride;
 
     const history: ChatHistoryItem[] = messages
       .filter((message) => !message.notice)
@@ -162,7 +168,7 @@ export default function Home() {
     setQuery("");
     setLoading(true);
     try {
-      const response = await askAssistant(question, history, paper);
+      const response = await askAssistant(question, history, effectivePaper);
       setMessages((current) => [...current, {
         id: crypto.randomUUID(),
         role: "assistant",
