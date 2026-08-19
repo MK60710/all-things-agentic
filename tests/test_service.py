@@ -9,6 +9,7 @@ from agent.clarification_orchestrator import ClarificationOrchestrator
 from agent.document_ingestion import PdfTextExtractor
 from agent.extraction_agent import ChunkOnlyStructuredExtractor, ExtractionAgent
 from agent.gap_finder import GapFinder
+from agent.general_chat import GeneralChatAgent
 from agent.graph_manager import GraphManager
 from agent.query_agent import QueryAgent
 from agent.research_store import ResearchStore
@@ -17,6 +18,7 @@ from agent.schema import Node, NodeType
 from service.app import app
 from service.deps import get_state
 from service.state import AppState
+from service.storage import PaperStore, UploadTokenStore
 
 
 @pytest.fixture
@@ -32,6 +34,7 @@ def app_state(fake_db, tmp_path) -> AppState:
         # Vertex AI call, same pattern test_query_agent.py/test_gap_finder.py
         # already use.
         query_agent=QueryAgent(chunks, graph, clarification=clarification, db_client=fake_db),
+        general_chat=GeneralChatAgent(),
         gap_finder=GapFinder(graph, db_client=fake_db),
         extraction_agent=ExtractionAgent(
             document_extractor=PdfTextExtractor(allowed_root=str(tmp_path)),
@@ -39,6 +42,8 @@ def app_state(fake_db, tmp_path) -> AppState:
         ),
         research_store=ResearchStore(chunks, graph),
         upload_root=str(tmp_path),
+        paper_store=PaperStore(fake_db),
+        upload_tokens=UploadTokenStore(fake_db),
     )
 
 
@@ -215,3 +220,96 @@ def test_no_api_key_required_when_secret_unset(client, monkeypatch):
     monkeypatch.delenv("API_SHARED_SECRET", raising=False)
     response = client.post("/query", json={"query": "test"})
     assert response.status_code == 200
+
+
+def test_general_chat_uses_shared_fastapi_surface(client, app_state, monkeypatch):
+    monkeypatch.setattr(
+        app_state.general_chat,
+        "answer",
+        lambda message, history: f"Gemini says: {message} ({len(history)} prior turns)",
+    )
+    response = client.post(
+        "/chat",
+        json={
+            "message": "hello",
+            "history": [{"role": "user", "text": "earlier"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["retrieval_mode"] == "general"
+    assert response.json()["answer"] == "Gemini says: hello (1 prior turns)"
+
+
+def test_paper_chat_is_scoped_to_requested_paper(client, app_state):
+    app_state.chunks.upsert_paper("paper-a", ["Alpha paper studies apples."])
+    app_state.chunks.upsert_paper("paper-b", ["Beta paper studies bananas."])
+
+    response = client.post(
+        "/chat", json={"message": "What does the paper study?", "paper_id": "paper-b"}
+    )
+
+    assert response.status_code == 200
+    assert {item["paper_id"] for item in response.json()["citations"]} == {"paper-b"}
+
+
+def test_upload_token_is_one_use(client, monkeypatch):
+    monkeypatch.setenv("API_SHARED_SECRET", "correct-secret")
+    issued = client.post(
+        "/papers/upload-token", headers={"X-API-Key": "correct-secret"}
+    )
+    assert issued.status_code == 200
+    token = issued.json()["token"]
+
+    first = client.post(
+        "/papers",
+        headers={"X-Upload-Token": token},
+        files={"file": ("paper.pdf", b"%PDF-1.4 fake", "application/pdf")},
+    )
+    assert first.status_code in (200, 422)
+    second = client.post(
+        "/papers",
+        headers={"X-Upload-Token": token},
+        files={"file": ("paper.pdf", b"%PDF-1.4 fake", "application/pdf")},
+    )
+    assert second.status_code == 401
+
+
+def test_upload_rejects_non_pdf_content(client):
+    response = client.post(
+        "/papers",
+        files={"file": ("paper.pdf", b"not a pdf", "application/pdf")},
+    )
+    assert response.status_code == 415
+
+
+def test_upload_rejects_oversized_pdf(client, monkeypatch):
+    monkeypatch.setattr("service.routers.papers.MAX_PDF_BYTES", 8)
+    response = client.post(
+        "/papers",
+        files={"file": ("paper.pdf", b"%PDF-1234", "application/pdf")},
+    )
+    assert response.status_code == 413
+
+
+def test_arxiv_ingest_rejects_invalid_identifier_before_download(client, monkeypatch):
+    def unexpected_request(*args, **kwargs):
+        raise AssertionError("invalid identifiers must not trigger a download")
+
+    monkeypatch.setattr("service.routers.papers.requests.get", unexpected_request)
+    response = client.post(
+        "/papers/arxiv", json={"arxiv_id": "../../secret", "title": "Bad"}
+    )
+    assert response.status_code == 400
+
+
+def test_local_frontend_origin_is_allowed_by_cors(client):
+    response = client.options(
+        "/chat",
+        headers={
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://localhost:3000"

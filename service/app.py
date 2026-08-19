@@ -10,9 +10,12 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+import os
 
-from service.routers import clarifications, gaps, health, papers, query
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from service.routers import chat, clarifications, gaps, health, papers, query
 from service.state import build_state
 
 
@@ -27,5 +30,20 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="all-things-agentic API", lifespan=lifespan)
 
-for router in (health.router, query.router, clarifications.router, gaps.router, papers.router):
+origins = [
+    value.strip()
+    for value in os.environ.get(
+        "CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
+    ).split(",")
+    if value.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "X-API-Key", "X-Upload-Token"],
+)
+
+for router in (health.router, chat.router, query.router, clarifications.router, gaps.router, papers.router):
     app.include_router(router)

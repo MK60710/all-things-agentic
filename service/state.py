@@ -1,14 +1,8 @@
 """App-wide singleton wiring, built once at container startup.
 
-ChunkIndex and ClarificationOrchestrator are plain in-process state with no
-Firestore rehydration (unlike GraphManager, which does rehydrate on
-construction) - if this were ever built more than once per running process,
-or if Cloud Run ran more than one instance, requests could land on an
-instance that never saw earlier ingests or pending questions. This is the
-reason the deploy command in the handoff doc pins
---min-instances=1 --max-instances=1 and the Dockerfile pins --workers 1:
-build_state() must run exactly once, and everything downstream depends on
-that being true.
+GraphManager, ChunkIndex, and ClarificationOrchestrator rehydrate their
+Firestore-backed state at process startup. AppState still owns one shared
+in-process view per worker, so it is constructed once by FastAPI's lifespan.
 """
 
 from __future__ import annotations
@@ -23,11 +17,13 @@ from agent.document_ingestion import PdfTextExtractor
 from agent.extraction_agent import ExtractionAgent
 from agent.gap_finder import GapFinder, GeminiExplainer
 from agent.gemini_extractor import GeminiStructuredExtractor
+from agent.general_chat import GeneralChatAgent
 from agent.graph_manager import GraphManager
 from agent.query_agent import QueryAgent
 from agent.research_store import ResearchStore
 from agent.retrieval import ChunkIndex, LocalHashingEmbedder
 from agent.text_utils import entity_embedding_text
+from service.storage import PaperStore, UploadTokenStore
 
 
 @dataclass
@@ -36,10 +32,13 @@ class AppState:
     chunks: ChunkIndex
     clarification: ClarificationOrchestrator
     query_agent: QueryAgent
+    general_chat: GeneralChatAgent
     gap_finder: GapFinder
     extraction_agent: ExtractionAgent
     research_store: ResearchStore
     upload_root: str
+    paper_store: PaperStore
+    upload_tokens: UploadTokenStore
     _embedder: LocalHashingEmbedder | None = None
 
     def __post_init__(self) -> None:
@@ -60,7 +59,7 @@ def build_state() -> AppState:
     db = firestore.Client(project=project)
     graph = GraphManager(project_id=project, db_client=db)
     chunks = ChunkIndex(db_client=db)
-    clarification = ClarificationOrchestrator(graph_manager=graph)
+    clarification = ClarificationOrchestrator(graph_manager=graph, db_client=db)
 
     query_agent = QueryAgent(
         chunks,
@@ -69,6 +68,11 @@ def build_state() -> AppState:
         location=location,
         clarification=clarification,
         db_client=db,
+    )
+    general_chat = GeneralChatAgent(
+        project=project,
+        location=location,
+        model=os.environ.get("GEMINI_CHAT_MODEL", "gemini-2.5-flash-lite"),
     )
     gap_finder = GapFinder(
         graph,
@@ -91,8 +95,11 @@ def build_state() -> AppState:
         chunks=chunks,
         clarification=clarification,
         query_agent=query_agent,
+        general_chat=general_chat,
         gap_finder=gap_finder,
         extraction_agent=extraction_agent,
         research_store=research_store,
         upload_root=upload_root,
+        paper_store=PaperStore(db),
+        upload_tokens=UploadTokenStore(db),
     )

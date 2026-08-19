@@ -120,6 +120,36 @@ class ChunkIndex:
         self._embedding_fn = embedding_fn or LocalHashingEmbedder()
         self._db = db_client
         self._records: dict[str, ChunkRecord] = {}
+        if self._db is not None:
+            self._rehydrate()
+
+    def _rehydrate(self) -> None:
+        """Restore persisted chunks so paper chat survives a process restart."""
+        for snapshot in self._db.collection("chunks").stream():
+            data = snapshot.to_dict()
+            text = str(data.get("text", "")).strip()
+            paper_id = str(data.get("paper_id", "")).strip()
+            if not text or not paper_id:
+                continue
+            embedding = data.get("embedding")
+            self._records[snapshot.id] = ChunkRecord(
+                id=snapshot.id,
+                paper_id=paper_id,
+                ordinal=int(data.get("ordinal", 0)),
+                text=text,
+                embedding=(
+                    [float(value) for value in embedding]
+                    if isinstance(embedding, list)
+                    else self._embedding_fn(text)
+                ),
+                page_start=data.get("page_start"),
+                page_end=data.get("page_end"),
+                section=data.get("section"),
+                source=str(data.get("source", "pdf_text")),
+                content_type=str(data.get("content_type", "prose")),
+                previous_chunk_id=data.get("previous_chunk_id"),
+                next_chunk_id=data.get("next_chunk_id"),
+            )
 
     def upsert_paper(
         self, paper_id: str, chunks: list[str] | list[ExtractionChunk]

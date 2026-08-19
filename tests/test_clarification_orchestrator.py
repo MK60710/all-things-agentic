@@ -290,3 +290,18 @@ def test_terminal_review_loop_reports_no_pending_questions():
 
     assert answered == 0
     assert any("No pending" in line for line in printed)
+
+
+def test_open_questions_rehydrate_from_firestore(fake_db):
+    first = ClarificationOrchestrator(db_client=fake_db)
+    question = first.register_entity_merge_question(
+        provisional_node_id="new-node",
+        entity_name="New",
+        candidate_node_id="existing-node",
+        candidate_name="Existing",
+    )
+
+    restored = ClarificationOrchestrator(db_client=fake_db)
+
+    assert restored.get(question.id) is not None
+    assert [item.id for item in restored.pending()] == [question.id]

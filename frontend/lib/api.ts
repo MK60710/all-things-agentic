@@ -1,4 +1,4 @@
-import type { Citation, QueryResponse } from "./types";
+import type { QueryResponse } from "./types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL;
 
@@ -23,34 +23,63 @@ export async function askAssistant(
   message: string,
   history: ChatHistoryItem[],
   paper?: PaperContext | null,
-  sessionId?: string,
-): Promise<QueryResponse | null> {
-  if (paper && !API_URL) return null;
-
-  const endpoint = paper ? `${API_URL!.replace(/\/$/, "")}/query` : "/api/chat";
-  const body = paper ? { query: message, paper_id: paper.id, paper } : { message, history, sessionId };
-  const response = await fetch(endpoint, {
+): Promise<QueryResponse> {
+  const response = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify({ message, history: history.slice(-20), paper_id: paper?.id }),
   });
 
-  if (!response.ok) throw new Error(`Assistant request failed (${response.status})`);
-  const data = await response.json() as Partial<QueryResponse> & { text?: string; response?: string };
+  const data = await response.json() as Partial<QueryResponse> & { error?: string };
+  if (!response.ok) throw new Error(data.error ?? `Assistant request failed (${response.status})`);
   return {
-    answer: data.answer ?? data.text ?? data.response ?? "I couldn't produce a response.",
+    answer: data.answer ?? "I couldn't produce a response.",
     citations: data.citations ?? [],
-    retrieval_mode: data.retrieval_mode ?? (paper ? "vector" : "no_results"),
+    retrieval_mode: data.retrieval_mode ?? (paper ? "vector" : "general"),
+    confidence: data.confidence,
+    candidates: data.candidates,
+    clarification_question_id: data.clarification_question_id,
   };
 }
 
-export async function uploadPaper(file: File): Promise<PaperContext | null> {
-  if (!API_URL) return null;
+export async function uploadPaper(file: File): Promise<PaperContext> {
+  if (!API_URL) throw new Error("NEXT_PUBLIC_API_URL is not configured");
+  const tokenResponse = await fetch("/api/papers/upload-token", { method: "POST" });
+  const tokenData = await tokenResponse.json() as { token?: string; max_bytes?: number; error?: string };
+  if (!tokenResponse.ok || !tokenData.token) {
+    throw new Error(tokenData.error ?? "Could not authorize the upload");
+  }
+  if (tokenData.max_bytes && file.size > tokenData.max_bytes) {
+    throw new Error("This PDF is larger than 25 MiB.");
+  }
   const body = new FormData();
   body.append("file", file);
-  const response = await fetch(`${API_URL.replace(/\/$/, "")}/papers/upload`, { method: "POST", body });
-  if (!response.ok) throw new Error(`Paper upload failed (${response.status})`);
-  return response.json() as Promise<PaperContext>;
+  body.append("title", file.name.replace(/\.pdf$/i, ""));
+  const response = await fetch(`${API_URL.replace(/\/$/, "")}/papers`, {
+    method: "POST",
+    headers: { "X-Upload-Token": tokenData.token },
+    body,
+  });
+  const data = await response.json() as PaperContext & { detail?: string };
+  if (!response.ok) throw new Error(data.detail ?? `Paper upload failed (${response.status})`);
+  return data;
+}
+
+export async function ingestArxivPaper(paper: PaperSearchResult): Promise<PaperContext> {
+  const response = await fetch("/api/papers/arxiv", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      arxiv_id: paper.id.replace(/^arxiv:/, ""),
+      title: paper.title,
+      authors: paper.authors,
+      abstract: paper.abstract,
+      pdfUrl: paper.pdfUrl,
+    }),
+  });
+  const data = await response.json() as PaperContext & { error?: string };
+  if (!response.ok) throw new Error(data.error ?? "Could not ingest the arXiv paper");
+  return data;
 }
 
 export async function searchPapers(query: string): Promise<PaperSearchResult[]> {
