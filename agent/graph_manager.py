@@ -11,11 +11,15 @@ from __future__ import annotations
 import logging
 import math
 import re
+import threading
 import uuid
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import networkx as nx
+
+if TYPE_CHECKING:
+    from agent.clarification_orchestrator import ClarificationOrchestrator
 
 try:
     from google.cloud import firestore
@@ -134,6 +138,16 @@ class GraphManager:
             self._db = firestore.Client(project=project_id, database=database)
         self._known_distinct: set[tuple[str, str]] = set()
         self._node_token_cache: dict[str, set[str]] = {}
+        # networkx's MultiDiGraph is not thread-safe - the FastAPI service
+        # (service/) runs sync route handlers concurrently against one
+        # shared GraphManager instance, so a concurrent write during a
+        # read's iteration (e.g. self.graph.nodes(data=True) in
+        # search_nodes/canonicalize) can raise "dictionary changed size
+        # during iteration" and turn a normal request into a 500.
+        # Reentrant because apply_extraction_result calls add_node/
+        # canonicalize internally, from the same thread, while already
+        # holding this lock.
+        self._lock = threading.RLock()
         self._rehydrate()
 
     def _rehydrate(self) -> None:
@@ -158,28 +172,31 @@ class GraphManager:
 
     def add_node(self, node: Node) -> str:
         """Idempotent upsert on node.id — safe to retry."""
-        self._db.collection("nodes").document(node.id).set(
-            node.model_dump(mode="json"), merge=True
-        )
-        self.graph.add_node(node.id, **node.model_dump(mode="json"))
-        # add_node is an upsert (name/description can change on retry with
-        # richer data) - drop any stale cached tokens so search_nodes below
-        # re-tokenizes from the current data on next lookup.
-        self._node_token_cache.pop(node.id, None)
-        return node.id
+        with self._lock:
+            self._db.collection("nodes").document(node.id).set(
+                node.model_dump(mode="json"), merge=True
+            )
+            self.graph.add_node(node.id, **node.model_dump(mode="json"))
+            # add_node is an upsert (name/description can change on retry
+            # with richer data) - drop any stale cached tokens so
+            # search_nodes below re-tokenizes from the current data on
+            # next lookup.
+            self._node_token_cache.pop(node.id, None)
+            return node.id
 
     def add_edge(self, edge: Edge) -> str:
         """Idempotent upsert on edge.id — safe to retry."""
-        self._db.collection("edges").document(edge.id).set(
-            edge.model_dump(mode="json"), merge=True
-        )
-        self.graph.add_edge(
-            edge.source_id,
-            edge.target_id,
-            key=edge.id,
-            **edge.model_dump(mode="json"),
-        )
-        return edge.id
+        with self._lock:
+            self._db.collection("edges").document(edge.id).set(
+                edge.model_dump(mode="json"), merge=True
+            )
+            self.graph.add_edge(
+                edge.source_id,
+                edge.target_id,
+                key=edge.id,
+                **edge.model_dump(mode="json"),
+            )
+            return edge.id
 
     def resolve_alias(
         self, canonical_id: str, alias_id: str, distinct: bool = False
@@ -191,48 +208,50 @@ class GraphManager:
         records the pair as known-distinct so the same question isn't asked
         again later in the batch.
         """
-        if distinct:
-            pair = tuple(sorted((canonical_id, alias_id)))
-            self._known_distinct.add(pair)
-            correction_id = str(
-                uuid.uuid5(
-                    uuid.NAMESPACE_URL,
-                    f"canonicalization:distinct:{pair[0]}:{pair[1]}",
+        with self._lock:
+            if distinct:
+                pair = tuple(sorted((canonical_id, alias_id)))
+                self._known_distinct.add(pair)
+                correction_id = str(
+                    uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f"canonicalization:distinct:{pair[0]}:{pair[1]}",
+                    )
                 )
-            )
-            self._db.collection("canonicalization_corrections").document(
-                correction_id
-            ).set(
-                {
-                    "decision": "distinct",
-                    "first_node_id": pair[0],
-                    "second_node_id": pair[1],
-                },
-                merge=True,
-            )
-            return
-        edge = Edge(
-            id=str(
-                uuid.uuid5(
-                    uuid.NAMESPACE_URL,
-                    f"same_as:{alias_id}:{canonical_id}",
+                self._db.collection("canonicalization_corrections").document(
+                    correction_id
+                ).set(
+                    {
+                        "decision": "distinct",
+                        "first_node_id": pair[0],
+                        "second_node_id": pair[1],
+                    },
+                    merge=True,
                 )
-            ),
-            source_id=alias_id,
-            target_id=canonical_id,
-            type=EdgeType.SAME_AS,
-            provenance=ProvenanceTag.INFERRED,
-        )
-        self.add_edge(edge)
+                return
+            edge = Edge(
+                id=str(
+                    uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f"same_as:{alias_id}:{canonical_id}",
+                    )
+                ),
+                source_id=alias_id,
+                target_id=canonical_id,
+                type=EdgeType.SAME_AS,
+                provenance=ProvenanceTag.INFERRED,
+            )
+            self.add_edge(edge)
 
     # ---- Read-only tools ----
 
     def get_neighbors(self, node_id: str) -> list[str]:
-        if node_id not in self.graph:
-            return []
-        return list(self.graph.successors(node_id)) + list(
-            self.graph.predecessors(node_id)
-        )
+        with self._lock:
+            if node_id not in self.graph:
+                return []
+            return list(self.graph.successors(node_id)) + list(
+                self.graph.predecessors(node_id)
+            )
 
     def _node_tokens(self, node_id: str, data: dict[str, Any]) -> set[str]:
         cached = self._node_token_cache.get(node_id)
@@ -241,6 +260,16 @@ class GraphManager:
         tokens = search_tokens(f"{data.get('name', '')} {data.get('description', '')}")
         self._node_token_cache[node_id] = tokens
         return tokens
+
+    def _is_merged_alias(self, node_id: str) -> bool:
+        """True if node_id has been resolved into another node via
+        resolve_alias(distinct=False) - a SAME_AS edge out of it means it's
+        superseded by its canonical target, not an independent entity
+        anymore."""
+        return any(
+            data.get("type") == EdgeType.SAME_AS.value
+            for _, _, data in self.graph.out_edges(node_id, data=True)
+        )
 
     def search_nodes(
         self, query: str, *, limit: int = 8, min_score: float = 0.0
@@ -252,71 +281,110 @@ class GraphManager:
         of reaching into `.graph` themselves and treating any token overlap
         as a match. Tokenization is cached per node (invalidated in
         add_node) since node text is static between graph mutations and
-        this scan is O(number of nodes) per call.
+        this scan is O(number of nodes) per call. Nodes already merged
+        into another node (resolve_alias(distinct=False)) are excluded -
+        otherwise a resolved entity_merge question keeps resurfacing the
+        same ambiguity on every later query, since the alias node would
+        still show up as an independent, separately-scored hit. The merge
+        check runs after the (cached) token-overlap check, not before -
+        it's an uncached edge scan, so only paying it for nodes that
+        already cleared the cheap check keeps the common case (no overlap)
+        fast.
         """
         query_tokens = search_tokens(query)
         if not query_tokens:
             return []
-        hits: list[NodeSearchHit] = []
-        for node_id, data in self.graph.nodes(data=True):
-            node_tokens = self._node_tokens(node_id, data)
-            if not node_tokens:
-                continue
-            overlap = query_tokens & node_tokens
-            if not overlap:
-                continue
-            score = len(overlap) / len(query_tokens)
-            if score >= min_score:
-                hits.append(
-                    NodeSearchHit(
-                        node_id=node_id,
-                        score=score,
-                        name=data.get("name", node_id),
-                        type=data.get("type", "UNKNOWN"),
-                        description=data.get("description", ""),
+        with self._lock:
+            hits: list[NodeSearchHit] = []
+            for node_id, data in self.graph.nodes(data=True):
+                node_tokens = self._node_tokens(node_id, data)
+                if not node_tokens:
+                    continue
+                overlap = query_tokens & node_tokens
+                if not overlap:
+                    continue
+                if self._is_merged_alias(node_id):
+                    continue
+                score = len(overlap) / len(query_tokens)
+                if score >= min_score:
+                    hits.append(
+                        NodeSearchHit(
+                            node_id=node_id,
+                            score=score,
+                            name=data.get("name", node_id),
+                            type=data.get("type", "UNKNOWN"),
+                            description=data.get("description", ""),
+                        )
                     )
-                )
-        hits.sort(key=lambda hit: (-hit.score, hit.node_id))
-        return hits[:limit]
+            hits.sort(key=lambda hit: (-hit.score, hit.node_id))
+            return hits[:limit]
 
     def get_node(self, node_id: str) -> dict[str, Any] | None:
-        if node_id not in self.graph:
-            return None
-        return dict(self.graph.nodes[node_id])
+        with self._lock:
+            if node_id not in self.graph:
+                return None
+            return dict(self.graph.nodes[node_id])
+
+    def _merged_aliases_of(self, node_id: str) -> list[str]:
+        """Node ids that were merged into node_id via
+        resolve_alias(distinct=False) - i.e. nodes with a SAME_AS edge
+        pointing at node_id. Used by get_incident_edges so a canonical
+        node's real extracted edges aren't the only ones surfaced after a
+        merge; the alias's own edges (which resolve_alias never moves or
+        copies) stay reachable too, through the node that now represents
+        both."""
+        return [
+            source_id
+            for source_id, _, data in self.graph.in_edges(node_id, data=True)
+            if data.get("type") == EdgeType.SAME_AS.value
+        ]
 
     def get_incident_edges(self, node_id: str) -> list[IncidentEdge]:
         """All edges touching node_id, deduplicated (MultiDiGraph can
         return the same edge from both an in- and out-edge query if it's a
-        self-loop)."""
-        if node_id not in self.graph:
-            return []
-        combined = list(
-            self.graph.in_edges(node_id, keys=True, data=True)
-        ) + list(self.graph.out_edges(node_id, keys=True, data=True))
-        seen: set[str] = set()
-        edges: list[IncidentEdge] = []
-        for source_id, target_id, edge_id, data in combined:
-            if edge_id in seen:
-                continue
-            seen.add(edge_id)
-            edges.append(
-                IncidentEdge(
-                    edge_id=edge_id,
-                    source_id=source_id,
-                    target_id=target_id,
-                    source_name=self.graph.nodes.get(source_id, {}).get(
-                        "name", source_id
-                    ),
-                    target_name=self.graph.nodes.get(target_id, {}).get(
-                        "name", target_id
-                    ),
-                    relation=data.get("type", "UNKNOWN"),
-                    source_quote=data.get("source_quote") or "",
-                    source_paper_id=data.get("source_paper_id"),
-                    source_section=data.get("source_section"),
+        self-loop), plus - if other nodes were merged into node_id via
+        resolve_alias - their edges too. Without this, a merge only adds a
+        SAME_AS edge; the alias's real extracted relations stay stored
+        under its own node_id and would otherwise become permanently
+        unreachable from graph evidence once search_nodes stops returning
+        the (now-merged) alias as its own hit."""
+        with self._lock:
+            if node_id not in self.graph:
+                return []
+            node_ids = [node_id, *self._merged_aliases_of(node_id)]
+            combined = []
+            for nid in node_ids:
+                combined += list(self.graph.in_edges(nid, keys=True, data=True))
+                combined += list(self.graph.out_edges(nid, keys=True, data=True))
+            seen: set[str] = set()
+            edges: list[IncidentEdge] = []
+            for source_id, target_id, edge_id, data in combined:
+                if edge_id in seen:
+                    continue
+                seen.add(edge_id)
+                if data.get("type") == EdgeType.SAME_AS.value:
+                    # The merge marker itself, not a real extracted
+                    # relation - already accounted for via
+                    # _merged_aliases_of, not useful as evidence.
+                    continue
+                edges.append(
+                    IncidentEdge(
+                        edge_id=edge_id,
+                        source_id=source_id,
+                        target_id=target_id,
+                        source_name=self.graph.nodes.get(source_id, {}).get(
+                            "name", source_id
+                        ),
+                        target_name=self.graph.nodes.get(target_id, {}).get(
+                            "name", target_id
+                        ),
+                        relation=data.get("type", "UNKNOWN"),
+                        source_quote=data.get("source_quote") or "",
+                        source_paper_id=data.get("source_paper_id"),
+                        source_section=data.get("source_section"),
+                    )
                 )
-            )
-        return edges
+            return edges
 
     def _stable_node_id(
         self, paper_id: str, name: str, node_type: NodeType
@@ -352,26 +420,27 @@ class GraphManager:
     ) -> list[tuple[str, str]]:
         """Candidate pairs with no direct edge but at least one common
         neighbor — topology decides, not LLM guessing."""
-        candidates = [
-            n
-            for n, data in self.graph.nodes(data=True)
-            if node_type is None or data.get("type") == node_type.value
-        ]
-        undirected = self.graph.to_undirected()
-        pairs: list[tuple[str, str, int]] = []
-        for i, a in enumerate(candidates):
-            for b in candidates[i + 1 :]:
-                if undirected.has_edge(a, b):
-                    continue
-                if tuple(sorted((a, b))) in self._known_distinct:
-                    continue
-                common = len(
-                    list(nx.common_neighbors(undirected, a, b))
-                )
-                if common > 0:
-                    pairs.append((a, b, common))
-        pairs.sort(key=lambda p: p[2], reverse=True)
-        return [(a, b) for a, b, _ in pairs[:limit]]
+        with self._lock:
+            candidates = [
+                n
+                for n, data in self.graph.nodes(data=True)
+                if node_type is None or data.get("type") == node_type.value
+            ]
+            undirected = self.graph.to_undirected()
+            pairs: list[tuple[str, str, int]] = []
+            for i, a in enumerate(candidates):
+                for b in candidates[i + 1 :]:
+                    if undirected.has_edge(a, b):
+                        continue
+                    if tuple(sorted((a, b))) in self._known_distinct:
+                        continue
+                    common = len(
+                        list(nx.common_neighbors(undirected, a, b))
+                    )
+                    if common > 0:
+                        pairs.append((a, b, common))
+            pairs.sort(key=lambda p: p[2], reverse=True)
+            return [(a, b) for a, b, _ in pairs[:limit]]
 
     # ---- Canonicalization ----
 
@@ -382,33 +451,47 @@ class GraphManager:
         node_type: NodeType | None = None,
     ) -> CanonicalizationResult:
         """Two-tier match: cheap string match first, then embedding
-        similarity. Three-way routing on the result."""
-        normalized = _normalize_name(name)
-        for node_id, data in self.graph.nodes(data=True):
-            if node_type is not None and data.get("type") != node_type.value:
-                continue
-            if _normalize_name(data.get("name", "")) == normalized:
-                return CanonicalizationResult("auto_merge", node_id, 1.0)
+        similarity. Three-way routing on the result.
 
-        if embedding is None:
-            return CanonicalizationResult("new")
+        Both loops skip already-merged alias nodes (resolve_alias
+        (distinct=False) target) - without this, a later entity could
+        match a node that itself got superseded by an earlier merge, and
+        canonicalize/apply_extraction_result would auto-merge or raise a
+        clarification question against a dead alias instead of the real
+        canonical node, same class of bug search_nodes had before it
+        gained the same exclusion.
+        """
+        with self._lock:
+            normalized = _normalize_name(name)
+            for node_id, data in self.graph.nodes(data=True):
+                if node_type is not None and data.get("type") != node_type.value:
+                    continue
+                if self._is_merged_alias(node_id):
+                    continue
+                if _normalize_name(data.get("name", "")) == normalized:
+                    return CanonicalizationResult("auto_merge", node_id, 1.0)
 
-        best_id, best_score = None, 0.0
-        for node_id, data in self.graph.nodes(data=True):
-            if node_type is not None and data.get("type") != node_type.value:
-                continue
-            candidate_embedding = data.get("entity_embedding")
-            if not candidate_embedding:
-                continue
-            score = _cosine_similarity(embedding, candidate_embedding)
-            if score > best_score:
-                best_id, best_score = node_id, score
+            if embedding is None:
+                return CanonicalizationResult("new")
 
-        if best_score >= CANONICALIZATION_HIGH:
-            return CanonicalizationResult("auto_merge", best_id, best_score)
-        if best_score >= CANONICALIZATION_LOW:
-            return CanonicalizationResult("needs_clarification", best_id, best_score)
-        return CanonicalizationResult("new", best_id, best_score)
+            best_id, best_score = None, 0.0
+            for node_id, data in self.graph.nodes(data=True):
+                if node_type is not None and data.get("type") != node_type.value:
+                    continue
+                if self._is_merged_alias(node_id):
+                    continue
+                candidate_embedding = data.get("entity_embedding")
+                if not candidate_embedding:
+                    continue
+                score = _cosine_similarity(embedding, candidate_embedding)
+                if score > best_score:
+                    best_id, best_score = node_id, score
+
+            if best_score >= CANONICALIZATION_HIGH:
+                return CanonicalizationResult("auto_merge", best_id, best_score)
+            if best_score >= CANONICALIZATION_LOW:
+                return CanonicalizationResult("needs_clarification", best_id, best_score)
+            return CanonicalizationResult("new", best_id, best_score)
 
     def apply_extraction_result(
         self,
@@ -416,8 +499,24 @@ class GraphManager:
         *,
         paper_name: str | None = None,
         embedding_fn: Callable[[ExtractedEntity], list[float] | None] | None = None,
+        clarification: "ClarificationOrchestrator | None" = None,
     ) -> GraphIngestionReport:
-        """Persist structured extraction output with stable, retry-safe IDs."""
+        """Persist structured extraction output with stable, retry-safe IDs.
+
+        Each individual graph read/write this method calls (add_node,
+        canonicalize, add_edge) is independently lock-protected, which is
+        enough to prevent the crash this service is actually exposed to -
+        a concurrent iteration/mutation on self.graph raising "dictionary
+        changed size during iteration". This method does not hold one lock
+        across its own entire body, so two concurrent
+        apply_extraction_result calls can still interleave between their
+        individual locked steps (e.g. both could canonicalize a similar
+        entity as "new" before either has written it) - a real but lower-
+        severity race than the crash risk, and one Firestore writes
+        wouldn't be transactional against either way. Acceptable given
+        this service's documented single-instance, --concurrency=4 deploy
+        profile (see service/state.py) - revisit if that profile changes.
+        """
 
         paper_node = Node(
             id=self._stable_paper_node_id(extraction.paper_id),
@@ -465,6 +564,36 @@ class GraphManager:
                     )
                 )
                 reused = False
+                already_distinct = canonical.matched_node_id is not None and tuple(
+                    sorted((canonical.matched_node_id, node_id))
+                ) in self._known_distinct
+                if (
+                    canonical.decision == "needs_clarification"
+                    and canonical.matched_node_id
+                    and clarification is not None
+                    and not already_distinct
+                ):
+                    # The node is created either way so the batch never
+                    # stalls on a person - this just tags the provisional
+                    # node so a later answer can merge it via
+                    # resolve_alias, same fix-it mechanism used for
+                    # manual corrections today. already_distinct guards a
+                    # retry of this exact pair (deterministic node_id) from
+                    # re-asking a question a person already answered
+                    # "no, genuinely different" for.
+                    matched_data = self.graph.nodes.get(
+                        canonical.matched_node_id, {}
+                    )
+                    clarification.register_entity_merge_question(
+                        provisional_node_id=node_id,
+                        entity_name=entity.name,
+                        candidate_node_id=canonical.matched_node_id,
+                        candidate_name=matched_data.get(
+                            "name", canonical.matched_node_id
+                        ),
+                        candidate_description=matched_data.get("description", ""),
+                        score=canonical.score,
+                    )
             entity_to_node_id[(_normalize_name(entity.name), entity.type)] = node_id
             node_writes.append(
                 NodeWriteResult(

@@ -1,27 +1,37 @@
 """Read-only, graph-first research question answering.
 
 The Query Agent keeps retrieval deterministic and uses Gemini only to turn
-retrieved evidence into a concise answer.  It deliberately does not expose
-graph write operations or implement clarification orchestration.
+retrieved evidence into a concise answer. It deliberately does not expose
+graph write operations. When two or more distinct entities are plausibly
+what a query means, it returns that as a clarifying question instead of
+guessing (see _check_query_ambiguity) and optionally hands the question to
+a ClarificationOrchestrator (agent/clarification_orchestrator.py) - the
+question and answer still happen in the same exchange, so this stays
+read-only either way.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
+import uuid
 from collections import Counter
+from dataclasses import replace
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
 
+from agent.clarification_orchestrator import ClarificationOrchestrator
 from agent.graph_manager import GraphManager, IncidentEdge, NodeSearchHit
 from agent.retrieval import ChunkIndex
 from agent.text_utils import escape_tag_delimiters
 
 logger = logging.getLogger(__name__)
 
-RetrievalMode = Literal["graph", "vector", "no_results"]
+RetrievalMode = Literal["graph", "vector", "no_results", "ambiguous"]
 
 
 class QueryCitation(BaseModel):
@@ -37,12 +47,31 @@ class QueryCitation(BaseModel):
     node_ids: list[str] = Field(default_factory=list)
 
 
+class QueryCandidate(BaseModel):
+    """One of several plausible entities a query might mean, returned
+    instead of a guessed answer when the top graph matches are too close
+    to call - see QueryAgent._check_query_ambiguity."""
+
+    node_id: str
+    name: str
+    type: str
+    description: str
+    score: float
+
+
 class QueryResult(BaseModel):
     answer: str
     citations: list[QueryCitation] = Field(default_factory=list)
     retrieval_mode: RetrievalMode
     graph_hit_count: int = 0
     vector_fallback_count: int = 0
+    candidates: list[QueryCandidate] = Field(default_factory=list)
+    clarification_question_id: str | None = None
+    # The in-between case from the Part 5 plan: "confident" is the default
+    # for no_results/ambiguous (those already carry their own explicit
+    # signal), "low" means graph/vector evidence was used but the best
+    # match's score was a soft one, not a clean one.
+    confidence: Literal["confident", "low"] = "confident"
 
 
 class QueryAgent:
@@ -76,6 +105,32 @@ class QueryAgent:
         min_graph_score: float = 0.4,
         timeout_ms: int = 15_000,
         max_output_tokens: int = 1024,
+        # disambiguation_margin/confident_score are QueryAgent's version of
+        # the same score-band decision graph_manager.py's
+        # CANONICALIZATION_HIGH/CANONICALIZATION_LOW already make for
+        # canonicalization - different shape (relative margin + a soft-use
+        # floor, vs. two absolute bands) because query-time ambiguity and
+        # write-time canonicalization aren't quite the same decision, but
+        # tuning one against real corpus data without checking the other
+        # can leave them meaning different things on the same 0-1 score
+        # scale. Not yet corpus-measured, same caveat as min_graph_score
+        # above.
+        #
+        # How close the top two-or-more distinct node matches' scores need
+        # to be to treat the query as genuinely ambiguous rather than
+        # picking the top one silently.
+        disambiguation_margin: float = 0.1,
+        max_disambiguation_candidates: int = 4,
+        # The in-between, not-ambiguous-enough-to-ask case from the Part 5
+        # plan: a graph or chunk match that clears its retrieval threshold
+        # but is still a soft match, not a clean one. Below this, the
+        # result is used (it's still the best evidence available) but
+        # QueryResult.confidence is marked "low" instead of silently
+        # looking identical to a clean match. Same 0-1 scale as
+        # min_graph_score/NodeSearchHit.score and ChunkIndex hit scores.
+        confident_score: float = 0.6,
+        clarification: ClarificationOrchestrator | None = None,
+        db_client: Any | None = None,
     ):
         self._chunks = chunk_index
         self._graph = graph_manager
@@ -86,12 +141,22 @@ class QueryAgent:
         self._min_graph_score = min_graph_score
         self._timeout_ms = timeout_ms
         self._max_output_tokens = max_output_tokens
+        self._disambiguation_margin = disambiguation_margin
+        self._max_disambiguation_candidates = max_disambiguation_candidates
+        self._confident_score = confident_score
+        self._clarification = clarification
         self._client = client
         if self._client is None and project is not None:
             self._client = genai.Client(
                 vertexai=True, project=project, location=location
             )
         self._metrics: Counter[str] = Counter()
+        # record_feedback / _apply_boost: same pattern as GapFinder's
+        # _node_boost - "capture feedback so it adapts" only holds if a
+        # rating actually changes a future answer, not just a log entry.
+        self._db = db_client
+        self._node_boost: dict[str, float] = {}
+        self._boost_lock = threading.Lock()
 
     @property
     def metrics(self) -> dict[str, int]:
@@ -110,7 +175,24 @@ class QueryAgent:
                 retrieval_mode="no_results",
             )
 
-        graph_context, graph_citations = self._graph_evidence(cleaned_query)
+        graph_hits = (
+            self._graph.search_nodes(
+                cleaned_query,
+                limit=self._max_graph_nodes,
+                min_score=self._min_graph_score,
+            )
+            if self._graph is not None
+            else []
+        )
+        graph_hits = self._apply_boost(graph_hits)
+
+        ambiguous_hits = self._check_query_ambiguity(graph_hits)
+        if ambiguous_hits is not None:
+            return self._ambiguous_result(cleaned_query, ambiguous_hits)
+
+        graph_context, graph_citations, graph_best_score = self._graph_evidence(
+            graph_hits
+        )
         if graph_citations:
             self._metrics["graph_hits"] += 1
             answer = self._answer_with_gemini(
@@ -121,6 +203,7 @@ class QueryAgent:
                 citations=graph_citations,
                 retrieval_mode="graph",
                 graph_hit_count=1,
+                confidence=self._confidence_for(graph_best_score),
             )
 
         assembled = self._chunks.assemble_context(
@@ -158,16 +241,113 @@ class QueryAgent:
             citations=citations,
             retrieval_mode="vector",
             vector_fallback_count=1,
+            confidence=self._confidence_for(top_hits[0].score),
         )
 
-    def _graph_evidence(self, query: str) -> tuple[str, list[QueryCitation]]:
-        if self._graph is None:
-            return "", []
-        hits = self._graph.search_nodes(
-            query, limit=self._max_graph_nodes, min_score=self._min_graph_score
+    def _confidence_for(self, best_score: float | None) -> Literal["confident", "low"]:
+        """The in-between case: a used match that isn't a clean one. The
+        score is carried through as data here rather than baked into the
+        answer text, since there's no frontend yet to decide how "low
+        confidence" should actually be shown."""
+        if best_score is not None and best_score < self._confident_score:
+            return "low"
+        return "confident"
+
+    def _apply_boost(self, hits: list[NodeSearchHit]) -> list[NodeSearchHit]:
+        """Apply record_feedback's accumulated per-node adjustments and
+        re-sort - without the re-sort, a boosted node could deserve to
+        rank above an unboosted one but never actually get picked as the
+        top match, since everything downstream (citations, ambiguity
+        check, confidence) reads hits in score order."""
+        if not self._node_boost:
+            return hits
+        with self._boost_lock:
+            boosted = [
+                replace(hit, score=hit.score + self._node_boost.get(hit.node_id, 0.0))
+                for hit in hits
+            ]
+        boosted.sort(key=lambda hit: (-hit.score, hit.node_id))
+        return boosted
+
+    def record_feedback(self, node_id: str, helpful: bool) -> None:
+        """Applied immediately to future queries' graph-hit ranking - the
+        concrete mechanism behind "capture feedback so it adapts", not
+        just a log entry. Same shape as GapFinder.record_feedback:
+        an in-memory boost that takes effect right away, plus an optional
+        durable event write when a Firestore client is supplied."""
+        delta = 1.0 if helpful else -1.0
+        with self._boost_lock:
+            self._node_boost[node_id] = self._node_boost.get(node_id, 0.0) + delta
+
+        if self._db is not None:
+            event_id = str(uuid.uuid4())
+            self._db.collection("feedback_events").document(event_id).set(
+                {
+                    "type": "query_rating",
+                    "node_id": node_id,
+                    "helpful": helpful,
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+
+    def _check_query_ambiguity(
+        self, hits: list[NodeSearchHit]
+    ) -> list[NodeSearchHit] | None:
+        """Return the close-scoring node matches if the query is genuinely
+        ambiguous between two or more distinct entities, else None.
+
+        search_nodes returns one hit per node, so two hits are always
+        different entities even if they happen to share a name (e.g. the
+        same word used as a CONCEPT in one paper and part of a METHOD name
+        in another) - that's exactly the case worth asking about, not
+        picking the higher-scoring one silently. Takes hits rather than
+        the raw query so answer() can share one search_nodes scan with
+        _graph_evidence instead of paying the O(number of nodes) cost
+        twice per query.
+        """
+        if len(hits) < 2:
+            return None
+        top_score = hits[0].score
+        close = [hit for hit in hits if top_score - hit.score <= self._disambiguation_margin]
+        if len(close) < 2:
+            return None
+        return close[: self._max_disambiguation_candidates]
+
+    def _ambiguous_result(
+        self, query: str, candidates: list[NodeSearchHit]
+    ) -> QueryResult:
+        options = [
+            QueryCandidate(
+                node_id=hit.node_id,
+                name=hit.name,
+                type=hit.type,
+                description=hit.description,
+                score=hit.score,
+            )
+            for hit in candidates
+        ]
+        question_id = None
+        if self._clarification is not None:
+            question_id = self._clarification.register_query_disambiguation(
+                query, candidates
+            ).id
+        names = ", ".join(f'"{option.name}"' for option in options)
+        answer = (
+            "There are multiple things in the stored research that could "
+            f"match this question: {names}. Which one did you mean?"
         )
+        return QueryResult(
+            answer=answer,
+            retrieval_mode="ambiguous",
+            candidates=options,
+            clarification_question_id=question_id,
+        )
+
+    def _graph_evidence(
+        self, hits: list[NodeSearchHit]
+    ) -> tuple[str, list[QueryCitation], float | None]:
         if not hits:
-            return "", []
+            return "", [], None
 
         selected: list[QueryCitation] = []
         seen_edges: set[str] = set()
@@ -197,7 +377,10 @@ class QueryAgent:
                 break
 
         context = "\n\n".join(context_parts)[: self._max_context_characters]
-        return context, selected[: self._max_citations]
+        # hits is already sorted by descending score (search_nodes), so
+        # hits[0] is the best match regardless of which citations got
+        # truncated below max_citations.
+        return context, selected[: self._max_citations], hits[0].score
 
     @staticmethod
     def _citation_from_edge(edge: IncidentEdge) -> QueryCitation:
