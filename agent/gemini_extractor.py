@@ -107,6 +107,15 @@ class GeminiStructuredExtractor:
         client: Any | None = None,
         max_characters_per_call: int = 12000,
         max_calls_per_paper: int = 8,
+        # Every other Gemini-calling class in this codebase (GeneralChatAgent,
+        # QueryAgent, GapFinder's GeminiExplainer) sets http_options'
+        # timeout - this one didn't, so a single slow/stuck Vertex AI call
+        # could hang extract()'s per-window loop indefinitely instead of
+        # hitting the per-window except Exception below (whose own comment
+        # already named "timeout" as an anticipated failure mode - the
+        # wiring to actually produce one was just missing). Confirmed live:
+        # one window hung 20+ minutes with no exception and no progress.
+        timeout_ms: int = 30_000,
     ):
         self._client = client or genai.Client(
             vertexai=True, project=project, location=location
@@ -114,6 +123,7 @@ class GeminiStructuredExtractor:
         self._model = model
         self._max_characters_per_call = max_characters_per_call
         self._max_calls_per_paper = max_calls_per_paper
+        self._timeout_ms = timeout_ms
         self._cache: dict[str, SemanticExtraction] = {}
 
     def extract(self, document: DocumentIngestionResult) -> ExtractionResult:
@@ -260,6 +270,7 @@ class GeminiStructuredExtractor:
                 # worse for cost too, not just correctness.
                 max_output_tokens=8192,
                 thinking_config=types.ThinkingConfig(thinking_budget=0),
+                http_options=types.HttpOptions(timeout=self._timeout_ms),
             ),
         )
         semantic = (
