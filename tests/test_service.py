@@ -1,0 +1,178 @@
+from __future__ import annotations
+
+import pytest
+from fastapi.testclient import TestClient
+
+from agent.clarification_orchestrator import ClarificationOrchestrator
+from agent.document_ingestion import PdfTextExtractor
+from agent.extraction_agent import ChunkOnlyStructuredExtractor, ExtractionAgent
+from agent.gap_finder import GapFinder
+from agent.graph_manager import GraphManager
+from agent.query_agent import QueryAgent
+from agent.research_store import ResearchStore
+from agent.retrieval import ChunkIndex
+from agent.schema import Node, NodeType
+from service.app import app
+from service.deps import get_state
+from service.state import AppState
+
+
+@pytest.fixture
+def app_state(fake_db, tmp_path) -> AppState:
+    graph = GraphManager(project_id="test", db_client=fake_db)
+    chunks = ChunkIndex(db_client=fake_db)
+    clarification = ClarificationOrchestrator(graph_manager=graph)
+    return AppState(
+        graph=graph,
+        chunks=chunks,
+        clarification=clarification,
+        # No project=/client= -> stays client-less, never attempts a live
+        # Vertex AI call, same pattern test_query_agent.py/test_gap_finder.py
+        # already use.
+        query_agent=QueryAgent(chunks, graph, clarification=clarification, db_client=fake_db),
+        gap_finder=GapFinder(graph, db_client=fake_db),
+        extraction_agent=ExtractionAgent(
+            document_extractor=PdfTextExtractor(allowed_root=str(tmp_path)),
+            structured_extractor=ChunkOnlyStructuredExtractor(),
+        ),
+        research_store=ResearchStore(chunks, graph),
+        upload_root=str(tmp_path),
+    )
+
+
+@pytest.fixture
+def client(app_state, monkeypatch):
+    # The real lifespan still runs on TestClient context entry regardless
+    # of dependency_overrides, and build_state() would otherwise construct
+    # a real firestore.Client and call GraphManager._rehydrate() - a real
+    # network call - during test setup. Patch build_state itself so the
+    # lifespan's real work never happens; get_state is also overridden so
+    # every route handler gets app_state regardless.
+    monkeypatch.setattr("service.app.build_state", lambda: app_state)
+    app.dependency_overrides[get_state] = lambda: app_state
+    with TestClient(app) as test_client:
+        yield test_client
+    app.dependency_overrides.pop(get_state, None)
+
+
+def test_healthz(client):
+    response = client.get("/healthz")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_query_no_results(client):
+    response = client.post("/query", json={"query": "nonexistent topic xyz"})
+    assert response.status_code == 200
+    assert response.json()["retrieval_mode"] == "no_results"
+
+
+def test_clarifications_empty(client):
+    assert client.get("/clarifications").json() == []
+
+
+def test_clarifications_404_for_unknown_id(client):
+    assert client.get("/clarifications/does-not-exist").status_code == 404
+
+
+def test_gaps_empty_graph(client):
+    assert client.get("/gaps").json() == []
+
+
+def test_query_feedback_accepts_and_returns_no_content(client):
+    response = client.post(
+        "/query/feedback", json={"node_id": "some-node", "helpful": True}
+    )
+    assert response.status_code == 204
+
+
+def test_gap_feedback_accepts_and_returns_no_content(client):
+    response = client.post(
+        "/gaps/feedback",
+        json={"node_a_id": "a", "node_b_id": "b", "interesting": False},
+    )
+    assert response.status_code == 204
+
+
+def test_answer_clarification_end_to_end(client, app_state):
+    """Real path: register a question directly on the shared orchestrator
+    (as apply_extraction_result would), list it via GET, answer it via
+    POST, and confirm the graph mutation actually happened - the same
+    round trip a frontend would do."""
+    graph = app_state.graph
+    existing = Node(id="existing", type=NodeType.CONCEPT, name="Existing")
+    provisional = Node(id="provisional", type=NodeType.CONCEPT, name="Provisional")
+    graph.add_node(existing)
+    graph.add_node(provisional)
+
+    question = app_state.clarification.register_entity_merge_question(
+        provisional_node_id="provisional",
+        entity_name="Provisional",
+        candidate_node_id="existing",
+        candidate_name="Existing",
+    )
+
+    listed = client.get("/clarifications").json()
+    assert len(listed) == 1
+    assert listed[0]["id"] == question.id
+    assert listed[0]["kind"] == "entity_merge"
+
+    response = client.post(
+        f"/clarifications/{question.id}/answer", json={"option_id": "existing"}
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "answered"
+    assert client.get("/clarifications").json() == []
+
+    edges = list(graph.graph.get_edge_data("provisional", "existing").values())
+    assert len(edges) == 1
+    assert edges[0]["type"] == "SAME_AS"
+
+
+def test_answer_clarification_invalid_option_returns_400(client, app_state):
+    app_state.clarification.register_entity_merge_question(
+        provisional_node_id="p", entity_name="X", candidate_node_id="c", candidate_name="Y"
+    )
+    question_id = client.get("/clarifications").json()[0]["id"]
+
+    response = client.post(
+        f"/clarifications/{question_id}/answer", json={"option_id": "not-real"}
+    )
+    assert response.status_code == 400
+
+
+def test_papers_upload_and_ingest(client):
+    pdf_bytes = b"%PDF-1.4 fake"
+    response = client.post(
+        "/papers",
+        files={"file": ("paper.pdf", pdf_bytes, "application/pdf")},
+        data={"paper_id": "test-paper-1"},
+    )
+    # ChunkOnlyStructuredExtractor makes no real extraction calls, and
+    # PdfTextExtractor's pdftotext output on a fake PDF is whatever the
+    # real pdftotext binary produces (or a DocumentExtractionError) - only
+    # assert the endpoint round-trips without crashing and returns one of
+    # the two documented outcomes, not a specific text result.
+    assert response.status_code in (200, 422)
+
+
+def test_require_api_key_rejects_wrong_key(client, monkeypatch):
+    monkeypatch.setenv("API_SHARED_SECRET", "correct-secret")
+    response = client.post(
+        "/query", json={"query": "test"}, headers={"X-API-Key": "wrong"}
+    )
+    assert response.status_code == 401
+
+
+def test_require_api_key_accepts_correct_key(client, monkeypatch):
+    monkeypatch.setenv("API_SHARED_SECRET", "correct-secret")
+    response = client.post(
+        "/query", json={"query": "test"}, headers={"X-API-Key": "correct-secret"}
+    )
+    assert response.status_code == 200
+
+
+def test_no_api_key_required_when_secret_unset(client, monkeypatch):
+    monkeypatch.delenv("API_SHARED_SECRET", raising=False)
+    response = client.post("/query", json={"query": "test"})
+    assert response.status_code == 200
