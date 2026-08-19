@@ -13,13 +13,13 @@ router = APIRouter(tags=["chat"], dependencies=[Depends(require_api_key)])
 
 @router.post("/chat", response_model=QueryResult)
 def chat(body: ChatRequest, state: AppState = Depends(get_state)) -> QueryResult:
+    history = [ChatTurn(role=item.role, text=item.text) for item in body.history]
     if body.paper_id:
-        return state.query_agent.answer(body.message, paper_ids={body.paper_id})
-    try:
-        answer = state.general_chat.answer(
-            body.message,
-            [ChatTurn(role=item.role, text=item.text) for item in body.history],
+        return state.query_agent.answer(
+            body.message, paper_ids={body.paper_id}, history=history
         )
+    try:
+        answer = state.general_chat.answer(body.message, history)
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return QueryResult(answer=answer, retrieval_mode="general")

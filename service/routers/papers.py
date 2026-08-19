@@ -164,7 +164,10 @@ def ingest_arxiv(body: ArxivIngestRequest, state: AppState = Depends(get_state))
     if not _ARXIV_ID.fullmatch(arxiv_id):
         raise HTTPException(status_code=400, detail="invalid arXiv identifier")
     pid = _sanitize_paper_id(f"arxiv-{arxiv_id}")
-    dest = Path(state.upload_root).resolve() / f"{pid}.pdf"
+    upload_root = Path(state.upload_root).resolve()
+    dest = (upload_root / f"{pid}.pdf").resolve()
+    if not dest.is_relative_to(upload_root):
+        raise HTTPException(status_code=400, detail="invalid arXiv identifier")
     url = f"https://arxiv.org/pdf/{arxiv_id}"
     try:
         response = requests.get(
