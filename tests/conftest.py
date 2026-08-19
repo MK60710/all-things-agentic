@@ -16,14 +16,21 @@ class _FakeDocRef:
     def delete(self) -> None:
         self._store.pop(self._doc_id, None)
 
+    def get(self) -> "_FakeSnapshot":
+        return _FakeSnapshot(self._doc_id, self._store.get(self._doc_id))
+
 
 class _FakeSnapshot:
-    def __init__(self, doc_id: str, data: dict):
+    def __init__(self, doc_id: str, data: dict | None):
         self.id = doc_id
         self._data = data
 
+    @property
+    def exists(self) -> bool:
+        return self._data is not None
+
     def to_dict(self) -> dict:
-        return self._data
+        return self._data or {}
 
 
 class _FakeCollection:

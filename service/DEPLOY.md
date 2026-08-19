@@ -70,4 +70,4 @@ error-shaped 200 isn't a real pass.
   live GCP dependency (`tests/test_service.py`).
 
 Not tested: the actual deployed Cloud Run URL, multiple concurrent
-users/instances, or anything past a single `/papers` upload per request.
+users/instances, or anything past a single file per `/papers` request.

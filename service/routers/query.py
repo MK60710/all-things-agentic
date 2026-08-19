@@ -12,7 +12,8 @@ router = APIRouter(tags=["query"], dependencies=[Depends(require_api_key)])
 
 @router.post("/query", response_model=QueryResult)
 def answer_query(body: QueryRequest, state: AppState = Depends(get_state)) -> QueryResult:
-    return state.query_agent.answer(body.query)
+    paper_ids = {body.paper_id} if body.paper_id else None
+    return state.query_agent.answer(body.query, paper_ids=paper_ids)
 
 
 @router.post("/query/feedback", status_code=204)

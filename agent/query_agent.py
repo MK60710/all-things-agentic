@@ -31,7 +31,7 @@ from agent.text_utils import escape_tag_delimiters
 
 logger = logging.getLogger(__name__)
 
-RetrievalMode = Literal["graph", "vector", "no_results", "ambiguous"]
+RetrievalMode = Literal["general", "graph", "vector", "no_results", "ambiguous"]
 
 
 class QueryCitation(BaseModel):
@@ -165,7 +165,9 @@ class QueryAgent:
             "vector_fallbacks": self._metrics["vector_fallbacks"],
         }
 
-    def answer(self, query: str) -> QueryResult:
+    def answer(
+        self, query: str, *, paper_ids: set[str] | None = None
+    ) -> QueryResult:
         """Retrieve evidence and answer ``query`` using Vertex Gemini."""
 
         cleaned_query = query.strip()
@@ -185,13 +187,22 @@ class QueryAgent:
             else []
         )
         graph_hits = self._apply_boost(graph_hits)
+        if paper_ids is not None:
+            graph_hits = [
+                hit
+                for hit in graph_hits
+                if any(
+                    edge.source_paper_id in paper_ids
+                    for edge in self._graph.get_incident_edges(hit.node_id)
+                )
+            ]
 
         ambiguous_hits = self._check_query_ambiguity(graph_hits)
         if ambiguous_hits is not None:
             return self._ambiguous_result(cleaned_query, ambiguous_hits)
 
         graph_context, graph_citations, graph_best_score = self._graph_evidence(
-            graph_hits
+            graph_hits, paper_ids=paper_ids
         )
         if graph_citations:
             self._metrics["graph_hits"] += 1
@@ -208,6 +219,7 @@ class QueryAgent:
 
         assembled = self._chunks.assemble_context(
             cleaned_query,
+            paper_ids=paper_ids,
             max_characters=self._max_context_characters,
         )
         if not assembled.hits:
@@ -344,7 +356,10 @@ class QueryAgent:
         )
 
     def _graph_evidence(
-        self, hits: list[NodeSearchHit]
+        self,
+        hits: list[NodeSearchHit],
+        *,
+        paper_ids: set[str] | None = None,
     ) -> tuple[str, list[QueryCitation], float | None]:
         if not hits:
             return "", [], None
@@ -358,6 +373,8 @@ class QueryAgent:
             )
             new_edges = 0
             for edge in self._graph.get_incident_edges(hit.node_id):
+                if paper_ids is not None and edge.source_paper_id not in paper_ids:
+                    continue
                 if edge.edge_id in seen_edges:
                     continue
                 seen_edges.add(edge.edge_id)
