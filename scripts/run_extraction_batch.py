@@ -30,6 +30,7 @@ from agent.gemini_extractor import GeminiStructuredExtractor
 from agent.graph_manager import GraphManager
 from agent.research_store import ResearchStore
 from agent.retrieval import ChunkIndex, LocalHashingEmbedder
+from agent.text_utils import entity_embedding_text
 
 
 class _InProcessFirestore:
@@ -84,19 +85,6 @@ class _InProcessFirestore:
 
     def collection(self, name: str) -> "_InProcessFirestore._Collection":
         return _InProcessFirestore._Collection(self._collections.setdefault(name, {}))
-
-
-def entity_embedding_text(name: str, description: str, name_weight: int = 4) -> str:
-    """Text to feed a bag-of-hashed-tokens embedder for entity
-    canonicalization. Repeating the name biases the averaged vector toward
-    the one signal that actually distinguishes entities - without this, a
-    long generic description ("a large language model used in
-    experiments") can dominate the vector and make differently-named
-    entities in the same topical category (different metrics, different
-    model names) collide. Observed live: "Claude" vs "GPT-4o" and "F1
-    score" vs "Exact Match (EM) score" both false-positived into
-    needs_clarification before this weighting was added."""
-    return f"{' '.join([name] * name_weight)}: {description}"
 
 
 def _parse_args() -> argparse.Namespace:

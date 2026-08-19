@@ -1,0 +1,14 @@
+.venv/
+.git/
+.github/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+corpus/
+tests/
+hello_world/
+.claude/
+docs/
+.ua/
+scripts/export_ua_graph.py
