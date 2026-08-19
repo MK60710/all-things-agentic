@@ -146,7 +146,7 @@ def test_answer_clarification_invalid_option_returns_400(client, app_state):
 def test_papers_upload_and_ingest(client):
     pdf_bytes = b"%PDF-1.4 fake"
     response = client.post(
-        "/papers",
+        "/papers/upload",
         files={"file": ("paper.pdf", pdf_bytes, "application/pdf")},
         data={"paper_id": "test-paper-1"},
     )
@@ -167,7 +167,7 @@ def test_papers_upload_rejects_path_traversal_in_paper_id(client, app_state, tmp
     nothing lands outside the upload root at all."""
     pdf_bytes = b"%PDF-1.4 fake"
     response = client.post(
-        "/papers",
+        "/papers/upload",
         files={"file": ("paper.pdf", pdf_bytes, "application/pdf")},
         data={"paper_id": "../../../../tmp/evil"},
     )
@@ -185,7 +185,7 @@ def test_papers_upload_rejects_path_traversal_in_paper_id(client, app_state, tmp
 def test_papers_upload_sanitizes_unsafe_paper_id_characters(client, app_state):
     pdf_bytes = b"%PDF-1.4 fake"
     response = client.post(
-        "/papers",
+        "/papers/upload",
         files={"file": ("paper.pdf", pdf_bytes, "application/pdf")},
         data={"paper_id": "weird/name with spaces!*.pdf"},
     )

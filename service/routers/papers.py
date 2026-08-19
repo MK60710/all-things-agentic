@@ -26,7 +26,7 @@ def _sanitize_paper_id(raw: str) -> str:
     return cleaned or str(uuid.uuid4())
 
 
-@router.post("", response_model=PaperIngestResponse)
+@router.post("/upload", response_model=PaperIngestResponse)
 def upload_paper(
     file: UploadFile = File(...),
     paper_id: str | None = Form(default=None),
