@@ -18,6 +18,18 @@ def chat(body: ChatRequest, state: AppState = Depends(get_state)) -> QueryResult
         return state.query_agent.answer(
             body.message, paper_ids={body.paper_id}, history=history
         )
+    # No paper attached doesn't mean "skip the graph" - it means search the
+    # whole graph instead of one paper. Previously this branch went straight
+    # to general_chat, so every unscoped question (including gap-suggestion
+    # clicks, which are always about real graph content) got an ungrounded
+    # answer instead of a real one. Only fall back to plain chat when the
+    # graph genuinely has nothing relevant, not just when no paper_id was
+    # supplied.
+    graph_result = state.query_agent.answer(
+        body.message, paper_ids=None, history=history
+    )
+    if graph_result.retrieval_mode != "no_results":
+        return graph_result
     try:
         answer = state.general_chat.answer(body.message, history)
     except Exception as exc:

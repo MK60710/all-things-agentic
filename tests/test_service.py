@@ -253,6 +253,31 @@ def test_paper_chat_is_scoped_to_requested_paper(client, app_state):
     assert {item["paper_id"] for item in response.json()["citations"]} == {"paper-b"}
 
 
+def test_unscoped_chat_searches_the_graph_before_falling_back_to_general_chat(
+    client, app_state, monkeypatch
+):
+    """Regression: /chat with no paper_id used to skip the graph entirely
+    and go straight to ungrounded general_chat, even when the message was
+    about real content already in the graph (e.g. a gap-suggestion click).
+    Confirmed live: this produced a confident but wrong hallucinated answer
+    for a real graph entity. general_chat must only be reached when the
+    graph genuinely has nothing relevant."""
+    app_state.chunks.upsert_paper("paper-a", ["Alpha paper studies apples."])
+
+    def unexpected_general_chat(message, history):
+        raise AssertionError(
+            "general_chat must not be called when the graph has a real match"
+        )
+
+    monkeypatch.setattr(app_state.general_chat, "answer", unexpected_general_chat)
+
+    response = client.post("/chat", json={"message": "What does the paper study?"})
+
+    assert response.status_code == 200
+    assert response.json()["retrieval_mode"] != "general"
+    assert {item["paper_id"] for item in response.json()["citations"]} == {"paper-a"}
+
+
 def test_upload_token_is_one_use(client, monkeypatch):
     monkeypatch.setenv("API_SHARED_SECRET", "correct-secret")
     issued = client.post(
