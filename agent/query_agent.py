@@ -25,6 +25,7 @@ from google.genai import types
 from pydantic import BaseModel, Field
 
 from agent.clarification_orchestrator import ClarificationOrchestrator
+from agent.general_chat import ChatTurn
 from agent.graph_manager import GraphManager, IncidentEdge, NodeSearchHit
 from agent.retrieval import ChunkIndex
 from agent.text_utils import escape_tag_delimiters
@@ -166,7 +167,11 @@ class QueryAgent:
         }
 
     def answer(
-        self, query: str, *, paper_ids: set[str] | None = None
+        self,
+        query: str,
+        *,
+        paper_ids: set[str] | None = None,
+        history: list[ChatTurn] | None = None,
     ) -> QueryResult:
         """Retrieve evidence and answer ``query`` using Vertex Gemini."""
 
@@ -187,14 +192,24 @@ class QueryAgent:
             else []
         )
         graph_hits = self._apply_boost(graph_hits)
+        # Populated below when paper_ids scoping needs each hit's incident
+        # edges, then reused by _graph_evidence - without this cache,
+        # every paper-scoped query walked each node's edges twice (once
+        # here to decide relevance, again inside _graph_evidence to build
+        # citations), each walk taking GraphManager's internal lock.
+        edges_by_node: dict[str, list[IncidentEdge]] = {}
         if paper_ids is not None:
+            def _edges(node_id: str) -> list[IncidentEdge]:
+                cached = edges_by_node.get(node_id)
+                if cached is None:
+                    cached = self._graph.get_incident_edges(node_id)
+                    edges_by_node[node_id] = cached
+                return cached
+
             graph_hits = [
                 hit
                 for hit in graph_hits
-                if any(
-                    edge.source_paper_id in paper_ids
-                    for edge in self._graph.get_incident_edges(hit.node_id)
-                )
+                if any(edge.source_paper_id in paper_ids for edge in _edges(hit.node_id))
             ]
 
         ambiguous_hits = self._check_query_ambiguity(graph_hits)
@@ -202,12 +217,12 @@ class QueryAgent:
             return self._ambiguous_result(cleaned_query, ambiguous_hits)
 
         graph_context, graph_citations, graph_best_score = self._graph_evidence(
-            graph_hits, paper_ids=paper_ids
+            graph_hits, paper_ids=paper_ids, edges_by_node=edges_by_node
         )
         if graph_citations:
             self._metrics["graph_hits"] += 1
             answer = self._answer_with_gemini(
-                cleaned_query, graph_context, graph_citations
+                cleaned_query, graph_context, graph_citations, history=history
             )
             return QueryResult(
                 answer=answer,
@@ -247,7 +262,9 @@ class QueryAgent:
             )
             for hit in top_hits
         ]
-        answer = self._answer_with_gemini(cleaned_query, assembled.text, citations)
+        answer = self._answer_with_gemini(
+            cleaned_query, assembled.text, citations, history=history
+        )
         return QueryResult(
             answer=answer,
             citations=citations,
@@ -360,6 +377,7 @@ class QueryAgent:
         hits: list[NodeSearchHit],
         *,
         paper_ids: set[str] | None = None,
+        edges_by_node: dict[str, list[IncidentEdge]] | None = None,
     ) -> tuple[str, list[QueryCitation], float | None]:
         if not hits:
             return "", [], None
@@ -372,7 +390,12 @@ class QueryAgent:
                 f"Entity: {hit.name} ({hit.type})\nDescription: {hit.description}"
             )
             new_edges = 0
-            for edge in self._graph.get_incident_edges(hit.node_id):
+            incident_edges = (
+                edges_by_node.get(hit.node_id)
+                if edges_by_node is not None and hit.node_id in edges_by_node
+                else self._graph.get_incident_edges(hit.node_id)
+            )
+            for edge in incident_edges:
                 if paper_ids is not None and edge.source_paper_id not in paper_ids:
                     continue
                 if edge.edge_id in seen_edges:
@@ -420,21 +443,43 @@ class QueryAgent:
         )
 
     def _answer_with_gemini(
-        self, query: str, context: str, citations: list[QueryCitation]
+        self,
+        query: str,
+        context: str,
+        citations: list[QueryCitation],
+        *,
+        history: list[ChatTurn] | None = None,
     ) -> str:
         if self._client is None:
             return self._fallback_answer(citations)
         answer = ""
+        current_turn = (
+            "QUESTION:\n"
+            + query
+            + "\n\n<RETRIEVED_RESEARCH>\n"
+            + escape_tag_delimiters(context)
+            + "\n</RETRIEVED_RESEARCH>"
+        )
+        # Prior turns as real conversation history (same pattern as
+        # GeneralChatAgent) rather than a single flat string - without
+        # this, a paper-scoped follow-up question ("how does that compare
+        # to prior work?") had nothing to resolve "that" against, since
+        # every call started a fresh conversation.
+        contents: str | list[types.Content] = current_turn
+        if history:
+            contents = [
+                types.Content(
+                    role="model" if turn.role == "assistant" else "user",
+                    parts=[types.Part(text=turn.text)],
+                )
+                for turn in history[-20:]
+                if turn.text.strip()
+            ]
+            contents.append(types.Content(role="user", parts=[types.Part(text=current_turn)]))
         try:
             response = self._client.models.generate_content(
                 model=self._model,
-                contents=(
-                    "QUESTION:\n"
-                    + query
-                    + "\n\n<RETRIEVED_RESEARCH>\n"
-                    + escape_tag_delimiters(context)
-                    + "\n</RETRIEVED_RESEARCH>"
-                ),
+                contents=contents,
                 config=types.GenerateContentConfig(
                     system_instruction=(
                         "Answer the research question using only the "

@@ -27,7 +27,7 @@ export async function askAssistant(
   const response = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message, history: history.slice(-20), paper_id: paper?.id }),
+    body: JSON.stringify({ message, history, paper_id: paper?.id }),
   });
 
   const data = await response.json() as Partial<QueryResponse> & { error?: string };
