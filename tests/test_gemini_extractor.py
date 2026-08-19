@@ -95,6 +95,39 @@ def test_extractor_caches_calls_and_preserves_chunks():
     assert models.calls == 1
 
 
+def test_generate_content_sets_an_http_timeout():
+    """Regression: every other Gemini-calling class in this codebase
+    (GeneralChatAgent, QueryAgent, GapFinder's GeminiExplainer) sets
+    http_options' timeout - this one didn't, so a single slow/stuck Vertex
+    AI call could hang extract()'s per-window loop indefinitely instead of
+    ever reaching the per-window except Exception handling built to
+    isolate exactly this kind of failure. Confirmed live: a real paper
+    hung 20+ minutes with no exception and no progress."""
+    semantic = SemanticExtraction(entities=[], relations=[])
+    captured: dict = {}
+
+    class Models:
+        def generate_content(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(parsed=semantic, text=semantic.model_dump_json())
+
+    client = SimpleNamespace(models=Models())
+    extractor = GeminiStructuredExtractor(project="test", client=client, timeout_ms=12_345)
+    document = DocumentIngestionResult(
+        paper_id="paper-1",
+        pdf_path="paper.pdf",
+        pages=[],
+        raw_text="text",
+        chunks=["text"],
+    )
+
+    extractor.extract(document)
+
+    http_options = captured["config"].http_options
+    assert http_options is not None
+    assert http_options.timeout == 12_345
+
+
 def test_one_truncated_window_does_not_discard_other_windows():
     """A window whose JSON response got cut off by max_output_tokens must
     not take the whole paper's extraction down with it - reproduces a real
