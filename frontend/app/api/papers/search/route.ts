@@ -27,6 +27,12 @@ export async function GET(request: NextRequest) {
       headers: { "User-Agent": "AtlasResearchAssistant/0.1" },
       next: { revalidate: 900 },
     });
+    if (response.status === 429) {
+      return NextResponse.json(
+        { papers: [], error: "arXiv is rate-limiting search requests right now - try again in a minute." },
+        { status: 429 },
+      );
+    }
     if (!response.ok) throw new Error(`arXiv returned ${response.status}`);
     const xml = await response.text();
     const entries = xml.match(/<entry>[\s\S]*?<\/entry>/g) ?? [];

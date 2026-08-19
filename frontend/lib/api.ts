@@ -1,4 +1,4 @@
-import type { QueryResponse } from "./types";
+import type { GapCandidate, PendingQuestion, QueryResponse } from "./types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL;
 
@@ -84,7 +84,48 @@ export async function ingestArxivPaper(paper: PaperSearchResult): Promise<PaperC
 
 export async function searchPapers(query: string): Promise<PaperSearchResult[]> {
   const response = await fetch(`/api/papers/search?q=${encodeURIComponent(query)}`);
-  if (!response.ok) throw new Error("Paper search failed");
-  const data = await response.json() as { papers: PaperSearchResult[] };
+  const data = await response.json() as { papers: PaperSearchResult[]; error?: string };
+  if (!response.ok) throw new Error(data.error ?? "Paper search failed");
   return data.papers;
+}
+
+export async function listClarifications(): Promise<PendingQuestion[]> {
+  const response = await fetch("/api/clarifications");
+  if (!response.ok) throw new Error("Could not load clarifications");
+  return await response.json() as PendingQuestion[];
+}
+
+export async function answerClarification(id: string, optionId: string): Promise<PendingQuestion> {
+  const response = await fetch(`/api/clarifications/${encodeURIComponent(id)}/answer`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ option_id: optionId }),
+  });
+  const data = await response.json() as PendingQuestion & { error?: string };
+  if (!response.ok) throw new Error((data as { error?: string }).error ?? "Could not answer this question");
+  return data;
+}
+
+export async function listGaps(limit = 3): Promise<GapCandidate[]> {
+  const response = await fetch(`/api/gaps?limit=${limit}`);
+  if (!response.ok) throw new Error("Could not load suggestions");
+  return await response.json() as GapCandidate[];
+}
+
+export async function recordGapFeedback(nodeAId: string, nodeBId: string, interesting: boolean): Promise<void> {
+  const response = await fetch("/api/gaps/feedback", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ node_a_id: nodeAId, node_b_id: nodeBId, interesting }),
+  });
+  if (!response.ok) throw new Error("Could not record feedback");
+}
+
+export async function recordQueryFeedback(nodeId: string, helpful: boolean): Promise<void> {
+  const response = await fetch("/api/query/feedback", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ node_id: nodeId, helpful }),
+  });
+  if (!response.ok) throw new Error("Could not record feedback");
 }
