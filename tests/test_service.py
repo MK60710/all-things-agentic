@@ -246,11 +246,33 @@ def test_paper_chat_is_scoped_to_requested_paper(client, app_state):
     app_state.chunks.upsert_paper("paper-b", ["Beta paper studies bananas."])
 
     response = client.post(
-        "/chat", json={"message": "What does the paper study?", "paper_id": "paper-b"}
+        "/chat", json={"message": "What does the paper study?", "paper_ids": ["paper-b"]}
     )
 
     assert response.status_code == 200
     assert {item["paper_id"] for item in response.json()["citations"]} == {"paper-b"}
+
+
+def test_paper_chat_scopes_to_a_multi_paper_working_set(client, app_state):
+    """paper_ids is a session's working set, not a single paper - a query
+    should draw evidence from every paper in the set and nothing outside
+    it."""
+    app_state.chunks.upsert_paper("paper-a", ["Alpha paper studies apples."])
+    app_state.chunks.upsert_paper("paper-b", ["Beta paper studies bananas."])
+    app_state.chunks.upsert_paper("paper-c", ["Gamma paper studies cherries."])
+
+    response = client.post(
+        "/chat",
+        json={
+            "message": "What do the papers study?",
+            "paper_ids": ["paper-a", "paper-b"],
+        },
+    )
+
+    assert response.status_code == 200
+    cited_papers = {item["paper_id"] for item in response.json()["citations"]}
+    assert cited_papers <= {"paper-a", "paper-b"}
+    assert "paper-c" not in cited_papers
 
 
 def test_unscoped_chat_searches_the_graph_before_falling_back_to_general_chat(

@@ -14,17 +14,17 @@ router = APIRouter(tags=["chat"], dependencies=[Depends(require_api_key)])
 @router.post("/chat", response_model=QueryResult)
 def chat(body: ChatRequest, state: AppState = Depends(get_state)) -> QueryResult:
     history = [ChatTurn(role=item.role, text=item.text) for item in body.history]
-    if body.paper_id:
+    if body.paper_ids:
         return state.query_agent.answer(
-            body.message, paper_ids={body.paper_id}, history=history
+            body.message, paper_ids=set(body.paper_ids), history=history
         )
-    # No paper attached doesn't mean "skip the graph" - it means search the
-    # whole graph instead of one paper. Previously this branch went straight
-    # to general_chat, so every unscoped question (including gap-suggestion
-    # clicks, which are always about real graph content) got an ungrounded
-    # answer instead of a real one. Only fall back to plain chat when the
-    # graph genuinely has nothing relevant, not just when no paper_id was
-    # supplied.
+    # An empty working set doesn't mean "skip the graph" - it means search
+    # the whole graph instead of a specific session's papers. Previously
+    # this branch went straight to general_chat, so every unscoped question
+    # (including gap-suggestion clicks, which are always about real graph
+    # content) got an ungrounded answer instead of a real one. Only fall
+    # back to plain chat when the graph genuinely has nothing relevant, not
+    # just when no papers were attached.
     graph_result = state.query_agent.answer(
         body.message, paper_ids=None, history=history
     )
