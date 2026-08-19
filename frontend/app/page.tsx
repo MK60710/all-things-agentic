@@ -12,8 +12,9 @@ import {
   searchPapers,
   uploadPaper,
 } from "@/lib/api";
-import type { ChatHistoryItem, PaperContext, PaperSearchResult } from "@/lib/api";
+import type { ChatHistoryItem, PaperContext, PaperIngestResult, PaperSearchResult } from "@/lib/api";
 import type { Citation, GapCandidate, PendingQuestion, QueryResponse } from "@/lib/types";
+import GraphBuildAnimation from "./GraphBuildAnimation";
 
 type IconName = "atlas" | "plus" | "send" | "spark" | "paper" | "search" | "upload" | "close" | "quote" | "check" | "globe" | "thumbUp" | "thumbDown";
 type AddMode = "choose" | "upload" | "search";
@@ -74,6 +75,7 @@ export default function Home() {
   const [searchError, setSearchError] = useState("");
   const [expandedCitation, setExpandedCitation] = useState<string | null>(null);
   const [dismissedGapKeys, setDismissedGapKeys] = useState<Set<string>>(new Set());
+  const [buildingGraph, setBuildingGraph] = useState<PaperIngestResult | null>(null);
   const shownClarificationIds = useRef<Set<string>>(new Set());
   const shownGapKeys = useRef<Set<string>>(new Set());
 
@@ -228,7 +230,7 @@ export default function Home() {
     setUploadError("");
     try {
       const uploaded = await uploadPaper(file);
-      addPaper(uploaded);
+      setBuildingGraph(uploaded);
     } catch (error) {
       setUploadError(error instanceof Error ? error.message : "Upload failed.");
     } finally {
@@ -284,7 +286,7 @@ export default function Home() {
     setIngestingId(result.id);
     setSearchError("");
     try {
-      addPaper(await ingestArxivPaper(result));
+      setBuildingGraph(await ingestArxivPaper(result));
     } catch (error) {
       setSearchError(error instanceof Error ? error.message : "Could not read this paper.");
     } finally {
@@ -392,6 +394,13 @@ export default function Home() {
         <section className="modal-card">
           <header><div><span><Icon name="paper" size={18}/></span><div><strong>Add a research paper</strong><small>Give Gemini a paper to read with you</small></div></div><button onClick={() => setAddOpen(false)} aria-label="Close"><Icon name="close" size={19}/></button></header>
 
+          {buildingGraph ? (
+            <GraphBuildAnimation
+              newNodes={buildingGraph.new_nodes}
+              newEdges={buildingGraph.new_edges}
+              onComplete={() => { addPaper(buildingGraph); setBuildingGraph(null); }}
+            />
+          ) : <>
           {addMode === "choose" && <div className="add-choices">
             <button onClick={() => setAddMode("upload")}><span className="choice-icon violet"><Icon name="upload" size={22}/></span><div><strong>Upload a PDF</strong><p>Choose a paper saved on your computer.</p></div></button>
             <button onClick={() => setAddMode("search")}><span className="choice-icon blue"><Icon name="globe" size={22}/></span><div><strong>Search online</strong><p>Find papers on arXiv by title, author, or topic.</p></div></button>
@@ -412,6 +421,7 @@ export default function Home() {
             {searchError && <p className="form-error">{searchError}</p>}
             <div className="search-results">{searchResults.map((result) => <article key={result.id}><div><span>arXiv</span><small>{result.published}</small></div><h3>{result.title}</h3><p>{result.authors}</p><button disabled={Boolean(ingestingId)} onClick={() => void addArxivPaper(result)}>{ingestingId === result.id ? "Reading…" : "Add to chat"}</button></article>)}</div>
           </div>}
+          </>}
         </section>
       </div>}
     </main>

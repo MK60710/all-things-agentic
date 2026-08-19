@@ -57,3 +57,17 @@ export interface GapCandidate {
   explanation?: string | null;
   citations: GapCitation[];
 }
+
+export interface GraphVizNode {
+  node_id: string;
+  name: string;
+  type?: string | null;
+  reused_existing_node: boolean;
+}
+
+export interface GraphVizEdge {
+  edge_id: string;
+  source_id: string;
+  target_id: string;
+  relation: string;
+}
