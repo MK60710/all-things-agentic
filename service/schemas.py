@@ -132,6 +132,20 @@ class PendingQuestionOut(BaseModel):
         return cls(**base)
 
 
+class GraphVizNode(BaseModel):
+    node_id: str
+    name: str
+    type: str | None = None
+    reused_existing_node: bool = False
+
+
+class GraphVizEdge(BaseModel):
+    edge_id: str
+    source_id: str
+    target_id: str
+    relation: str
+
+
 class PaperIngestResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
@@ -147,4 +161,10 @@ class PaperIngestResponse(BaseModel):
     chunk_ids: list[str]
     entities_added: int
     relations_added: int
+    # The exact post-canonicalization node/edge writes from this ingest -
+    # GraphManager already computes these (GraphIngestionReport.node_writes/
+    # edge_writes), just never returned over HTTP. Powers the frontend's
+    # live graph-building animation with real data, not synthesized counts.
+    new_nodes: list[GraphVizNode] = Field(default_factory=list)
+    new_edges: list[GraphVizEdge] = Field(default_factory=list)
     pending_clarification_count: int

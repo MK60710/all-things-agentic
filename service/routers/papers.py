@@ -13,6 +13,8 @@ from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Uploa
 from service.deps import get_state, require_api_key
 from service.schemas import (
     ArxivIngestRequest,
+    GraphVizEdge,
+    GraphVizNode,
     PaperIngestResponse,
     PaperMetadata,
     UploadTokenResponse,
@@ -86,6 +88,29 @@ def _ingest(
     )
     pending_added = len(state.clarification.pending()) - pending_before
     state.paper_store.save(paper_id, **metadata, status="ready")
+
+    new_nodes: list[GraphVizNode] = []
+    new_edges: list[GraphVizEdge] = []
+    if report.graph is not None:
+        new_nodes = [
+            GraphVizNode(
+                node_id=write.node_id,
+                name=write.entity_name,
+                type=state.graph.graph.nodes.get(write.node_id, {}).get("type"),
+                reused_existing_node=write.reused_existing_node,
+            )
+            for write in report.graph.node_writes
+        ]
+        new_edges = [
+            GraphVizEdge(
+                edge_id=write.edge_id,
+                source_id=write.source_id,
+                target_id=write.target_id,
+                relation=write.relation,
+            )
+            for write in report.graph.edge_writes
+        ]
+
     return PaperIngestResponse(
         paper_id=paper_id,
         id=paper_id,
@@ -100,6 +125,8 @@ def _ingest(
         entities_added=len(outcome.result.entities),
         relations_added=len(outcome.result.relations),
         pending_clarification_count=pending_added,
+        new_nodes=new_nodes,
+        new_edges=new_edges,
     )
 
 
