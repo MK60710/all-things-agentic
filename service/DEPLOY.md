@@ -60,7 +60,7 @@ error-shaped 200 isn't a real pass.
   and a real ambiguity hit that correctly returned a clarifying
   question), `/query/feedback`, `/clarifications` (list, answer, and a
   confirmed graph mutation from the answer), `/gaps` (real
-  `GeminiExplainer` output), `/papers` (a real corpus PDF, real Gemini
+  `GeminiExplainer` output), `/papers/upload` (a real corpus PDF, real Gemini
   extraction, ~70s round trip, correctly surfaced a partial-extraction
   issue and a pending clarification question through the HTTP response).
 - A real `gcloud builds submit` confirming the Dockerfile builds and
@@ -70,4 +70,4 @@ error-shaped 200 isn't a real pass.
   live GCP dependency (`tests/test_service.py`).
 
 Not tested: the actual deployed Cloud Run URL, multiple concurrent
-users/instances, or anything past a single `/papers` upload per request.
+users/instances, or anything past a single file per `/papers/upload` request.
