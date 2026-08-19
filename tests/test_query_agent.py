@@ -380,3 +380,87 @@ def test_paper_scope_prevents_cross_paper_graph_and_chunk_evidence(fake_db):
 
     assert result.retrieval_mode == "vector"
     assert {citation.paper_id for citation in result.citations} == {"paper-2"}
+
+
+def test_paper_scoped_answer_passes_conversation_history_to_gemini(fake_db):
+    """Regression: the /chat route's paper-scoped branch used to call
+    QueryAgent.answer() with no history param at all - a follow-up like
+    "how does that compare to prior work?" had nothing to resolve "that"
+    against, since every call started a fresh conversation. Once history
+    is threaded through, _answer_with_gemini must build a real multi-turn
+    `contents` list (matching GeneralChatAgent's pattern), not silently
+    drop it."""
+    from agent.general_chat import ChatTurn
+
+    calls = []
+
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(text="Grounded follow-up answer")
+
+    agent = QueryAgent(
+        ChunkIndex(),
+        _graph(fake_db),
+        client=SimpleNamespace(models=FakeModels()),
+    )
+    history = [
+        ChatTurn(role="user", text="What does the memory method use recall for?"),
+        ChatTurn(role="assistant", text="It uses recall to evaluate retrieval quality."),
+    ]
+
+    result = agent.answer(
+        "How does that compare to the metric?", history=history
+    )
+
+    assert result.answer == "Grounded follow-up answer"
+    contents = calls[0]["contents"]
+    assert isinstance(contents, list)
+    assert len(contents) == 3  # 2 history turns + the current question
+    assert contents[0].role == "user"
+    assert contents[1].role == "model"  # "assistant" maps to "model"
+    assert contents[2].role == "user"
+    assert "How does that compare to the metric?" in contents[2].parts[0].text
+
+
+def test_no_history_keeps_the_original_single_string_contents(fake_db):
+    """Without history, contents must stay a plain string (the original
+    shape) rather than always wrapping in a list - avoids changing
+    behavior for every existing non-chat caller of QueryAgent.answer()."""
+    calls = []
+
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(text="Answer")
+
+    agent = QueryAgent(
+        ChunkIndex(),
+        _graph(fake_db),
+        client=SimpleNamespace(models=FakeModels()),
+    )
+
+    agent.answer("How does the memory method use recall?")
+
+    assert isinstance(calls[0]["contents"], str)
+
+
+def test_paper_scoped_answer_only_walks_incident_edges_once_per_node(fake_db):
+    """Regression: paper_ids filtering in answer() and citation-building
+    in _graph_evidence each independently called
+    GraphManager.get_incident_edges(hit.node_id) for the same node -
+    every paper-scoped query walked each candidate node's edges twice."""
+    graph = _graph(fake_db)
+    calls = []
+    original = graph.get_incident_edges
+
+    def counting_get_incident_edges(node_id):
+        calls.append(node_id)
+        return original(node_id)
+
+    graph.get_incident_edges = counting_get_incident_edges
+    agent = QueryAgent(ChunkIndex(), graph)
+
+    agent.answer("How does the memory method use recall?", paper_ids={"paper-1"})
+
+    assert calls.count("method") == 1
