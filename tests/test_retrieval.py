@@ -136,3 +136,15 @@ def test_context_text_cannot_forge_a_closing_tag():
     assert "<source_metadata>" in context.text
     assert context.text.count("<source_metadata>") == 1
     assert "&lt;/source_metadata&gt;" in context.text
+
+
+def test_chunk_index_rehydrates_persisted_records(fake_db):
+    first = ChunkIndex(db_client=fake_db)
+    first.upsert_paper("paper-restart", ["Durable evidence survives restart."])
+
+    restored = ChunkIndex(db_client=fake_db)
+
+    hits = restored.search("durable evidence", paper_ids={"paper-restart"})
+    assert restored.count() == 1
+    assert hits[0].paper_id == "paper-restart"
+    assert "survives restart" in hits[0].text

@@ -369,3 +369,14 @@ def test_gemini_response_text_property_raising_falls_back():
     ).answer("What is stored?")
 
     assert "Stored evidence about safety blocks." in result.answer
+
+
+def test_paper_scope_prevents_cross_paper_graph_and_chunk_evidence(fake_db):
+    index = ChunkIndex()
+    index.upsert_paper("paper-2", ["Paper two discusses a separate recall baseline."])
+    agent = QueryAgent(index, _graph(fake_db))
+
+    result = agent.answer("What does recall mean?", paper_ids={"paper-2"})
+
+    assert result.retrieval_mode == "vector"
+    assert {citation.paper_id for citation in result.citations} == {"paper-2"}

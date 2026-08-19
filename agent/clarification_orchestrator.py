@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Literal
+from typing import TYPE_CHECKING, Any, Callable, Literal
 
 if TYPE_CHECKING:
     from agent.graph_manager import GraphManager, NodeSearchHit
@@ -85,9 +85,68 @@ class ClarificationOrchestrator:
     still recorded here so a chosen option has somewhere real to apply to.
     """
 
-    def __init__(self, graph_manager: "GraphManager | None" = None):
+    def __init__(
+        self,
+        graph_manager: "GraphManager | None" = None,
+        db_client: Any | None = None,
+    ):
         self._graph = graph_manager
+        self._db = db_client
         self._questions: dict[str, PendingQuestion] = {}
+        if self._db is not None:
+            self._rehydrate()
+
+    def _rehydrate(self) -> None:
+        for snapshot in self._db.collection("clarifications").stream():
+            data = snapshot.to_dict()
+            try:
+                common = dict(
+                    id=snapshot.id,
+                    question=data["question"],
+                    options=[ClarificationOption(**option) for option in data["options"]],
+                    status=data.get("status", "open"),
+                    answer_option_id=data.get("answer_option_id"),
+                )
+                if data.get("kind") == "entity_merge":
+                    question: PendingQuestion = EntityMergeQuestion(
+                        **common,
+                        provisional_node_id=data["provisional_node_id"],
+                        candidate_node_id=data["candidate_node_id"],
+                        score=data.get("score"),
+                    )
+                elif data.get("kind") == "query_disambiguation":
+                    question = QueryDisambiguationQuestion(
+                        **common, query_text=data["query_text"]
+                    )
+                else:
+                    continue
+            except (KeyError, TypeError, ValueError):
+                logger.warning("Ignoring malformed persisted clarification %s", snapshot.id)
+                continue
+            self._questions[question.id] = question
+
+    def _persist(self, question: PendingQuestion) -> None:
+        if self._db is None:
+            return
+        data: dict[str, Any] = {
+            "kind": question.kind,
+            "question": question.question,
+            "options": [
+                {"id": option.id, "label": option.label, "description": option.description}
+                for option in question.options
+            ],
+            "status": question.status,
+            "answer_option_id": question.answer_option_id,
+        }
+        if isinstance(question, EntityMergeQuestion):
+            data.update(
+                provisional_node_id=question.provisional_node_id,
+                candidate_node_id=question.candidate_node_id,
+                score=question.score,
+            )
+        else:
+            data["query_text"] = question.query_text
+        self._db.collection("clarifications").document(question.id).set(data, merge=True)
 
     def register_entity_merge_question(
         self,
@@ -121,6 +180,7 @@ class ClarificationOrchestrator:
             score=score,
         )
         self._questions[question.id] = question
+        self._persist(question)
         return question
 
     def register_query_disambiguation(
@@ -138,6 +198,7 @@ class ClarificationOrchestrator:
             query_text=query_text,
         )
         self._questions[question.id] = question
+        self._persist(question)
         return question
 
     def pending(self) -> list[PendingQuestion]:
@@ -178,6 +239,7 @@ class ClarificationOrchestrator:
 
         question.status = "answered"
         question.answer_option_id = option_id
+        self._persist(question)
         return question
 
     def run_terminal_review_loop(

@@ -12,9 +12,31 @@ chunking, and feature-hashed vectors. OCR, Gemini structured extraction,
 Firestore persistence, and hosted embeddings are optional upgrades rather
 than requirements for every paper or query.
 
+## Run the integrated app locally
+
+Copy `.env.example` values into your shell, authenticate Application Default
+Credentials, then start the API:
+
+```bash
+uv run uvicorn service.app:app --reload --port 8000
+```
+
+Copy `frontend/.env.local.example` to `frontend/.env.local`, using the same
+`API_SHARED_SECRET`, then start Next.js in a second terminal:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Open `http://localhost:3000`. General chat, PDF ingestion, arXiv ingestion,
+and paper-grounded chat all use the FastAPI service. PDF uploads are limited
+to 25 MiB and use a short-lived browser upload token; the permanent shared
+secret stays in the Next.js server process.
+
 ## Stack
-- Google ADK (multi-agent framework)
-- Optional Gemini structured extraction via Vertex AI
+- Gemini chat and optional structured extraction via Vertex AI
 - Local chunk index for retrieval
 - networkx graph engine + optional Firestore persistence
 - Cloud Run (deployment)

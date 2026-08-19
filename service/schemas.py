@@ -9,7 +9,9 @@ a client to know about Python dataclasses.
 
 from __future__ import annotations
 
-from pydantic import BaseModel
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field
 
 from agent.clarification_orchestrator import (
     EntityMergeQuestion,
@@ -19,7 +21,46 @@ from agent.clarification_orchestrator import (
 
 
 class QueryRequest(BaseModel):
-    query: str
+    query: str = Field(min_length=1, max_length=8000)
+    paper_id: str | None = None
+
+
+class ChatHistoryItem(BaseModel):
+    role: Literal["user", "assistant"]
+    text: str = Field(min_length=1, max_length=8000)
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=8000)
+    history: list[ChatHistoryItem] = Field(default_factory=list, max_length=20)
+    paper_id: str | None = None
+
+
+class UploadTokenResponse(BaseModel):
+    token: str
+    expires_at: str
+    max_bytes: int
+
+
+class ArxivIngestRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    arxiv_id: str = Field(min_length=5, max_length=40)
+    title: str = Field(min_length=1, max_length=500)
+    authors: str | None = Field(default=None, max_length=2000)
+    abstract: str | None = Field(default=None, max_length=10000)
+    pdf_url: str | None = Field(default=None, alias="pdfUrl")
+
+
+class PaperMetadata(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str
+    title: str
+    authors: str | None = None
+    abstract: str | None = None
+    pdf_url: str | None = Field(default=None, alias="pdfUrl")
+    status: str
 
 
 class FeedbackRequest(BaseModel):
@@ -89,7 +130,15 @@ class PendingQuestionOut(BaseModel):
 
 
 class PaperIngestResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     paper_id: str
+    id: str
+    title: str
+    authors: str | None = None
+    abstract: str | None = None
+    pdf_url: str | None = Field(default=None, alias="pdfUrl")
+    status: str = "ready"
     extraction_ok: bool
     issue_message: str | None = None
     chunk_ids: list[str]
