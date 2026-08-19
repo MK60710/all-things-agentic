@@ -62,7 +62,7 @@ export default function Home() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
-  const [paper, setPaper] = useState<PaperContext | null>(null);
+  const [papers, setPapers] = useState<PaperContext[]>([]);
   const [addOpen, setAddOpen] = useState(false);
   const [addMode, setAddMode] = useState<AddMode>("choose");
   const [uploading, setUploading] = useState(false);
@@ -85,9 +85,9 @@ export default function Home() {
     window.localStorage.setItem("atlas-messages", JSON.stringify(messages));
   }, [messages]);
   useEffect(() => {
-    const savedPaper = window.localStorage.getItem("atlas-active-paper");
-    if (savedPaper) {
-      try { setPaper(JSON.parse(savedPaper) as PaperContext); } catch { window.localStorage.removeItem("atlas-active-paper"); }
+    const savedPapers = window.localStorage.getItem("atlas-session-papers");
+    if (savedPapers) {
+      try { setPapers(JSON.parse(savedPapers) as PaperContext[]); } catch { window.localStorage.removeItem("atlas-session-papers"); }
     }
     const savedMessages = window.localStorage.getItem("atlas-messages");
     if (savedMessages) {
@@ -162,12 +162,12 @@ export default function Home() {
   function askAboutGap(candidate: GapCandidate) {
     const question = `How does ${candidate.node_a_name} relate to ${candidate.node_b_name}?${candidate.explanation ? ` (${candidate.explanation})` : ""}`;
     void recordGapFeedback(candidate.node_a_id, candidate.node_b_id, true).catch(() => {});
-    // Gaps come from GapFinder, which reasons over the whole graph, not any
-    // one paper - explicitly ignore whatever paper happens to be attached
-    // right now, or this silently re-scopes the question to it and can
-    // wrongly report "no information" for evidence that's real but lives
-    // in a different paper.
-    void ask(undefined, question, null);
+    // Gaps come from GapFinder, which reasons over the whole graph, not the
+    // session's working set - explicitly ignore whatever papers are
+    // currently added, or this silently re-scopes the question to them and
+    // can wrongly report "no information" for evidence that's real but
+    // lives in a paper outside the working set.
+    void ask(undefined, question, []);
   }
 
   function dismissGap(candidate: GapCandidate) {
@@ -175,11 +175,11 @@ export default function Home() {
     void recordGapFeedback(candidate.node_a_id, candidate.node_b_id, false).catch(() => {});
   }
 
-  async function ask(event?: FormEvent, suggested = query, paperOverride?: PaperContext | null) {
+  async function ask(event?: FormEvent, suggested = query, papersOverride?: PaperContext[] | null) {
     event?.preventDefault();
     const question = suggested.trim();
     if (!question || loading) return;
-    const effectivePaper = paperOverride === undefined ? paper : paperOverride;
+    const effectivePapers = papersOverride === undefined ? papers : papersOverride;
 
     const history: ChatHistoryItem[] = messages
       .filter((message) => !message.notice)
@@ -189,7 +189,7 @@ export default function Home() {
     setQuery("");
     setLoading(true);
     try {
-      const response = await askAssistant(question, history, effectivePaper);
+      const response = await askAssistant(question, history, effectivePapers);
       setMessages((current) => [...current, {
         id: crypto.randomUUID(),
         role: "assistant",
@@ -228,7 +228,7 @@ export default function Home() {
     setUploadError("");
     try {
       const uploaded = await uploadPaper(file);
-      attachPaper(uploaded);
+      addPaper(uploaded);
     } catch (error) {
       setUploadError(error instanceof Error ? error.message : "Upload failed.");
     } finally {
@@ -237,9 +237,13 @@ export default function Home() {
     }
   }
 
-  function attachPaper(nextPaper: PaperContext) {
-    setPaper(nextPaper);
-    window.localStorage.setItem("atlas-active-paper", JSON.stringify(nextPaper));
+  function addPaper(nextPaper: PaperContext) {
+    setPapers((current) => {
+      if (current.some((existing) => existing.id === nextPaper.id)) return current;
+      const updated = [...current, nextPaper];
+      window.localStorage.setItem("atlas-session-papers", JSON.stringify(updated));
+      return updated;
+    });
     setMessages((current) => [...current, { id: crypto.randomUUID(), role: "assistant", text: `I've added "${nextPaper.title}" to this conversation. Ask me to summarize it, explain a section, or examine its evidence.`, notice: true }]);
     setAddOpen(false);
     setAddMode("choose");
@@ -247,11 +251,14 @@ export default function Home() {
     void checkGuidance();
   }
 
-  function removePaper() {
-    const title = paper?.title;
-    setPaper(null);
-    window.localStorage.removeItem("atlas-active-paper");
-    setMessages((current) => [...current, { id: crypto.randomUUID(), role: "assistant", text: `Paper context removed${title ? `: “${title}”` : ""}. We’re back to general Gemini chat.`, notice: true }]);
+  function removePaperFromSet(paperId: string) {
+    setPapers((current) => {
+      const removed = current.find((existing) => existing.id === paperId);
+      const updated = current.filter((existing) => existing.id !== paperId);
+      window.localStorage.setItem("atlas-session-papers", JSON.stringify(updated));
+      setMessages((currentMessages) => [...currentMessages, { id: crypto.randomUUID(), role: "assistant", text: `Removed${removed ? `: "${removed.title}"` : ""} from this conversation.${updated.length === 0 ? " We're back to searching everything." : ""}`, notice: true }]);
+      return updated;
+    });
   }
 
   async function runSearch(event: FormEvent) {
@@ -277,7 +284,7 @@ export default function Home() {
     setIngestingId(result.id);
     setSearchError("");
     try {
-      attachPaper(await ingestArxivPaper(result));
+      addPaper(await ingestArxivPaper(result));
     } catch (error) {
       setSearchError(error instanceof Error ? error.message : "Could not read this paper.");
     } finally {
@@ -294,10 +301,14 @@ export default function Home() {
     <main className="assistant-app">
       <header className="app-header">
         <div className="brand"><span><Icon name="atlas" size={21}/></span><strong>Atlas</strong></div>
-        <div className={`mode-label ${paper ? "paper-mode" : ""}`}>
-          {paper ? <><Icon name="paper" size={15}/><span><small>Reading</small><strong>{paper.title}</strong></span><button onClick={removePaper} aria-label="Remove paper"><Icon name="close" size={14}/></button></> : <><span className="online-dot"/><strong>General chat</strong><small>Gemini</small></>}
+        <div className={`mode-label ${papers.length ? "paper-mode" : ""}`}>
+          {papers.length > 0 ? (
+            <div className="paper-chip-row">
+              {papers.map((p) => <span key={p.id} className="paper-chip"><Icon name="paper" size={12}/><strong>{p.title}</strong><button onClick={() => removePaperFromSet(p.id)} aria-label={`Remove ${p.title}`}><Icon name="close" size={11}/></button></span>)}
+            </div>
+          ) : <><span className="online-dot"/><strong>General chat</strong><small>Gemini</small></>}
         </div>
-        <button className="add-paper-button" onClick={() => openAddPaper()}><Icon name="plus" size={17}/>{paper ? "Change paper" : "Add paper"}</button>
+        <button className="add-paper-button" onClick={() => openAddPaper()}><Icon name="plus" size={17}/>{papers.length ? "Add another" : "Add paper"}</button>
       </header>
 
       <section className="conversation-scroll">
@@ -367,10 +378,10 @@ export default function Home() {
       </section>
 
       <footer className="composer-area">
-        {paper && <div className="paper-context-chip"><Icon name="paper" size={14}/><span>Using <strong>{paper.title}</strong></span><button onClick={removePaper}><Icon name="close" size={13}/></button></div>}
+        {papers.length > 0 && <div className="paper-context-chip"><Icon name="paper" size={14}/><span>Using <strong>{papers.length === 1 ? papers[0].title : `${papers.length} papers`}</strong></span></div>}
         <form className="composer" onSubmit={(event) => ask(event)}>
           <button type="button" className="composer-add" onClick={() => openAddPaper()} aria-label="Add a paper"><Icon name="plus" size={19}/></button>
-          <textarea ref={composerInput} value={query} maxLength={8000} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void ask(); } }} rows={1} placeholder={paper ? "Ask anything about this paper…" : "Message Gemini…"}/>
+          <textarea ref={composerInput} value={query} maxLength={8000} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void ask(); } }} rows={1} placeholder={papers.length ? "Ask anything about these papers…" : "Message Gemini…"}/>
           <button type="submit" className="send-button" disabled={!query.trim() || loading} aria-label="Send"><Icon name="send" size={18}/></button>
         </form>
         <small className="composer-hint">Gemini can make mistakes. Paper answers include sources when available.</small>

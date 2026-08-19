@@ -33,7 +33,10 @@ class ChatHistoryItem(BaseModel):
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=8000)
     history: list[ChatHistoryItem] = Field(default_factory=list, max_length=20)
-    paper_id: str | None = None
+    # A session's working set, not a single paper - QueryAgent.answer()
+    # already accepts paper_ids: set[str] | None as a multi-paper filter,
+    # this was only ever exposed here as if it took just one.
+    paper_ids: list[str] | None = None
 
 
 class UploadTokenResponse(BaseModel):

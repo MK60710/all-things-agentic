@@ -22,12 +22,13 @@ export interface PaperSearchResult extends PaperContext {
 export async function askAssistant(
   message: string,
   history: ChatHistoryItem[],
-  paper?: PaperContext | null,
+  papers?: PaperContext[] | null,
 ): Promise<QueryResponse> {
+  const paperIds = papers?.map((paper) => paper.id) ?? [];
   const response = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message, history, paper_id: paper?.id }),
+    body: JSON.stringify({ message, history, paper_ids: paperIds }),
   });
 
   const data = await response.json() as Partial<QueryResponse> & { error?: string };
@@ -35,7 +36,7 @@ export async function askAssistant(
   return {
     answer: data.answer ?? "I couldn't produce a response.",
     citations: data.citations ?? [],
-    retrieval_mode: data.retrieval_mode ?? (paper ? "vector" : "general"),
+    retrieval_mode: data.retrieval_mode ?? (paperIds.length ? "vector" : "general"),
     confidence: data.confidence,
     candidates: data.candidates,
     clarification_question_id: data.clarification_question_id,
