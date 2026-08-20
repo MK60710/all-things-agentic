@@ -18,6 +18,7 @@ from service.schemas import (
     UploadTokenResponse,
 )
 from service.state import AppState
+from agent.paper_guide import PaperGuide
 
 router = APIRouter(prefix="/papers", tags=["papers"])
 
@@ -70,7 +71,7 @@ def _ingest(
     pdf_url: str | None = None,
 ) -> PaperIngestResponse:
     metadata = dict(title=title, authors=authors, abstract=abstract, pdf_url=pdf_url)
-    state.paper_store.save(paper_id, **metadata, status="processing")
+    state.paper_store.save(paper_id, **metadata, status="processing", guide=None)
     outcome = state.extraction_agent.extract_one(paper_id, str(path), fail_closed=False)
     if outcome.result is None:
         message = outcome.issue.message if outcome.issue else "extraction failed"
@@ -192,3 +193,23 @@ def ingest_arxiv(body: ArxivIngestRequest, state: AppState = Depends(get_state))
         abstract=body.abstract,
         pdf_url=body.pdf_url or url,
     )
+
+
+@router.post(
+    "/{paper_id}/guide",
+    response_model=PaperGuide,
+    dependencies=[Depends(require_api_key)],
+)
+def create_paper_guide(
+    paper_id: str, state: AppState = Depends(get_state)
+) -> PaperGuide:
+    metadata = state.paper_store.get(paper_id)
+    chunks = state.chunks.paper_chunks(paper_id)
+    if not chunks:
+        raise HTTPException(status_code=404, detail="paper has no indexed content")
+    if metadata and isinstance(metadata.get("guide"), dict):
+        return PaperGuide.model_validate(metadata["guide"])
+    title = str((metadata or {}).get("title") or paper_id)
+    guide = state.paper_guide.generate(title, chunks)
+    state.paper_store.save(paper_id, guide=guide.model_dump(mode="json"))
+    return guide
