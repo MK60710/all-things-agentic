@@ -91,6 +91,11 @@ export default function Home() {
   const [buildingGraphQueue, setBuildingGraphQueue] = useState<PaperIngestResult[]>([]);
   const shownClarificationIds = useRef<Set<string>>(new Set());
   const shownGapKeys = useRef<Set<string>>(new Set());
+  // Tags every ingest write server-side (scripts/clear_session.py can then
+  // clear exactly this session's papers/nodes/edges) - not displayed, just
+  // sent with every ingest request. A ref, not state: nothing renders off
+  // it, only requests read it.
+  const sessionIdRef = useRef<string>("");
 
   useEffect(() => { chatEnd.current?.scrollIntoView({ behavior: "smooth" }); }, [messages, loading]);
   // Conversation history is otherwise plain React state - a refresh meant
@@ -100,6 +105,13 @@ export default function Home() {
     window.localStorage.setItem("atlas-messages", JSON.stringify(messages));
   }, [messages]);
   useEffect(() => {
+    const savedSessionId = window.localStorage.getItem("atlas-session-id");
+    if (savedSessionId) {
+      sessionIdRef.current = savedSessionId;
+    } else {
+      sessionIdRef.current = crypto.randomUUID();
+      window.localStorage.setItem("atlas-session-id", sessionIdRef.current);
+    }
     const savedPapers = window.localStorage.getItem("atlas-session-papers");
     let restoredPapers: PaperContext[] = [];
     if (savedPapers) {
@@ -272,7 +284,7 @@ export default function Home() {
     setUploading(true);
     setUploadError("");
     try {
-      const uploaded = await uploadPaper(file, controller.signal);
+      const uploaded = await uploadPaper(file, controller.signal, sessionIdRef.current);
       setBuildingGraphQueue((current) => [...current, uploaded]);
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") return;
@@ -300,6 +312,25 @@ export default function Home() {
     setAddMode("choose");
     window.setTimeout(() => composerInput.current?.focus(), 50);
     void checkGuidance();
+  }
+
+  function startNewSession() {
+    // Local-only reset: clears this browser's chat/working set and starts
+    // tagging future ingests with a new session id. Nothing already in
+    // the shared graph is deleted - that's a separate, explicit cleanup
+    // step (scripts/clear_session.py), not a side effect of this button.
+    if (!window.confirm("Start a new session? This clears the chat and added papers shown here. Nothing already added to the shared graph is deleted.")) return;
+    sessionIdRef.current = crypto.randomUUID();
+    window.localStorage.setItem("atlas-session-id", sessionIdRef.current);
+    window.localStorage.removeItem("atlas-session-papers");
+    window.localStorage.removeItem("atlas-messages");
+    shownClarificationIds.current = new Set();
+    shownGapKeys.current = new Set();
+    setDismissedGapKeys(new Set());
+    setPapers([]);
+    setMessages([]);
+    setBuildingGraphQueue([]);
+    window.setTimeout(() => composerInput.current?.focus(), 50);
   }
 
   function removePaperFromSet(paperId: string) {
@@ -337,7 +368,7 @@ export default function Home() {
     setIngestingIds((current) => new Set(current).add(result.id));
     setSearchError("");
     try {
-      const ingested = await ingestArxivPaper(result, controller.signal);
+      const ingested = await ingestArxivPaper(result, controller.signal, sessionIdRef.current);
       setBuildingGraphQueue((current) => [...current, ingested]);
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") return;
@@ -372,7 +403,10 @@ export default function Home() {
             </div>
           ) : <><span className="online-dot"/><strong>General chat</strong><small>Gemini</small></>}
         </div>
-        <button className="add-paper-button" onClick={() => openAddPaper()}><Icon name="plus" size={17}/>{papers.length ? "Add another" : "Add paper"}</button>
+        <div className="header-actions">
+          <button className="new-session-button" onClick={startNewSession}>New session</button>
+          <button className="add-paper-button" onClick={() => openAddPaper()}><Icon name="plus" size={17}/>{papers.length ? "Add another" : "Add paper"}</button>
+        </div>
       </header>
 
       <section className="conversation-scroll">

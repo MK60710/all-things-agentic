@@ -48,7 +48,11 @@ export async function askAssistant(
   };
 }
 
-export async function uploadPaper(file: File, signal?: AbortSignal): Promise<PaperIngestResult> {
+export async function uploadPaper(
+  file: File,
+  signal?: AbortSignal,
+  sessionId?: string,
+): Promise<PaperIngestResult> {
   if (!API_URL) throw new Error("NEXT_PUBLIC_API_URL is not configured");
   const tokenResponse = await fetch("/api/papers/upload-token", { method: "POST", signal });
   const tokenData = await tokenResponse.json() as { token?: string; max_bytes?: number; error?: string };
@@ -61,6 +65,7 @@ export async function uploadPaper(file: File, signal?: AbortSignal): Promise<Pap
   const body = new FormData();
   body.append("file", file);
   body.append("title", file.name.replace(/\.pdf$/i, ""));
+  if (sessionId) body.append("session_id", sessionId);
   const response = await fetch(`${API_URL.replace(/\/$/, "")}/papers`, {
     method: "POST",
     headers: { "X-Upload-Token": tokenData.token },
@@ -72,7 +77,11 @@ export async function uploadPaper(file: File, signal?: AbortSignal): Promise<Pap
   return data;
 }
 
-export async function ingestArxivPaper(paper: PaperSearchResult, signal?: AbortSignal): Promise<PaperIngestResult> {
+export async function ingestArxivPaper(
+  paper: PaperSearchResult,
+  signal?: AbortSignal,
+  sessionId?: string,
+): Promise<PaperIngestResult> {
   const response = await fetch("/api/papers/arxiv", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -82,6 +91,7 @@ export async function ingestArxivPaper(paper: PaperSearchResult, signal?: AbortS
       authors: paper.authors,
       abstract: paper.abstract,
       pdfUrl: paper.pdfUrl,
+      session_id: sessionId,
     }),
     signal,
   });
