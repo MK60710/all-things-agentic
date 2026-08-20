@@ -18,6 +18,7 @@ from agent.extraction_agent import ExtractionAgent
 from agent.gap_finder import GapFinder, GeminiExplainer
 from agent.gemini_extractor import GeminiStructuredExtractor
 from agent.general_chat import GeneralChatAgent
+from agent.paper_guide import PaperGuideAgent
 from agent.graph_manager import GraphManager
 from agent.query_agent import QueryAgent
 from agent.research_store import ResearchStore
@@ -33,6 +34,7 @@ class AppState:
     clarification: ClarificationOrchestrator
     query_agent: QueryAgent
     general_chat: GeneralChatAgent
+    paper_guide: PaperGuideAgent
     gap_finder: GapFinder
     extraction_agent: ExtractionAgent
     research_store: ResearchStore
@@ -74,6 +76,11 @@ def build_state() -> AppState:
         location=location,
         model=os.environ.get("GEMINI_CHAT_MODEL", "gemini-2.5-flash-lite"),
     )
+    paper_guide = PaperGuideAgent(
+        project=project,
+        location=location,
+        model=os.environ.get("GEMINI_GUIDE_MODEL", "gemini-2.5-flash-lite"),
+    )
     gap_finder = GapFinder(
         graph,
         explain_fn=GeminiExplainer(project=project, location=location),
@@ -96,6 +103,7 @@ def build_state() -> AppState:
         clarification=clarification,
         query_agent=query_agent,
         general_chat=general_chat,
+        paper_guide=paper_guide,
         gap_finder=gap_finder,
         extraction_agent=extraction_agent,
         research_store=research_store,
