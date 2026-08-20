@@ -190,6 +190,66 @@ def test_papers_upload_returns_the_real_graph_writes_for_the_build_animation(
     assert data["new_edges"] == []
 
 
+def test_papers_upload_backfills_implicit_relation_endpoint_nodes(
+    client, app_state, monkeypatch
+):
+    """Regression: GraphManager._resolve_relation_endpoint can create an
+    'implicit relation endpoint' node directly via add_node() when a
+    relation names an entity outside the extracted entities list - that
+    node is real and used as a real edge endpoint, but never gets a
+    NodeWriteResult, so node_writes alone misses it. Reproduced live:
+    the frontend's force-graph threw 'node not found' repeatedly because
+    an edge referenced a node id that was never in new_nodes. Every
+    edge's source/target must have a corresponding entry in new_nodes."""
+    from agent.document_ingestion import DocumentIngestionResult
+    from agent.extraction_agent import ExtractionOutcome
+    from agent.schema import EdgeType, ExtractedEntity, ExtractedRelation, ExtractionResult
+
+    def fake_extract_one(paper_id, path, fail_closed=False):
+        return ExtractionOutcome(
+            paper_id=paper_id,
+            document=DocumentIngestionResult(
+                paper_id=paper_id, pdf_path=path, pages=[], raw_text="text", chunks=["text"]
+            ),
+            result=ExtractionResult(
+                paper_id=paper_id,
+                entities=[
+                    ExtractedEntity(name="MyMethod", type=NodeType.METHOD, description="A method")
+                ],
+                # "SomeImplicitModel" is deliberately absent from entities
+                # above - this is exactly what triggers the implicit-node
+                # creation path in _resolve_relation_endpoint.
+                relations=[
+                    ExtractedRelation(
+                        source_entity="MyMethod",
+                        source_type=NodeType.METHOD,
+                        relation=EdgeType.USES,
+                        target_entity="SomeImplicitModel",
+                        target_type=NodeType.MODEL,
+                        source_quote="MyMethod uses SomeImplicitModel",
+                    )
+                ],
+            ),
+        )
+
+    monkeypatch.setattr(app_state.extraction_agent, "extract_one", fake_extract_one)
+
+    response = client.post(
+        "/papers",
+        files={"file": ("paper.pdf", b"%PDF-1.4 fake", "application/pdf")},
+        data={"paper_id": "implicit-node-test-paper"},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    node_ids = {node["node_id"] for node in data["new_nodes"]}
+    for edge in data["new_edges"]:
+        assert edge["source_id"] in node_ids
+        assert edge["target_id"] in node_ids
+    names = {node["name"] for node in data["new_nodes"]}
+    assert "SomeImplicitModel" in names
+
+
 def test_papers_upload_and_ingest(client):
     pdf_bytes = b"%PDF-1.4 fake"
     response = client.post(
