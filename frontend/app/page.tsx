@@ -71,11 +71,20 @@ export default function Home() {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<PaperSearchResult[]>([]);
   const [searching, setSearching] = useState(false);
-  const [ingestingId, setIngestingId] = useState<string | null>(null);
+  // Multiple searches can be in flight at once now - keyed by result.id so
+  // each card can show its own "Reading…"/cancel independently instead of
+  // one global flag blocking every other result while it's in progress.
+  const [ingestingIds, setIngestingIds] = useState<Set<string>>(new Set());
+  const ingestControllers = useRef<Map<string, AbortController>>(new Map());
+  const uploadController = useRef<AbortController | null>(null);
   const [searchError, setSearchError] = useState("");
   const [expandedCitation, setExpandedCitation] = useState<string | null>(null);
   const [dismissedGapKeys, setDismissedGapKeys] = useState<Set<string>>(new Set());
-  const [buildingGraph, setBuildingGraph] = useState<PaperIngestResult | null>(null);
+  // A queue, not a single value - multiple ingests can finish close
+  // together now that they're no longer serialized, and each one gets its
+  // own full reveal in turn rather than the second silently clobbering the
+  // first's still-playing animation.
+  const [buildingGraphQueue, setBuildingGraphQueue] = useState<PaperIngestResult[]>([]);
   const shownClarificationIds = useRef<Set<string>>(new Set());
   const shownGapKeys = useRef<Set<string>>(new Set());
 
@@ -88,26 +97,39 @@ export default function Home() {
   }, [messages]);
   useEffect(() => {
     const savedPapers = window.localStorage.getItem("atlas-session-papers");
+    let restoredPapers: PaperContext[] = [];
     if (savedPapers) {
-      try { setPapers(JSON.parse(savedPapers) as PaperContext[]); } catch { window.localStorage.removeItem("atlas-session-papers"); }
+      try {
+        restoredPapers = JSON.parse(savedPapers) as PaperContext[];
+        setPapers(restoredPapers);
+      } catch { window.localStorage.removeItem("atlas-session-papers"); }
     }
     const savedMessages = window.localStorage.getItem("atlas-messages");
+    let restoredMessages: Message[] = [];
     if (savedMessages) {
       try {
-        const restored = JSON.parse(savedMessages) as Message[];
+        restoredMessages = JSON.parse(savedMessages) as Message[];
         // Seed the dedup trackers directly from restored history (not from
         // messages state, which won't have committed yet) so checkGuidance
         // below doesn't re-post a clarification/gap card that's already
         // sitting in the restored conversation.
-        restored.forEach((message) => {
+        restoredMessages.forEach((message) => {
           if (message.clarification) shownClarificationIds.current.add(message.clarification.id);
           message.gaps?.forEach((candidate) => shownGapKeys.current.add(gapKey(candidate)));
         });
-        setMessages(restored);
+        setMessages(restoredMessages);
       } catch { window.localStorage.removeItem("atlas-messages"); }
     }
     composerInput.current?.focus();
-    void checkGuidance();
+    // A genuinely fresh session - nothing added, nothing asked yet - should
+    // start clean. Surfacing corpus-wide gap suggestions before the user
+    // has engaged with anything is confusing, not helpful; proactive
+    // guidance only makes sense once there's something to be guided about.
+    // addPaper() already runs checkGuidance() for the "just added a paper"
+    // case; this only covers the "returning to an existing session" case.
+    if (restoredPapers.length > 0 || restoredMessages.length > 0) {
+      void checkGuidance();
+    }
   }, []);
 
   // Proactive, unsolicited content: a missing suggestion is fine, an error
@@ -226,17 +248,25 @@ export default function Home() {
       setUploadError("Please choose a PDF file.");
       return;
     }
+    const controller = new AbortController();
+    uploadController.current = controller;
     setUploading(true);
     setUploadError("");
     try {
-      const uploaded = await uploadPaper(file);
-      setBuildingGraph(uploaded);
+      const uploaded = await uploadPaper(file, controller.signal);
+      setBuildingGraphQueue((current) => [...current, uploaded]);
     } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
       setUploadError(error instanceof Error ? error.message : "Upload failed.");
     } finally {
       setUploading(false);
+      uploadController.current = null;
       if (fileInput.current) fileInput.current.value = "";
     }
+  }
+
+  function cancelUpload() {
+    uploadController.current?.abort();
   }
 
   function addPaper(nextPaper: PaperContext) {
@@ -282,16 +312,29 @@ export default function Home() {
   }
 
   async function addArxivPaper(result: PaperSearchResult) {
-    if (ingestingId) return;
-    setIngestingId(result.id);
+    if (ingestingIds.has(result.id)) return;
+    const controller = new AbortController();
+    ingestControllers.current.set(result.id, controller);
+    setIngestingIds((current) => new Set(current).add(result.id));
     setSearchError("");
     try {
-      setBuildingGraph(await ingestArxivPaper(result));
+      const ingested = await ingestArxivPaper(result, controller.signal);
+      setBuildingGraphQueue((current) => [...current, ingested]);
     } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
       setSearchError(error instanceof Error ? error.message : "Could not read this paper.");
     } finally {
-      setIngestingId(null);
+      ingestControllers.current.delete(result.id);
+      setIngestingIds((current) => {
+        const updated = new Set(current);
+        updated.delete(result.id);
+        return updated;
+      });
     }
+  }
+
+  function cancelArxivIngest(resultId: string) {
+    ingestControllers.current.get(resultId)?.abort();
   }
 
   function onDrop(event: DragEvent<HTMLButtonElement>) {
@@ -391,14 +434,18 @@ export default function Home() {
 
       {addOpen && <div className="add-modal" role="dialog" aria-modal="true" aria-label="Add a research paper">
         <button className="modal-scrim" onClick={() => setAddOpen(false)} aria-label="Close"/>
-        <section className="modal-card">
+        <section className={`modal-card ${buildingGraphQueue.length > 0 ? "modal-card-fullscreen" : ""}`}>
           <header><div><span><Icon name="paper" size={18}/></span><div><strong>Add a research paper</strong><small>Give Gemini a paper to read with you</small></div></div><button onClick={() => setAddOpen(false)} aria-label="Close"><Icon name="close" size={19}/></button></header>
 
-          {buildingGraph ? (
+          {buildingGraphQueue.length > 0 ? (
             <GraphBuildAnimation
-              newNodes={buildingGraph.new_nodes}
-              newEdges={buildingGraph.new_edges}
-              onComplete={() => { addPaper(buildingGraph); setBuildingGraph(null); }}
+              key={buildingGraphQueue[0].id}
+              newNodes={buildingGraphQueue[0].new_nodes}
+              newEdges={buildingGraphQueue[0].new_edges}
+              onComplete={() => {
+                addPaper(buildingGraphQueue[0]);
+                setBuildingGraphQueue((current) => current.slice(1));
+              }}
             />
           ) : <>
           {addMode === "choose" && <div className="add-choices">
@@ -411,6 +458,7 @@ export default function Home() {
             <button className="drop-zone" onClick={() => fileInput.current?.click()} onDragOver={(event) => event.preventDefault()} onDrop={onDrop} disabled={uploading}>
               <span><Icon name="upload" size={25}/></span><strong>{uploading ? "Uploading and reading…" : "Choose a PDF or drag it here"}</strong><small>PDF files up to the backend’s configured limit</small>
             </button>
+            {uploading && <button className="cancel-ingest" onClick={cancelUpload}>Cancel</button>}
             <input ref={fileInput} className="hidden-input" type="file" accept="application/pdf,.pdf" onChange={(event: ChangeEvent<HTMLInputElement>) => void handleFile(event.target.files?.[0])}/>
             {uploadError && <p className="form-error">{uploadError}</p>}
           </div>}
@@ -419,7 +467,13 @@ export default function Home() {
             <button className="back-button" onClick={() => setAddMode("choose")}>← Back</button>
             <form onSubmit={runSearch}><Icon name="search" size={18}/><input autoFocus value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Search by title, author, or topic…"/><button disabled={searchQuery.trim().length < 2 || searching}>{searching ? "Searching…" : "Search"}</button></form>
             {searchError && <p className="form-error">{searchError}</p>}
-            <div className="search-results">{searchResults.map((result) => <article key={result.id}><div><span>arXiv</span><small>{result.published}</small></div><h3>{result.title}</h3><p>{result.authors}</p><button disabled={Boolean(ingestingId)} onClick={() => void addArxivPaper(result)}>{ingestingId === result.id ? "Reading…" : "Add to chat"}</button></article>)}</div>
+            <div className="search-results">{searchResults.map((result) => {
+              const isIngesting = ingestingIds.has(result.id);
+              return <article key={result.id}><div><span>arXiv</span><small>{result.published}</small></div><h3>{result.title}</h3><p>{result.authors}</p>
+                {isIngesting ? <div className="ingest-progress"><span>Reading…</span><button className="cancel-ingest" onClick={() => cancelArxivIngest(result.id)}>Cancel</button></div>
+                  : <button onClick={() => void addArxivPaper(result)}>Add to chat</button>}
+              </article>;
+            })}</div>
           </div>}
           </>}
         </section>

@@ -48,9 +48,9 @@ export async function askAssistant(
   };
 }
 
-export async function uploadPaper(file: File): Promise<PaperIngestResult> {
+export async function uploadPaper(file: File, signal?: AbortSignal): Promise<PaperIngestResult> {
   if (!API_URL) throw new Error("NEXT_PUBLIC_API_URL is not configured");
-  const tokenResponse = await fetch("/api/papers/upload-token", { method: "POST" });
+  const tokenResponse = await fetch("/api/papers/upload-token", { method: "POST", signal });
   const tokenData = await tokenResponse.json() as { token?: string; max_bytes?: number; error?: string };
   if (!tokenResponse.ok || !tokenData.token) {
     throw new Error(tokenData.error ?? "Could not authorize the upload");
@@ -65,13 +65,14 @@ export async function uploadPaper(file: File): Promise<PaperIngestResult> {
     method: "POST",
     headers: { "X-Upload-Token": tokenData.token },
     body,
+    signal,
   });
   const data = await response.json() as PaperIngestResult & { detail?: string };
   if (!response.ok) throw new Error(data.detail ?? `Paper upload failed (${response.status})`);
   return data;
 }
 
-export async function ingestArxivPaper(paper: PaperSearchResult): Promise<PaperIngestResult> {
+export async function ingestArxivPaper(paper: PaperSearchResult, signal?: AbortSignal): Promise<PaperIngestResult> {
   const response = await fetch("/api/papers/arxiv", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -82,6 +83,7 @@ export async function ingestArxivPaper(paper: PaperSearchResult): Promise<PaperI
       abstract: paper.abstract,
       pdfUrl: paper.pdfUrl,
     }),
+    signal,
   });
   const data = await response.json() as PaperIngestResult & { error?: string };
   if (!response.ok) throw new Error(data.error ?? "Could not ingest the arXiv paper");
