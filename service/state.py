@@ -23,7 +23,7 @@ from agent.query_agent import QueryAgent
 from agent.research_store import ResearchStore
 from agent.retrieval import ChunkIndex, LocalHashingEmbedder
 from agent.text_utils import entity_embedding_text
-from service.storage import PaperStore, UploadTokenStore
+from service.storage import PaperStore, SessionStore, UploadTokenStore
 
 
 @dataclass
@@ -39,6 +39,7 @@ class AppState:
     upload_root: str
     paper_store: PaperStore
     upload_tokens: UploadTokenStore
+    session_store: SessionStore
     _embedder: LocalHashingEmbedder | None = None
 
     def __post_init__(self) -> None:
@@ -102,4 +103,5 @@ def build_state() -> AppState:
         upload_root=upload_root,
         paper_store=PaperStore(db),
         upload_tokens=UploadTokenStore(db),
+        session_store=SessionStore(db),
     )

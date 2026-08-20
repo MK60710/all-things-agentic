@@ -8,7 +8,7 @@ from collections.abc import Iterable
 from pathlib import Path
 
 import requests
-from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, UploadFile
 
 from service.deps import get_state, require_api_key
 from service.schemas import (
@@ -173,8 +173,14 @@ def _authorize_upload(state: AppState, *, x_api_key: str, x_upload_token: str) -
 
 
 @router.get("", response_model=list[PaperMetadata], dependencies=[Depends(require_api_key)])
-def list_papers(state: AppState = Depends(get_state)) -> list[PaperMetadata]:
-    return [PaperMetadata.model_validate(item) for item in state.paper_store.list()]
+def list_papers(
+    session_id: str | None = Query(default=None),
+    state: AppState = Depends(get_state),
+) -> list[PaperMetadata]:
+    papers = state.paper_store.list()
+    if session_id is not None:
+        papers = [p for p in papers if p.get("session_id") == session_id]
+    return [PaperMetadata.model_validate(item) for item in papers]
 
 
 @router.post(

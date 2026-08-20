@@ -19,7 +19,7 @@ from agent.schema import Node, NodeType
 from service.app import app
 from service.deps import get_state
 from service.state import AppState
-from service.storage import PaperStore, UploadTokenStore
+from service.storage import PaperStore, SessionStore, UploadTokenStore
 
 
 @pytest.fixture
@@ -45,6 +45,7 @@ def app_state(fake_db, tmp_path) -> AppState:
         upload_root=str(tmp_path),
         paper_store=PaperStore(fake_db),
         upload_tokens=UploadTokenStore(fake_db),
+        session_store=SessionStore(fake_db),
     )
 
 
@@ -83,8 +84,47 @@ def test_clarifications_404_for_unknown_id(client):
     assert client.get("/clarifications/does-not-exist").status_code == 404
 
 
+def test_clarifications_session_filter_excludes_a_different_sessions_question(
+    client, app_state
+):
+    """With named sessions coexisting, an entity-merge question created by
+    one session's ingest must not surface to a different session - it's
+    ambiguity about that session's own data, not a shared prompt."""
+    candidate = Node(id="candidate-node", type=NodeType.CONCEPT, name="Existing Concept")
+    app_state.graph.add_node(candidate)
+    provisional = Node(
+        id="provisional-node",
+        type=NodeType.CONCEPT,
+        name="New Concept",
+        session_id="session-a",
+    )
+    app_state.graph.add_node(provisional)
+    app_state.clarification.register_entity_merge_question(
+        provisional_node_id=provisional.id,
+        entity_name="New Concept",
+        candidate_node_id=candidate.id,
+        candidate_name="Existing Concept",
+    )
+
+    assert client.get("/clarifications", params={"session_id": "session-b"}).json() == []
+    same_session = client.get("/clarifications", params={"session_id": "session-a"}).json()
+    assert len(same_session) == 1
+    assert len(client.get("/clarifications").json()) == 1  # unscoped call still returns it
+
+
 def test_gaps_empty_graph(client):
     assert client.get("/gaps").json() == []
+
+
+def test_sessions_create_and_list_round_trip(client):
+    response = client.post("/sessions", json={"name": "AI session"})
+    assert response.status_code == 200
+    created = response.json()
+    assert created["name"] == "AI session"
+    assert created["id"]
+
+    listed = client.get("/sessions").json()
+    assert any(s["id"] == created["id"] and s["name"] == "AI session" for s in listed)
 
 
 def test_query_feedback_accepts_and_returns_no_content(client):
@@ -384,6 +424,21 @@ def test_arxiv_ingest_persists_the_given_session_id(client, app_state, monkeypat
         p for p in app_state.paper_store.list() if p["id"] == "arxiv-2101.00001"
     )
     assert saved["session_id"] == "session-xyz"
+
+
+def test_papers_list_filters_by_session_id(client, app_state):
+    app_state.paper_store.save(
+        "paper-a", title="Paper A", status="ready", session_id="session-a"
+    )
+    app_state.paper_store.save(
+        "paper-b", title="Paper B", status="ready", session_id="session-b"
+    )
+
+    response = client.get("/papers", params={"session_id": "session-a"})
+
+    assert response.status_code == 200
+    ids = {p["id"] for p in response.json()}
+    assert ids == {"paper-a"}
 
 
 def test_papers_upload_rejects_path_traversal_in_paper_id(client, app_state, tmp_path):

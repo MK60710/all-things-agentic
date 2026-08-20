@@ -66,3 +66,21 @@ class PaperStore:
     def list(self) -> list[dict[str, Any]]:
         papers = [snapshot.to_dict() for snapshot in self._collection.stream()]
         return sorted(papers, key=lambda paper: str(paper.get("updated_at", "")), reverse=True)
+
+
+class SessionStore:
+    def __init__(self, db_client: Any) -> None:
+        self._collection = db_client.collection("sessions")
+
+    def save(self, session_id: str, **values: Any) -> dict[str, Any]:
+        data = {
+            "id": session_id,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            **values,
+        }
+        self._collection.document(session_id).set(data, merge=True)
+        return data
+
+    def list(self) -> list[dict[str, Any]]:
+        sessions = [snapshot.to_dict() for snapshot in self._collection.stream()]
+        return sorted(sessions, key=lambda session: str(session.get("updated_at", "")), reverse=True)
