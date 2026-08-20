@@ -28,6 +28,10 @@ interface Message {
   candidates?: QueryResponse["candidates"];
   notice?: boolean;
   clarification?: PendingQuestion;
+  // Set instead of `clarification` when more than one question arrives in
+  // the same checkGuidance() pass - rendered as one compact batched card
+  // instead of N full message bubbles.
+  clarifications?: PendingQuestion[];
   gaps?: GapCandidate[];
   feedbackGiven?: boolean;
 }
@@ -115,6 +119,7 @@ export default function Home() {
         // sitting in the restored conversation.
         restoredMessages.forEach((message) => {
           if (message.clarification) shownClarificationIds.current.add(message.clarification.id);
+          message.clarifications?.forEach((q) => shownClarificationIds.current.add(q.id));
           message.gaps?.forEach((candidate) => shownGapKeys.current.add(gapKey(candidate)));
         });
         setMessages(restoredMessages);
@@ -140,10 +145,18 @@ export default function Home() {
       const questions = await listClarifications();
       const fresh = questions.filter((q) => q.status === "open" && !shownClarificationIds.current.has(q.id));
       fresh.forEach((q) => shownClarificationIds.current.add(q.id));
-      if (fresh.length) {
+      if (fresh.length === 1) {
         setMessages((current) => [
           ...current,
-          ...fresh.map((clarification) => ({ id: crypto.randomUUID(), role: "assistant" as const, text: "", notice: true, clarification })),
+          { id: crypto.randomUUID(), role: "assistant" as const, text: "", notice: true, clarification: fresh[0] },
+        ]);
+      } else if (fresh.length > 1) {
+        // More than one at once reads as a wall of doubt-cards, not a
+        // partner asking a smart question - one compact batched card
+        // instead of N full message bubbles.
+        setMessages((current) => [
+          ...current,
+          { id: crypto.randomUUID(), role: "assistant" as const, text: "", notice: true, clarifications: fresh },
         ]);
       }
     } catch {
@@ -167,7 +180,13 @@ export default function Home() {
   async function answerClarificationQuestion(messageId: string, question: PendingQuestion, optionId: string) {
     try {
       const answered = await answerClarification(question.id, optionId);
-      setMessages((current) => current.map((m) => (m.id === messageId ? { ...m, clarification: answered } : m)));
+      setMessages((current) => current.map((m) => {
+        if (m.id !== messageId) return m;
+        if (m.clarifications) {
+          return { ...m, clarifications: m.clarifications.map((q) => (q.id === answered.id ? answered : q)) };
+        }
+        return { ...m, clarification: answered };
+      }));
     } catch (error) {
       setMessages((current) => [...current, {
         id: crypto.randomUUID(),
@@ -402,6 +421,19 @@ export default function Home() {
                           {message.clarification.options.map((option) => <button key={option.id} onClick={() => answerClarificationQuestion(message.id, message.clarification!, option.id)}>{option.label}</button>)}
                         </div>
                       )}
+                    </div>}
+                    {message.clarifications && message.clarifications.length > 0 && <div className="clarification-batch">
+                      <small>{message.clarifications.length} entities might be duplicates</small>
+                      {message.clarifications.map((question) => <div key={question.id} className="clarification-row">
+                        <p>{question.question}</p>
+                        {question.status === "answered" ? (
+                          <small>Answered: {question.options.find((opt) => opt.id === question.answer_option_id)?.label ?? question.answer_option_id}</small>
+                        ) : (
+                          <div className="clarification-options">
+                            {question.options.map((option) => <button key={option.id} onClick={() => answerClarificationQuestion(message.id, question, option.id)}>{option.label}</button>)}
+                          </div>
+                        )}
+                      </div>)}
                     </div>}
                     {visibleGaps && visibleGaps.length > 0 && <div className="gap-suggestions">
                       {visibleGaps.map((candidate) => <div key={gapKey(candidate)} className="gap-chip">
