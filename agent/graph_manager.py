@@ -549,6 +549,7 @@ class GraphManager:
         paper_name: str | None = None,
         embedding_fn: Callable[[ExtractedEntity], list[float] | None] | None = None,
         clarification: "ClarificationOrchestrator | None" = None,
+        session_id: str | None = None,
     ) -> GraphIngestionReport:
         """Persist structured extraction output with stable, retry-safe IDs.
 
@@ -567,11 +568,24 @@ class GraphManager:
         profile (see service/state.py) - revisit if that profile changes.
         """
 
+        paper_node_id = self._stable_paper_node_id(extraction.paper_id)
+        # A paper's node id is deterministic from paper_id alone (see
+        # _stable_paper_node_id) - re-ingesting the same paper_id (e.g. the
+        # same arXiv id added in a second session) must not reassign the
+        # paper node to the later session, same "only tag if genuinely
+        # new" rule apply_extraction_result already applies to entity
+        # nodes below via canonicalize's auto_merge branch.
+        existing_paper_node = self.graph.nodes.get(paper_node_id)
         paper_node = Node(
-            id=self._stable_paper_node_id(extraction.paper_id),
+            id=paper_node_id,
             type=NodeType.PAPER,
             name=paper_name or extraction.paper_id,
             description="Source paper",
+            session_id=(
+                existing_paper_node.get("session_id")
+                if existing_paper_node is not None
+                else session_id
+            ),
         )
         self.add_node(paper_node)
 
@@ -610,6 +624,7 @@ class GraphManager:
                         name=entity.name,
                         description=entity.description,
                         entity_embedding=embedding,
+                        session_id=session_id,
                     )
                 )
                 reused = False
@@ -663,12 +678,14 @@ class GraphManager:
                     relation.source_entity,
                     relation.source_type,
                     entity_to_node_id,
+                    session_id=session_id,
                 )
                 target_id = self._resolve_relation_endpoint(
                     extraction.paper_id,
                     relation.target_entity,
                     relation.target_type,
                     entity_to_node_id,
+                    session_id=session_id,
                 )
             except ValueError:
                 # An untyped relation endpoint whose name matches more than
@@ -688,14 +705,19 @@ class GraphManager:
                     exc_info=True,
                 )
                 continue
+            edge_id = self._stable_edge_id(
+                extraction.paper_id,
+                source_id,
+                target_id,
+                relation.relation,
+                relation.source_quote,
+            )
+            # Deterministic edge id, same re-ingest-collision reasoning as
+            # the paper node above - preserve whichever session's edge
+            # this already is rather than reassigning it.
+            existing_edge = self.graph.get_edge_data(source_id, target_id, key=edge_id)
             edge = Edge(
-                id=self._stable_edge_id(
-                    extraction.paper_id,
-                    source_id,
-                    target_id,
-                    relation.relation,
-                    relation.source_quote,
-                ),
+                id=edge_id,
                 source_id=source_id,
                 target_id=target_id,
                 type=relation.relation,
@@ -703,6 +725,11 @@ class GraphManager:
                 source_paper_id=extraction.paper_id,
                 source_section=relation.source_section,
                 source_quote=relation.source_quote,
+                session_id=(
+                    existing_edge.get("session_id")
+                    if existing_edge is not None
+                    else session_id
+                ),
             )
             self.add_edge(edge)
             edge_writes.append(
@@ -728,6 +755,8 @@ class GraphManager:
         name: str,
         node_type: NodeType | None,
         entity_to_node_id: dict[tuple[str, NodeType], str],
+        *,
+        session_id: str | None = None,
     ) -> str:
         normalized = _normalize_name(name)
         if node_type is not None:
@@ -759,6 +788,7 @@ class GraphManager:
                 type=resolved_type,
                 name=name,
                 description="Implicit relation endpoint from extraction",
+                session_id=session_id,
             )
         )
         entity_to_node_id[(normalized, resolved_type)] = node_id
