@@ -43,6 +43,16 @@ export default function GraphBuildAnimation({
   const [nodes, setNodes] = useState<GraphNode[]>([]);
   const [links, setLinks] = useState<GraphLink[]>([]);
   const [status, setStatus] = useState("Reading the paper...");
+  const [size, setSize] = useState({ width: 520, height: 280 });
+
+  useEffect(() => {
+    function measure() {
+      setSize({ width: Math.max(320, window.innerWidth - 120), height: Math.max(280, window.innerHeight - 260) });
+    }
+    measure();
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
+  }, []);
   const revealedNodeIds = useRef<Set<string>>(new Set());
 
   useEffect(() => {
@@ -96,20 +106,18 @@ export default function GraphBuildAnimation({
     <div className="graph-build">
       <ForceGraph2D
         graphData={{ nodes, links }}
-        width={520}
-        height={280}
+        width={size.width}
+        height={size.height}
         nodeLabel="name"
         nodeColor={(node: object) => {
           const { reused, type } = node as GraphNode;
           return reused ? "#efedfb" : TYPE_COLORS[type ?? ""] ?? DEFAULT_NODE_COLOR;
         }}
-        nodeRelSize={5}
+        nodeRelSize={7}
         linkColor={() => "#d7d2de"}
         linkDirectionalParticles={1}
         linkDirectionalParticleWidth={2}
         cooldownTicks={80}
-        enableZoomInteraction={false}
-        enablePanInteraction={false}
       />
       <p className="graph-build-status">{status}</p>
     </div>
