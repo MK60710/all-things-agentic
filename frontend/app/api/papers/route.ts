@@ -8,12 +8,12 @@ export async function GET(request: NextRequest) {
   const sessionId = request.nextUrl.searchParams.get("session_id");
   const query = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : "";
   try {
-    const response = await fetch(`${apiUrl.replace(/\/$/, "")}/clarifications${query}`, {
+    const response = await fetch(`${apiUrl.replace(/\/$/, "")}/papers${query}`, {
       headers: process.env.API_SHARED_SECRET ? { "X-API-Key": process.env.API_SHARED_SECRET } : {},
       cache: "no-store",
     });
     const data = await response.json();
-    return NextResponse.json(response.ok ? data : { error: data.detail ?? "Could not load clarifications" }, { status: response.status });
+    return NextResponse.json(response.ok ? data : { error: data.detail ?? "Could not load papers" }, { status: response.status });
   } catch (error) {
     return NextResponse.json({ error: error instanceof Error ? error.message : "Backend unavailable" }, { status: 502 });
   }

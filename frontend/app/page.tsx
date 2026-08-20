@@ -4,15 +4,18 @@ import { ChangeEvent, DragEvent, FormEvent, useEffect, useRef, useState } from "
 import {
   answerClarification,
   askAssistant,
+  createSession,
   ingestArxivPaper,
   listClarifications,
   listGaps,
+  listPapersForSession,
+  listSessions,
   recordGapFeedback,
   recordQueryFeedback,
   searchPapers,
   uploadPaper,
 } from "@/lib/api";
-import type { ChatHistoryItem, PaperContext, PaperIngestResult, PaperSearchResult } from "@/lib/api";
+import type { ChatHistoryItem, PaperContext, PaperIngestResult, PaperSearchResult, SessionMetadata } from "@/lib/api";
 import type { Citation, GapCandidate, PendingQuestion, QueryResponse } from "@/lib/types";
 import GraphBuildAnimation from "./GraphBuildAnimation";
 
@@ -92,36 +95,60 @@ export default function Home() {
   const shownClarificationIds = useRef<Set<string>>(new Set());
   const shownGapKeys = useRef<Set<string>>(new Set());
   // Tags every ingest write server-side (scripts/clear_session.py can then
-  // clear exactly this session's papers/nodes/edges) - not displayed, just
-  // sent with every ingest request. A ref, not state: nothing renders off
-  // it, only requests read it.
+  // clear exactly this session's papers/nodes/edges) and scopes chat/
+  // clarifications to this session - not displayed itself, currentSession
+  // is the display copy. A ref because requests read it synchronously
+  // between renders; a plain state field would risk a stale closure.
   const sessionIdRef = useRef<string>("");
+  const [currentSession, setCurrentSession] = useState<SessionMetadata | null>(null);
+  const [sessions, setSessions] = useState<SessionMetadata[]>([]);
+  const [sessionMenuOpen, setSessionMenuOpen] = useState(false);
 
   useEffect(() => { chatEnd.current?.scrollIntoView({ behavior: "smooth" }); }, [messages, loading]);
   // Conversation history is otherwise plain React state - a refresh meant
   // literally starting over, the opposite of "persistent memory... instead
   // of starting over each time".
   useEffect(() => {
-    window.localStorage.setItem("atlas-messages", JSON.stringify(messages));
+    // Guard against the pre-init render (sessionIdRef not set yet) writing
+    // an empty array under a bogus key - initSession/switchToSession below
+    // are what actually load a session's messages.
+    if (!sessionIdRef.current) return;
+    window.localStorage.setItem(`atlas-messages-${sessionIdRef.current}`, JSON.stringify(messages));
   }, [messages]);
-  useEffect(() => {
-    const savedSessionId = window.localStorage.getItem("atlas-session-id");
-    if (savedSessionId) {
-      sessionIdRef.current = savedSessionId;
-    } else {
-      sessionIdRef.current = crypto.randomUUID();
-      window.localStorage.setItem("atlas-session-id", sessionIdRef.current);
+  useEffect(() => { void initSession(); }, []);
+
+  async function initSession() {
+    let resolved: SessionMetadata | null = null;
+    try {
+      const list = await listSessions();
+      setSessions(list);
+      const savedId = window.localStorage.getItem("atlas-session-id");
+      resolved = list.find((s) => s.id === savedId) ?? list[0] ?? null;
+      if (!resolved) {
+        resolved = await createSession("Untitled session");
+        setSessions((current) => [resolved!, ...current]);
+      }
+    } catch {
+      // Backend unreachable at startup - fall back to a purely local
+      // session id so the app still works; ingest calls just carry it.
+      const fallbackId = window.localStorage.getItem("atlas-session-id") ?? crypto.randomUUID();
+      resolved = { id: fallbackId, name: "Untitled session", created_at: new Date().toISOString() };
     }
-    const savedPapers = window.localStorage.getItem("atlas-session-papers");
-    let restoredPapers: PaperContext[] = [];
-    if (savedPapers) {
-      try {
-        restoredPapers = JSON.parse(savedPapers) as PaperContext[];
-        setPapers(restoredPapers);
-      } catch { window.localStorage.removeItem("atlas-session-papers"); }
-    }
-    const savedMessages = window.localStorage.getItem("atlas-messages");
+    await switchToSession(resolved);
+  }
+
+  async function switchToSession(session: SessionMetadata) {
+    sessionIdRef.current = session.id;
+    window.localStorage.setItem("atlas-session-id", session.id);
+    setCurrentSession(session);
+    setSessionMenuOpen(false);
+    setBuildingGraphQueue([]);
+    setDismissedGapKeys(new Set());
+
+    const savedMessages = window.localStorage.getItem(`atlas-messages-${session.id}`);
     let restoredMessages: Message[] = [];
+    const freshClarificationIds = new Set<string>();
+    const freshGapKeys = new Set<string>();
     if (savedMessages) {
       try {
         restoredMessages = JSON.parse(savedMessages) as Message[];
@@ -130,31 +157,62 @@ export default function Home() {
         // below doesn't re-post a clarification/gap card that's already
         // sitting in the restored conversation.
         restoredMessages.forEach((message) => {
-          if (message.clarification) shownClarificationIds.current.add(message.clarification.id);
-          message.clarifications?.forEach((q) => shownClarificationIds.current.add(q.id));
-          message.gaps?.forEach((candidate) => shownGapKeys.current.add(gapKey(candidate)));
+          if (message.clarification) freshClarificationIds.add(message.clarification.id);
+          message.clarifications?.forEach((q) => freshClarificationIds.add(q.id));
+          message.gaps?.forEach((candidate) => freshGapKeys.add(gapKey(candidate)));
         });
-        setMessages(restoredMessages);
-      } catch { window.localStorage.removeItem("atlas-messages"); }
+      } catch { window.localStorage.removeItem(`atlas-messages-${session.id}`); }
     }
-    composerInput.current?.focus();
+    shownClarificationIds.current = freshClarificationIds;
+    shownGapKeys.current = freshGapKeys;
+    setMessages(restoredMessages);
+    setPapers([]);
+
+    try {
+      setPapers(await listPapersForSession(session.id));
+    } catch (error) {
+      setMessages((current) => [...current, {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        text: error instanceof Error ? error.message : "Could not load this session's papers.",
+        notice: true,
+      }]);
+    }
+
+    window.setTimeout(() => composerInput.current?.focus(), 50);
     // A genuinely fresh session - nothing added, nothing asked yet - should
     // start clean. Surfacing corpus-wide gap suggestions before the user
     // has engaged with anything is confusing, not helpful; proactive
     // guidance only makes sense once there's something to be guided about.
     // addPaper() already runs checkGuidance() for the "just added a paper"
-    // case; this only covers the "returning to an existing session" case.
-    if (restoredPapers.length > 0 || restoredMessages.length > 0) {
-      void checkGuidance();
+    // case; this only covers "returning to a session with history" here.
+    if (restoredMessages.length > 0) void checkGuidance();
+  }
+
+  async function createAndSwitchToNewSession() {
+    const name = window.prompt("Name this session:", "")?.trim();
+    if (!name) return;
+    setSessionMenuOpen(false);
+    try {
+      const created = await createSession(name);
+      setSessions((current) => [created, ...current]);
+      await switchToSession(created);
+    } catch (error) {
+      setMessages((current) => [...current, {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        text: error instanceof Error ? error.message : "Could not create the session.",
+        notice: true,
+      }]);
     }
-  }, []);
+  }
 
   // Proactive, unsolicited content: a missing suggestion is fine, an error
   // toast for something the user didn't ask for is not - both halves fail
   // silently and independently.
   async function checkGuidance() {
     try {
-      const questions = await listClarifications();
+      const questions = await listClarifications(sessionIdRef.current || undefined);
       const fresh = questions.filter((q) => q.status === "open" && !shownClarificationIds.current.has(q.id));
       fresh.forEach((q) => shownClarificationIds.current.add(q.id));
       if (fresh.length === 1) {
@@ -301,12 +359,10 @@ export default function Home() {
   }
 
   function addPaper(nextPaper: PaperContext) {
-    setPapers((current) => {
-      if (current.some((existing) => existing.id === nextPaper.id)) return current;
-      const updated = [...current, nextPaper];
-      window.localStorage.setItem("atlas-session-papers", JSON.stringify(updated));
-      return updated;
-    });
+    // Papers are sourced from the backend per session (listPapersForSession)
+    // now, not localStorage - this is just the optimistic local update for
+    // the paper the backend just confirmed ingesting into sessionIdRef.current.
+    setPapers((current) => (current.some((existing) => existing.id === nextPaper.id) ? current : [...current, nextPaper]));
     setMessages((current) => [...current, { id: crypto.randomUUID(), role: "assistant", text: `I've added "${nextPaper.title}" to this conversation. Ask me to summarize it, explain a section, or examine its evidence.`, notice: true }]);
     setAddOpen(false);
     setAddMode("choose");
@@ -314,30 +370,15 @@ export default function Home() {
     void checkGuidance();
   }
 
-  function startNewSession() {
-    // Local-only reset: clears this browser's chat/working set and starts
-    // tagging future ingests with a new session id. Nothing already in
-    // the shared graph is deleted - that's a separate, explicit cleanup
-    // step (scripts/clear_session.py), not a side effect of this button.
-    if (!window.confirm("Start a new session? This clears the chat and added papers shown here. Nothing already added to the shared graph is deleted.")) return;
-    sessionIdRef.current = crypto.randomUUID();
-    window.localStorage.setItem("atlas-session-id", sessionIdRef.current);
-    window.localStorage.removeItem("atlas-session-papers");
-    window.localStorage.removeItem("atlas-messages");
-    shownClarificationIds.current = new Set();
-    shownGapKeys.current = new Set();
-    setDismissedGapKeys(new Set());
-    setPapers([]);
-    setMessages([]);
-    setBuildingGraphQueue([]);
-    window.setTimeout(() => composerInput.current?.focus(), 50);
-  }
-
   function removePaperFromSet(paperId: string) {
+    // Scopes this browser's working set only (which papers /chat sends as
+    // paper_ids) - the paper stays tagged to this session server-side, so
+    // switching away and back to this same session currently re-shows it.
+    // A per-paper "hidden" preference that survives a switch is a real gap,
+    // just not one this pass solves.
     setPapers((current) => {
       const removed = current.find((existing) => existing.id === paperId);
       const updated = current.filter((existing) => existing.id !== paperId);
-      window.localStorage.setItem("atlas-session-papers", JSON.stringify(updated));
       setMessages((currentMessages) => [...currentMessages, { id: crypto.randomUUID(), role: "assistant", text: `Removed${removed ? `: "${removed.title}"` : ""} from this conversation.${updated.length === 0 ? " We're back to searching everything." : ""}`, notice: true }]);
       return updated;
     });
@@ -404,7 +445,22 @@ export default function Home() {
           ) : <><span className="online-dot"/><strong>General chat</strong><small>Gemini</small></>}
         </div>
         <div className="header-actions">
-          <button className="new-session-button" onClick={startNewSession}>New session</button>
+          <div className="session-switcher">
+            <button className="session-switcher-toggle" onClick={() => setSessionMenuOpen((open) => !open)}>
+              <span>{currentSession?.name ?? "Session"}</span>
+            </button>
+            {sessionMenuOpen && <div className="session-menu">
+              <button className="session-menu-new" onClick={() => void createAndSwitchToNewSession()}><Icon name="plus" size={13}/>New session</button>
+              {sessions.map((s) => <button
+                key={s.id}
+                className={`session-menu-item${s.id === currentSession?.id ? " active" : ""}`}
+                onClick={() => void switchToSession(s)}
+              >
+                <strong>{s.name}</strong>
+                <small>{new Date(s.created_at).toLocaleDateString()}</small>
+              </button>)}
+            </div>}
+          </div>
           <button className="add-paper-button" onClick={() => openAddPaper()}><Icon name="plus" size={17}/>{papers.length ? "Add another" : "Add paper"}</button>
         </div>
       </header>

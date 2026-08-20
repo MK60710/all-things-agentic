@@ -24,6 +24,49 @@ export interface PaperIngestResult extends PaperContext {
   new_edges: GraphVizEdge[];
 }
 
+export interface SessionMetadata {
+  id: string;
+  name: string;
+  created_at: string;
+}
+
+export async function createSession(name: string): Promise<SessionMetadata> {
+  const response = await fetch("/api/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+  const data = await response.json() as SessionMetadata & { error?: string };
+  if (!response.ok) throw new Error(data.error ?? "Could not create the session");
+  return data;
+}
+
+export async function listSessions(): Promise<SessionMetadata[]> {
+  const response = await fetch("/api/sessions");
+  const data = await response.json() as SessionMetadata[] & { error?: string };
+  if (!response.ok) throw new Error((data as unknown as { error?: string }).error ?? "Could not load sessions");
+  return data;
+}
+
+export async function listPapersForSession(sessionId: string): Promise<PaperContext[]> {
+  const response = await fetch(`/api/papers?session_id=${encodeURIComponent(sessionId)}`);
+  const data = await response.json() as Array<{
+    id: string;
+    title: string;
+    authors?: string;
+    abstract?: string;
+    pdf_url?: string;
+  }> & { error?: string };
+  if (!response.ok) throw new Error((data as unknown as { error?: string }).error ?? "Could not load this session's papers");
+  return data.map((paper) => ({
+    id: paper.id,
+    title: paper.title,
+    authors: paper.authors,
+    abstract: paper.abstract,
+    pdfUrl: paper.pdf_url,
+  }));
+}
+
 export async function askAssistant(
   message: string,
   history: ChatHistoryItem[],
@@ -107,8 +150,9 @@ export async function searchPapers(query: string): Promise<PaperSearchResult[]> 
   return data.papers;
 }
 
-export async function listClarifications(): Promise<PendingQuestion[]> {
-  const response = await fetch("/api/clarifications");
+export async function listClarifications(sessionId?: string): Promise<PendingQuestion[]> {
+  const query = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : "";
+  const response = await fetch(`/api/clarifications${query}`);
   if (!response.ok) throw new Error("Could not load clarifications");
   return await response.json() as PendingQuestion[];
 }
