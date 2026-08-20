@@ -12,6 +12,7 @@ import logging
 import math
 import re
 import threading
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
@@ -58,7 +59,33 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
 
 
 def _normalize_name(name: str) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
+    # NFKC first: folds Unicode compatibility variants (e.g. the
+    # Mathematical Alphanumeric Symbols block - "𝑄" U+1D444 italic-math
+    # capital Q) down to their plain ASCII letters before the regex strips
+    # anything outside literal a-z0-9. Without this, an entity name that
+    # differs from an existing node only by a math-italic codepoint drops
+    # that codepoint entirely instead of matching it, missing the exact-
+    # match tier and landing in the fuzzy needs_clarification band instead.
+    normalized = unicodedata.normalize("NFKC", name)
+    return re.sub(r"[^a-z0-9]+", " ", normalized.lower()).strip()
+
+
+_ABBREVIATION_RE = re.compile(r"^(.+?)\s*\(([^()]+)\)$")
+
+
+def _abbreviation_of(name: str) -> str | None:
+    """If `name` is "Full Form (Abbrev)", return normalize(Abbrev) - the
+    bare-abbreviation side of the pair. Used only to auto-match a spelled-
+    out name against another entity whose name IS that bare abbreviation
+    (e.g. "moral ODD" against "moral operational design domain (moral
+    ODD)"). Deliberately not used to match two parenthetical forms against
+    each other - two names that each carry their own distinguishing prefix
+    (e.g. "explicit moral ODD (...)" vs "moral ODD (...)") stay a real
+    needs_clarification question instead of being silently merged."""
+    match = _ABBREVIATION_RE.match(name.strip())
+    if match is None:
+        return None
+    return _normalize_name(match.group(2))
 
 
 @dataclass
@@ -463,13 +490,35 @@ class GraphManager:
         """
         with self._lock:
             normalized = _normalize_name(name)
+            new_abbreviation = _abbreviation_of(name)
+            abbreviation_matches: list[str] = []
             for node_id, data in self.graph.nodes(data=True):
                 if node_type is not None and data.get("type") != node_type.value:
                     continue
                 if self._is_merged_alias(node_id):
                     continue
-                if _normalize_name(data.get("name", "")) == normalized:
+                existing_name = data.get("name", "")
+                if _normalize_name(existing_name) == normalized:
                     return CanonicalizationResult("auto_merge", node_id, 1.0)
+                # Bare-abbreviation match: one side is exactly "Full Form
+                # (Abbrev)" and the other is exactly "Abbrev" - as strong a
+                # signal as the exact-string match above. Collected rather
+                # than returned immediately: if the abbreviation happens to
+                # be shared by more than one differently-qualified existing
+                # name (e.g. "moral ODD" abbreviates both "moral
+                # operational design domain (moral ODD)" and "explicit
+                # moral operational design domain (moral ODD)"), which one
+                # a bare mention actually means is genuinely ambiguous and
+                # must fall through to the normal embedding-similarity /
+                # needs_clarification path below, not be silently decided
+                # by graph iteration order.
+                if new_abbreviation is not None and _normalize_name(existing_name) == new_abbreviation:
+                    abbreviation_matches.append(node_id)
+                elif normalized == _abbreviation_of(existing_name):
+                    abbreviation_matches.append(node_id)
+
+            if len(abbreviation_matches) == 1:
+                return CanonicalizationResult("auto_merge", abbreviation_matches[0], 1.0)
 
             if embedding is None:
                 return CanonicalizationResult("new")

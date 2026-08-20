@@ -185,6 +185,80 @@ def test_canonicalize_low_similarity_is_new(fake_db):
     assert result.decision == "new"
 
 
+def test_canonicalize_unicode_math_variant_auto_merges(fake_db):
+    """"𝑄" (U+1D444, Mathematical Italic Capital Q) is a different
+    codepoint than plain "Q" - without NFKC normalization it gets stripped
+    by _normalize_name entirely instead of matching, landing this pair in
+    needs_clarification instead of the exact-match auto_merge tier."""
+    gm = _make_manager(fake_db)
+    existing = _node("Cochran's Q statistic")
+    gm.add_node(existing)
+    result = gm.canonicalize("Cochran's \U0001d444 statistic")
+    assert result.decision == "auto_merge"
+    assert result.matched_node_id == existing.id
+
+
+def test_canonicalize_bare_abbreviation_matches_spelled_out_form(fake_db):
+    gm = _make_manager(fake_db)
+    existing = _node("moral operational design domain (moral ODD)")
+    gm.add_node(existing)
+    result = gm.canonicalize("moral ODD")
+    assert result.decision == "auto_merge"
+    assert result.matched_node_id == existing.id
+
+
+def test_canonicalize_spelled_out_form_matches_existing_bare_abbreviation(fake_db):
+    gm = _make_manager(fake_db)
+    existing = _node("moral ODD")
+    gm.add_node(existing)
+    result = gm.canonicalize("moral operational design domain (moral ODD)")
+    assert result.decision == "auto_merge"
+    assert result.matched_node_id == existing.id
+
+
+def test_canonicalize_does_not_match_two_differently_qualified_parenthetical_forms(
+    fake_db,
+):
+    """Two spelled-out forms that share an abbreviation but each carry
+    their own distinguishing prefix are a real judgment call, not an
+    auto-merge - this must fall through to the normal embedding path
+    rather than picking one silently."""
+    gm = _make_manager(fake_db)
+    existing = _node(
+        "explicit moral operational design domain (moral ODD)",
+        embedding=[1.0, 0.0],
+    )
+    gm.add_node(existing)
+    result = gm.canonicalize(
+        "moral operational design domain (moral ODD)", embedding=[0.0, 1.0]
+    )
+    assert result.decision == "new"
+
+
+def test_canonicalize_bare_abbreviation_ambiguous_across_two_forms_falls_through(
+    fake_db,
+):
+    """A bare abbreviation that matches more than one differently-qualified
+    spelled-out form in the graph must not be silently decided by
+    iteration order - it falls through to the embedding path like any
+    other ambiguous name."""
+    gm = _make_manager(fake_db)
+    gm.add_node(
+        _node(
+            "moral operational design domain (moral ODD)",
+            embedding=[1.0, 0.0],
+        )
+    )
+    gm.add_node(
+        _node(
+            "explicit moral operational design domain (moral ODD)",
+            embedding=[1.0, 0.0],
+        )
+    )
+    result = gm.canonicalize("moral ODD", embedding=[0.0, 1.0])
+    assert result.decision == "new"
+
+
 def test_cosine_similarity_rejects_dimension_mismatch():
     assert _cosine_similarity([1.0, 0.0, 0.0], [1.0, 0.0]) == 0.0
 
