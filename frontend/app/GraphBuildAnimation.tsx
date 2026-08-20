@@ -50,6 +50,7 @@ export default function GraphBuildAnimation({
     // then edges - both real data from this ingest, just revealed here on a
     // timer for effect rather than as one instant dump.
     const steps: Array<() => void> = [];
+    const nodeIds = new Set(newNodes.map((node) => node.node_id));
     newNodes.forEach((node) => {
       steps.push(() => {
         revealedNodeIds.current.add(node.node_id);
@@ -57,8 +58,14 @@ export default function GraphBuildAnimation({
         setStatus(node.reused_existing_node ? `Linked "${node.name}" to your graph` : `Found "${node.name}"`);
       });
     });
+    // Defense in depth: the backend guarantees every edge endpoint has a
+    // matching node (service/routers/papers.py backfills implicit relation-
+    // endpoint nodes for exactly this reason), but d3-force throws
+    // repeatedly if a link ever references a node id that isn't in the
+    // nodes array - drop any edge that doesn't have both endpoints present
+    // rather than risk that.
     newEdges
-      .filter((edge) => revealedNodeIds.current.has(edge.source_id) || newNodes.some((n) => n.node_id === edge.source_id))
+      .filter((edge) => nodeIds.has(edge.source_id) && nodeIds.has(edge.target_id))
       .forEach((edge) => {
         steps.push(() => {
           setLinks((current) => [...current, { source: edge.source_id, target: edge.target_id, relation: edge.relation }]);

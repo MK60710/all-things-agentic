@@ -110,6 +110,34 @@ def _ingest(
             )
             for write in report.graph.edge_writes
         ]
+        # _resolve_relation_endpoint (agent/graph_manager.py) can create an
+        # "implicit relation endpoint" node directly via add_node() when a
+        # relation names an entity outside the extracted entities list -
+        # that node is real and used as a real edge endpoint, but never
+        # gets a NodeWriteResult, so node_writes alone isn't a complete
+        # picture of every node this ingest touched. Backfill any edge
+        # endpoint missing from new_nodes, or the frontend's force-graph
+        # renders a link to a node it never received.
+        covered_ids = {node.node_id for node in new_nodes}
+        missing_ids = {
+            node_id
+            for edge in new_edges
+            for node_id in (edge.source_id, edge.target_id)
+            if node_id not in covered_ids
+        }
+        for node_id in missing_ids:
+            data = state.graph.graph.nodes.get(node_id)
+            if data is None:
+                continue
+            new_nodes.append(
+                GraphVizNode(
+                    node_id=node_id,
+                    name=data.get("name", node_id),
+                    type=data.get("type"),
+                    reused_existing_node=True,
+                )
+            )
+            covered_ids.add(node_id)
 
     return PaperIngestResponse(
         paper_id=paper_id,
