@@ -53,6 +53,7 @@ class ArxivIngestRequest(BaseModel):
     authors: str | None = Field(default=None, max_length=2000)
     abstract: str | None = Field(default=None, max_length=10000)
     pdf_url: str | None = Field(default=None, alias="pdfUrl")
+    session_id: str | None = Field(default=None, max_length=200)
 
 
 class PaperMetadata(BaseModel):

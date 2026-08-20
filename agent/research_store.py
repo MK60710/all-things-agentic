@@ -41,6 +41,7 @@ class ResearchStore:
             [ExtractedEntity], list[float] | None
         ] | None = None,
         clarification: "ClarificationOrchestrator | None" = None,
+        session_id: str | None = None,
     ) -> ResearchIngestionReport:
         chunk_ids = self._chunks.upsert_paper(
             extraction.paper_id,
@@ -53,6 +54,7 @@ class ResearchStore:
                 paper_name=paper_name,
                 embedding_fn=entity_embedding_fn,
                 clarification=clarification,
+                session_id=session_id,
             )
         return ResearchIngestionReport(
             paper_id=extraction.paper_id,

@@ -70,13 +70,14 @@ def _ingest(
     authors: str | None = None,
     abstract: str | None = None,
     pdf_url: str | None = None,
+    session_id: str | None = None,
 ) -> PaperIngestResponse:
     metadata = dict(title=title, authors=authors, abstract=abstract, pdf_url=pdf_url)
-    state.paper_store.save(paper_id, **metadata, status="processing")
+    state.paper_store.save(paper_id, **metadata, status="processing", session_id=session_id)
     outcome = state.extraction_agent.extract_one(paper_id, str(path), fail_closed=False)
     if outcome.result is None:
         message = outcome.issue.message if outcome.issue else "extraction failed"
-        state.paper_store.save(paper_id, **metadata, status="failed", error=message)
+        state.paper_store.save(paper_id, **metadata, status="failed", error=message, session_id=session_id)
         raise HTTPException(status_code=422, detail=message)
 
     pending_before = len(state.clarification.pending())
@@ -85,9 +86,10 @@ def _ingest(
         paper_name=title,
         entity_embedding_fn=state.entity_embedding_fn,
         clarification=state.clarification,
+        session_id=session_id,
     )
     pending_added = len(state.clarification.pending()) - pending_before
-    state.paper_store.save(paper_id, **metadata, status="ready")
+    state.paper_store.save(paper_id, **metadata, status="ready", session_id=session_id)
 
     new_nodes: list[GraphVizNode] = []
     new_edges: list[GraphVizEdge] = []
@@ -190,6 +192,7 @@ def upload_paper(
     file: UploadFile = File(...),
     paper_id: str | None = Form(default=None),
     title: str | None = Form(default=None),
+    session_id: str | None = Form(default=None),
     x_api_key: str = Header(default=""),
     x_upload_token: str = Header(default=""),
     state: AppState = Depends(get_state),
@@ -206,7 +209,7 @@ def upload_paper(
         raise HTTPException(status_code=400, detail="invalid paper_id")
     _write_pdf(dest, _file_chunks(file), max_bytes=max_bytes)
     paper_title = (title or (Path(file.filename).stem if file.filename else pid)).strip()
-    return _ingest(state, paper_id=pid, path=dest, title=paper_title or pid)
+    return _ingest(state, paper_id=pid, path=dest, title=paper_title or pid, session_id=session_id)
 
 
 @router.post(
@@ -246,4 +249,5 @@ def ingest_arxiv(body: ArxivIngestRequest, state: AppState = Depends(get_state))
         authors=body.authors,
         abstract=body.abstract,
         pdf_url=body.pdf_url or url,
+        session_id=body.session_id,
     )

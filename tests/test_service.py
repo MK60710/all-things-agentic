@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -317,6 +318,72 @@ def test_papers_upload_and_ingest(client):
     # assert the endpoint round-trips without crashing and returns one of
     # the two documented outcomes, not a specific text result.
     assert response.status_code in (200, 422)
+
+
+def test_papers_upload_persists_the_given_session_id(client, app_state, monkeypatch):
+    from agent.document_ingestion import DocumentIngestionResult
+    from agent.extraction_agent import ExtractionOutcome
+    from agent.schema import ExtractionResult
+
+    def fake_extract_one(paper_id, path, fail_closed=False):
+        return ExtractionOutcome(
+            paper_id=paper_id,
+            document=DocumentIngestionResult(
+                paper_id=paper_id, pdf_path=path, pages=[], raw_text="text", chunks=["text"]
+            ),
+            result=ExtractionResult(paper_id=paper_id, entities=[], relations=[]),
+        )
+
+    monkeypatch.setattr(app_state.extraction_agent, "extract_one", fake_extract_one)
+
+    response = client.post(
+        "/papers",
+        files={"file": ("paper.pdf", b"%PDF-1.4 fake", "application/pdf")},
+        data={"paper_id": "session-tagged-paper", "session_id": "session-xyz"},
+    )
+
+    assert response.status_code == 200
+    saved = next(p for p in app_state.paper_store.list() if p["id"] == "session-tagged-paper")
+    assert saved["session_id"] == "session-xyz"
+
+
+def test_arxiv_ingest_persists_the_given_session_id(client, app_state, monkeypatch):
+    from agent.document_ingestion import DocumentIngestionResult
+    from agent.extraction_agent import ExtractionOutcome
+    from agent.schema import ExtractionResult
+
+    def fake_extract_one(paper_id, path, fail_closed=False):
+        return ExtractionOutcome(
+            paper_id=paper_id,
+            document=DocumentIngestionResult(
+                paper_id=paper_id, pdf_path=path, pages=[], raw_text="text", chunks=["text"]
+            ),
+            result=ExtractionResult(paper_id=paper_id, entities=[], relations=[]),
+        )
+
+    monkeypatch.setattr(app_state.extraction_agent, "extract_one", fake_extract_one)
+    monkeypatch.setattr(
+        "service.routers.papers.requests.get",
+        lambda *a, **k: SimpleNamespace(
+            raise_for_status=lambda: None,
+            iter_content=lambda chunk_size=None: [b"%PDF-1.4 fake"],
+        ),
+    )
+
+    response = client.post(
+        "/papers/arxiv",
+        json={
+            "arxiv_id": "2101.00001",
+            "title": "A Session-Tagged Paper",
+            "session_id": "session-xyz",
+        },
+    )
+
+    assert response.status_code == 200
+    saved = next(
+        p for p in app_state.paper_store.list() if p["id"] == "arxiv-2101.00001"
+    )
+    assert saved["session_id"] == "session-xyz"
 
 
 def test_papers_upload_rejects_path_traversal_in_paper_id(client, app_state, tmp_path):

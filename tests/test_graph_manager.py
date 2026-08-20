@@ -360,6 +360,79 @@ def test_apply_extraction_result_is_idempotent(fake_db):
     assert second.edge_writes[0].edge_id == first.edge_writes[0].edge_id
 
 
+def test_apply_extraction_result_tags_new_nodes_and_edges_with_session_id(fake_db):
+    gm = _make_manager(fake_db)
+    extraction = ExtractionResult(
+        paper_id="paper-session-tag",
+        entities=[
+            ExtractedEntity(name="Chain of Thought", type=NodeType.CONCEPT, description=""),
+            ExtractedEntity(name="Reasoning", type=NodeType.CONCEPT, description=""),
+        ],
+        relations=[
+            ExtractedRelation(
+                source_entity="Chain of Thought",
+                relation=EdgeType.SUPPORTS,
+                target_entity="Reasoning",
+                source_quote="Chain of thought prompts can support reasoning.",
+            )
+        ],
+    )
+
+    report = gm.apply_extraction_result(
+        extraction, paper_name="Paper Title", session_id="session-a"
+    )
+
+    assert gm.graph.nodes[report.paper_node_id]["session_id"] == "session-a"
+    for write in report.node_writes:
+        assert gm.graph.nodes[write.node_id]["session_id"] == "session-a"
+    edge_write = report.edge_writes[0]
+    edge_data = gm.graph.edges[edge_write.source_id, edge_write.target_id, edge_write.edge_id]
+    assert edge_data["session_id"] == "session-a"
+
+
+def test_apply_extraction_result_reused_node_keeps_its_original_session_id(fake_db):
+    """A node created by one session and later merged into by a different
+    session's ingest must not be reassigned to the later session - that's
+    what makes per-session cleanup (scripts/clear_session.py) safe."""
+    gm = _make_manager(fake_db)
+    first = ExtractionResult(
+        paper_id="paper-one",
+        entities=[
+            ExtractedEntity(name="Chain of Thought", type=NodeType.CONCEPT, description="")
+        ],
+        relations=[],
+    )
+    gm.apply_extraction_result(first, session_id="session-a")
+
+    second = ExtractionResult(
+        paper_id="paper-two",
+        entities=[
+            ExtractedEntity(name="chain of thought", type=NodeType.CONCEPT, description="")
+        ],  # casing differs - exact-match auto_merge into the session-a node
+        relations=[],
+    )
+    report = gm.apply_extraction_result(second, session_id="session-b")
+
+    reused_node_id = report.node_writes[0].node_id
+    assert report.node_writes[0].reused_existing_node is True
+    assert gm.graph.nodes[reused_node_id]["session_id"] == "session-a"
+
+
+def test_apply_extraction_result_paper_node_reingest_keeps_original_session_id(fake_db):
+    """A paper's node id is deterministic from paper_id alone - re-ingesting
+    the same paper_id under a different session (e.g. the same arXiv id
+    added twice) must not reassign the paper node."""
+    gm = _make_manager(fake_db)
+    extraction = ExtractionResult(paper_id="paper-reingest", entities=[], relations=[])
+
+    first = gm.apply_extraction_result(
+        extraction, paper_name="Paper Title", session_id="session-a"
+    )
+    gm.apply_extraction_result(extraction, paper_name="Paper Title", session_id="session-b")
+
+    assert gm.graph.nodes[first.paper_node_id]["session_id"] == "session-a"
+
+
 def test_relation_endpoint_uses_declared_entity_type(fake_db):
     gm = _make_manager(fake_db)
     extraction = ExtractionResult(
