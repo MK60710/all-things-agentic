@@ -250,6 +250,60 @@ def test_papers_upload_backfills_implicit_relation_endpoint_nodes(
     assert "SomeImplicitModel" in names
 
 
+def test_papers_upload_auto_merges_a_bare_abbreviation_without_asking(
+    client, app_state, monkeypatch
+):
+    """Regression guard for GraphManager.canonicalize's abbreviation-in-
+    parens auto-merge (Part A2): a bare "moral ODD" extracted against an
+    already-ingested "moral operational design domain (moral ODD)" node
+    must land as a silent auto_merge through the full HTTP ingest path,
+    not raise a clarification question - this is exactly the class of
+    false-positive question that made a real ingest dump 9 of them at
+    once."""
+    from agent.document_ingestion import DocumentIngestionResult
+    from agent.extraction_agent import ExtractionOutcome
+    from agent.schema import ExtractedEntity, ExtractionResult
+
+    existing = Node(
+        id="existing-moral-odd",
+        type=NodeType.CONCEPT,
+        name="moral operational design domain (moral ODD)",
+    )
+    app_state.graph.add_node(existing)
+
+    def fake_extract_one(paper_id, path, fail_closed=False):
+        return ExtractionOutcome(
+            paper_id=paper_id,
+            document=DocumentIngestionResult(
+                paper_id=paper_id, pdf_path=path, pages=[], raw_text="text", chunks=["text"]
+            ),
+            result=ExtractionResult(
+                paper_id=paper_id,
+                entities=[
+                    ExtractedEntity(
+                        name="moral ODD", type=NodeType.CONCEPT, description="An abbreviation"
+                    )
+                ],
+                relations=[],
+            ),
+        )
+
+    monkeypatch.setattr(app_state.extraction_agent, "extract_one", fake_extract_one)
+
+    response = client.post(
+        "/papers",
+        files={"file": ("paper.pdf", b"%PDF-1.4 fake", "application/pdf")},
+        data={"paper_id": "abbreviation-test-paper"},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["pending_clarification_count"] == 0
+    assert len(data["new_nodes"]) == 1
+    assert data["new_nodes"][0]["node_id"] == existing.id
+    assert data["new_nodes"][0]["reused_existing_node"] is True
+
+
 def test_papers_upload_and_ingest(client):
     pdf_bytes = b"%PDF-1.4 fake"
     response = client.post(
