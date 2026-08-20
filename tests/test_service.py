@@ -11,6 +11,7 @@ from agent.extraction_agent import ChunkOnlyStructuredExtractor, ExtractionAgent
 from agent.gap_finder import GapFinder
 from agent.general_chat import GeneralChatAgent
 from agent.graph_manager import GraphManager
+from agent.paper_guide import GuideSection, PaperGuide, PaperGuideAgent
 from agent.query_agent import QueryAgent
 from agent.research_store import ResearchStore
 from agent.retrieval import ChunkIndex
@@ -35,6 +36,7 @@ def app_state(fake_db, tmp_path) -> AppState:
         # already use.
         query_agent=QueryAgent(chunks, graph, clarification=clarification, db_client=fake_db),
         general_chat=GeneralChatAgent(),
+        paper_guide=PaperGuideAgent(),
         gap_finder=GapFinder(graph, db_client=fake_db),
         extraction_agent=ExtractionAgent(
             document_extractor=PdfTextExtractor(allowed_root=str(tmp_path)),
@@ -330,3 +332,41 @@ def test_local_frontend_origin_is_allowed_by_cors(client):
     )
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == "http://localhost:3000"
+
+
+def test_paper_guide_covers_indexed_paper_and_is_cached(client, app_state, monkeypatch):
+    app_state.chunks.upsert_paper(
+        "guided-paper",
+        ["Introduction and motivation.", "Method and experimental results."],
+    )
+    app_state.paper_store.save("guided-paper", title="A Guided Paper", status="ready")
+    calls = []
+
+    def generate(title, chunks):
+        calls.append((title, len(chunks)))
+        return PaperGuide(
+            title=title,
+            big_picture="The paper tests a method.",
+            sections=[
+                GuideSection(
+                    title="Method",
+                    plain_language="The method is explained simply.",
+                    key_points=["One key point"],
+                    why_it_matters="It supports the result.",
+                )
+            ],
+        )
+
+    monkeypatch.setattr(app_state.paper_guide, "generate", generate)
+    first = client.post("/papers/guided-paper/guide")
+    second = client.post("/papers/guided-paper/guide")
+
+    assert first.status_code == 200
+    assert first.json()["big_picture"] == "The paper tests a method."
+    assert second.status_code == 200
+    assert calls == [("A Guided Paper", 2)]
+
+
+def test_paper_guide_returns_404_when_paper_has_no_chunks(client):
+    response = client.post("/papers/missing/guide")
+    assert response.status_code == 404
