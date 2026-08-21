@@ -441,6 +441,31 @@ def test_papers_list_filters_by_session_id(client, app_state):
     assert ids == {"paper-a"}
 
 
+def test_detach_paper_clears_session_id_and_keeps_other_fields(client, app_state):
+    app_state.paper_store.save(
+        "paper-a", title="Paper A", authors="A. Uthor", status="ready", session_id="session-a"
+    )
+
+    response = client.post("/papers/paper-a/detach")
+
+    assert response.status_code == 200
+    assert response.json()["session_id"] is None
+
+    saved = next(p for p in app_state.paper_store.list() if p["id"] == "paper-a")
+    assert saved["session_id"] is None
+    assert saved["title"] == "Paper A"
+    assert saved["authors"] == "A. Uthor"
+
+    # A subsequent session-scoped listing must no longer include it.
+    listing = client.get("/papers", params={"session_id": "session-a"}).json()
+    assert listing == []
+
+
+def test_detach_paper_404_for_unknown_paper(client):
+    response = client.post("/papers/does-not-exist/detach")
+    assert response.status_code == 404
+
+
 def test_papers_upload_rejects_path_traversal_in_paper_id(client, app_state, tmp_path):
     """A client-supplied paper_id becomes a filename - without
     sanitization, paper_id="../../../../tmp/evil" would let an upload
