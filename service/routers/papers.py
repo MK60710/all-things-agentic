@@ -184,6 +184,27 @@ def list_papers(
 
 
 @router.post(
+    "/{paper_id}/detach",
+    response_model=PaperMetadata,
+    dependencies=[Depends(require_api_key)],
+)
+def detach_paper(paper_id: str, state: AppState = Depends(get_state)) -> PaperMetadata:
+    """Clears session_id on a paper record - the real, server-side version
+    of "remove this from my session," so it stays gone on the next
+    listPapersForSession(session_id) fetch instead of reappearing on a
+    later switch. Other fields are re-saved as-is: PaperStore.save always
+    re-passes the full record rather than relying on partial-field
+    Firestore merge (see every other call site in this router)."""
+    existing = next((p for p in state.paper_store.list() if p.get("id") == paper_id), None)
+    if existing is None:
+        raise HTTPException(status_code=404, detail=f"no paper {paper_id!r}")
+    values = {k: v for k, v in existing.items() if k not in ("id", "updated_at")}
+    values["session_id"] = None
+    updated = state.paper_store.save(paper_id, **values)
+    return PaperMetadata.model_validate(updated)
+
+
+@router.post(
     "/upload-token",
     response_model=UploadTokenResponse,
     dependencies=[Depends(require_api_key)],

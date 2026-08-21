@@ -67,6 +67,14 @@ export async function listPapersForSession(sessionId: string): Promise<PaperCont
   }));
 }
 
+export async function detachPaper(paperId: string): Promise<void> {
+  const response = await fetch(`/api/papers/${encodeURIComponent(paperId)}/detach`, { method: "POST" });
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({})) as { error?: string };
+    throw new Error(data.error ?? "Could not remove this paper from the session");
+  }
+}
+
 export async function askAssistant(
   message: string,
   history: ChatHistoryItem[],

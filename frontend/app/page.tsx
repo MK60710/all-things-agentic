@@ -5,6 +5,7 @@ import {
   answerClarification,
   askAssistant,
   createSession,
+  detachPaper,
   ingestArxivPaper,
   listClarifications,
   listGaps,
@@ -371,16 +372,25 @@ export default function Home() {
   }
 
   function removePaperFromSet(paperId: string) {
-    // Scopes this browser's working set only (which papers /chat sends as
-    // paper_ids) - the paper stays tagged to this session server-side, so
-    // switching away and back to this same session currently re-shows it.
-    // A per-paper "hidden" preference that survives a switch is a real gap,
-    // just not one this pass solves.
+    // Optimistic local removal (updates the working set /chat sends as
+    // paper_ids immediately), backed by a real server-side detach so the
+    // paper doesn't reappear if you switch away and back to this session -
+    // listPapersForSession(session_id) is the source of truth on switch.
     setPapers((current) => {
       const removed = current.find((existing) => existing.id === paperId);
       const updated = current.filter((existing) => existing.id !== paperId);
       setMessages((currentMessages) => [...currentMessages, { id: crypto.randomUUID(), role: "assistant", text: `Removed${removed ? `: "${removed.title}"` : ""} from this conversation.${updated.length === 0 ? " We're back to searching everything." : ""}`, notice: true }]);
       return updated;
+    });
+    void detachPaper(paperId).catch((error) => {
+      setMessages((current) => [...current, {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        text: error instanceof Error
+          ? `${error.message} - it may reappear if you switch sessions.`
+          : "Could not fully remove this paper - it may reappear if you switch sessions.",
+        notice: true,
+      }]);
     });
   }
 
