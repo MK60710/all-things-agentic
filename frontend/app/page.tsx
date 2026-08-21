@@ -4,6 +4,7 @@ import { ChangeEvent, DragEvent, FormEvent, useEffect, useRef, useState } from "
 import {
   answerClarification,
   askAssistant,
+  buildPaperGuide,
   createSession,
   detachPaper,
   ingestArxivPaper,
@@ -17,7 +18,7 @@ import {
   uploadPaper,
 } from "@/lib/api";
 import type { ChatHistoryItem, PaperContext, PaperIngestResult, PaperSearchResult, SessionMetadata } from "@/lib/api";
-import type { Citation, GapCandidate, PendingQuestion, QueryResponse } from "@/lib/types";
+import type { Citation, GapCandidate, PaperGuide, PendingQuestion, QueryResponse } from "@/lib/types";
 import GraphBuildAnimation from "./GraphBuildAnimation";
 
 type IconName = "atlas" | "plus" | "send" | "spark" | "paper" | "search" | "upload" | "close" | "quote" | "check" | "globe" | "thumbUp" | "thumbDown";
@@ -30,6 +31,9 @@ interface Message {
   citations?: Citation[];
   confidence?: QueryResponse["confidence"];
   candidates?: QueryResponse["candidates"];
+  guide?: PaperGuide;
+  guideLoading?: boolean;
+  guideError?: string;
   notice?: boolean;
   clarification?: PendingQuestion;
   // Set instead of `clarification` when more than one question arrives in
@@ -62,6 +66,35 @@ const icons: Record<IconName, React.ReactNode> = {
 
 function Icon({ name, size = 19 }: { name: IconName; size?: number }) {
   return <svg aria-hidden="true" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">{icons[name]}</svg>;
+}
+
+function FlowDiagram({ guide }: { guide: NonNullable<PaperGuide["sections"][number]["diagram"]> }) {
+  return <div className="guide-diagram">
+    <strong>{guide.title}</strong>
+    <div className="flow-track">{guide.nodes.map((node, index) => {
+      const next = guide.nodes[index + 1];
+      const edge = next ? guide.edges.find((item) => item.source === node.id && item.target === next.id) : undefined;
+      return <div className="flow-step" key={node.id}>
+        <div className="flow-node"><span>{node.label}</span>{node.detail && <small>{node.detail}</small>}</div>
+        {next && <div className="flow-arrow"><i>↓</i>{edge?.label && <small>{edge.label}</small>}</div>}
+      </div>;
+    })}</div>
+  </div>;
+}
+
+function GuidedReading({ guide }: { guide: PaperGuide }) {
+  return <section className="guided-reading">
+    <header><div><span>Guided reading</span><strong>{guide.sections.length} stops · about {guide.reading_time_minutes} min</strong></div><Icon name="spark" size={20}/></header>
+    <div className="guide-overview"><small>The big picture</small><p>{guide.big_picture}</p></div>
+    <div className="guide-sections">{guide.sections.map((section, index) => <article key={`${section.title}-${index}`}>
+      <div className="guide-section-heading"><span>{index + 1}</span><div><small>{section.page_start ? `Pages ${section.page_start}${section.page_end && section.page_end !== section.page_start ? `–${section.page_end}` : ""}` : "Paper section"}</small><h3>{section.title}</h3></div></div>
+      <p>{section.plain_language}</p>
+      {section.key_points.length > 0 && <ul>{section.key_points.map((point) => <li key={point}>{point}</li>)}</ul>}
+      {section.diagram && section.diagram.nodes.length > 0 && <FlowDiagram guide={section.diagram}/>}
+      <div className="why-it-matters"><strong>Why this matters</strong><p>{section.why_it_matters}</p></div>
+    </article>)}</div>
+    <footer>That’s the full walkthrough. Ask a question below and I’ll answer from this paper with page-level sources.</footer>
+  </section>;
 }
 
 export default function Home() {
@@ -296,7 +329,12 @@ export default function Home() {
     const effectivePapers = papersOverride === undefined ? papers : papersOverride;
 
     const history: ChatHistoryItem[] = messages
-      .filter((message) => !message.notice)
+      .filter((message) => (
+        !message.notice
+        && !message.guide
+        && !message.guideLoading
+        && Boolean(message.text.trim())
+      ))
       .slice(-20)
       .map(({ role, text }) => ({ role, text: text.slice(0, 8000) }));
     setMessages((current) => [...current, { id: crypto.randomUUID(), role: "user", text: question }]);
@@ -359,6 +397,26 @@ export default function Home() {
     uploadController.current?.abort();
   }
 
+  // announce=false is for the one caller that already sent its own "I've
+  // added X" notice right before this (addPaper) - announce=true is for
+  // any future caller that hasn't (kept from origin/main's signature since
+  // nothing else needs it today, but the option costs nothing to keep).
+  async function beginGuidedReading(nextPaper: PaperContext, announce = false) {
+    const guideMessageId = crypto.randomUUID();
+    setMessages((current) => [
+      ...current,
+      ...(announce ? [{ id: crypto.randomUUID(), role: "assistant" as const, text: `I've read "${nextPaper.title}". I'm building a guided walkthrough now, starting with the big picture, then moving through the paper section by section.`, notice: true }] : []),
+      { id: guideMessageId, role: "assistant", text: "", guideLoading: true },
+    ]);
+    try {
+      const guide = await buildPaperGuide(nextPaper.id);
+      setMessages((current) => current.map((message) => message.id === guideMessageId ? { ...message, guideLoading: false, guide } : message));
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "Could not build the walkthrough.";
+      setMessages((current) => current.map((message) => message.id === guideMessageId ? { ...message, guideLoading: false, guideError: detail, text: "The paper was added and is ready for questions, but I couldn't generate its guided walkthrough." } : message));
+    }
+  }
+
   function addPaper(nextPaper: PaperContext) {
     // Papers are sourced from the backend per session (listPapersForSession)
     // now, not localStorage - this is just the optimistic local update for
@@ -367,6 +425,7 @@ export default function Home() {
     setMessages((current) => [...current, { id: crypto.randomUUID(), role: "assistant", text: `I've added "${nextPaper.title}" to this conversation. Ask me to summarize it, explain a section, or examine its evidence.`, notice: true }]);
     setAddOpen(false);
     setAddMode("choose");
+    void beginGuidedReading(nextPaper);
     window.setTimeout(() => composerInput.current?.focus(), 50);
     void checkGuidance();
   }
@@ -494,12 +553,16 @@ export default function Home() {
                 const visibleGaps = message.gaps?.filter((g) => !dismissedGapKeys.has(gapKey(g)));
                 if (message.gaps && (!visibleGaps || visibleGaps.length === 0)) return null;
                 const feedbackNodeId = message.citations?.[0]?.source_kind === "graph" ? message.citations[0].node_ids?.[0] : undefined;
+                const isGuideMessage = Boolean(message.guide || message.guideLoading);
 
-                return <article key={message.id} className={`message ${message.role} ${message.notice ? "notice" : ""}`}>
+                return <article key={message.id} className={`message ${message.role} ${message.notice ? "notice" : ""} ${isGuideMessage ? "guide-message" : ""}`}>
                   {message.role === "assistant" && <span className="assistant-avatar"><Icon name={message.notice ? "check" : "spark"} size={16}/></span>}
                   <div className="message-body">
-                    {message.role === "assistant" && <small>{message.notice ? "Atlas" : "Gemini"}</small>}
+                    {message.role === "assistant" && <small>{isGuideMessage ? "Atlas guide" : message.notice ? "Atlas" : "Gemini"}</small>}
                     {message.text && <p>{message.text}</p>}
+                    {message.guideLoading && <div className="guide-building"><span/><div><strong>Building your guided reading</strong><small>Finding the paper's structure, simplifying each section, and drawing useful visual explanations…</small></div></div>}
+                    {message.guide && <GuidedReading guide={message.guide}/>}
+                    {message.guideError && <span className="guide-error">{message.guideError}</span>}
                     {message.confidence === "low" && <span className="confidence-note">Low-confidence match — check the sources below.</span>}
                     {message.candidates && message.candidates.length > 0 && <div className="candidate-list">{message.candidates.map((candidate) => <div key={candidate.node_id}><strong>{candidate.name}</strong><small>{candidate.type}</small>{candidate.description && <p>{candidate.description}</p>}</div>)}</div>}
                     {message.citations && message.citations.length > 0 && <div className="citations">{message.citations.map((citation, index) => {

@@ -337,3 +337,10 @@ class ChunkIndex:
 
     def count(self) -> int:
         return len(self._records)
+
+    def paper_chunks(self, paper_id: str) -> list[ChunkRecord]:
+        """Return one paper's indexed chunks in reading order for guided reading."""
+        return sorted(
+            (record for record in self._records.values() if record.paper_id == paper_id),
+            key=lambda record: record.ordinal,
+        )
