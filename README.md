@@ -31,7 +31,7 @@ npm run dev
 ```
 
 Open `http://localhost:3000`. General chat, PDF ingestion, arXiv ingestion,
-and paper-grounded chat all use the FastAPI service. PDF uploads are limited
+guided visual paper walkthroughs, and paper-grounded chat all use the FastAPI service. PDF uploads are limited
 to 25 MiB and use a short-lived browser upload token; the permanent shared
 secret stays in the Next.js server process.
 

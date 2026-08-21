@@ -1,4 +1,4 @@
-import type { GapCandidate, GraphVizEdge, GraphVizNode, PendingQuestion, QueryResponse } from "./types";
+import type { GapCandidate, GraphVizEdge, GraphVizNode, PaperGuide, PendingQuestion, QueryResponse } from "./types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL;
 
@@ -148,6 +148,17 @@ export async function ingestArxivPaper(
   });
   const data = await response.json() as PaperIngestResult & { error?: string };
   if (!response.ok) throw new Error(data.error ?? "Could not ingest the arXiv paper");
+  return data;
+}
+
+export async function buildPaperGuide(paperId: string): Promise<PaperGuide> {
+  const response = await fetch("/api/papers/guide", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ paper_id: paperId }),
+  });
+  const data = await response.json() as PaperGuide & { error?: string };
+  if (!response.ok) throw new Error(data.error ?? "Could not build the paper walkthrough");
   return data;
 }
 

@@ -67,6 +67,10 @@ class PaperStore:
         papers = [snapshot.to_dict() for snapshot in self._collection.stream()]
         return sorted(papers, key=lambda paper: str(paper.get("updated_at", "")), reverse=True)
 
+    def get(self, paper_id: str) -> dict[str, Any] | None:
+        snapshot = self._collection.document(paper_id).get()
+        return snapshot.to_dict() if snapshot.exists else None
+
 
 class SessionStore:
     def __init__(self, db_client: Any) -> None:

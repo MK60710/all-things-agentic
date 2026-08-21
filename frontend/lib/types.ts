@@ -71,3 +71,32 @@ export interface GraphVizEdge {
   target_id: string;
   relation: string;
 }
+
+export interface GuideDiagramNode {
+  id: string;
+  label: string;
+  detail: string;
+}
+
+export interface GuideDiagram {
+  title: string;
+  nodes: GuideDiagramNode[];
+  edges: Array<{ source: string; target: string; label: string }>;
+}
+
+export interface GuideSection {
+  title: string;
+  plain_language: string;
+  key_points: string[];
+  why_it_matters: string;
+  page_start?: number | null;
+  page_end?: number | null;
+  diagram?: GuideDiagram | null;
+}
+
+export interface PaperGuide {
+  title: string;
+  big_picture: string;
+  reading_time_minutes: number;
+  sections: GuideSection[];
+}
