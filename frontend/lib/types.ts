@@ -72,6 +72,29 @@ export interface GraphVizEdge {
   relation: string;
 }
 
+export interface SessionGraphNode {
+  node_id: string;
+  name: string;
+  type: string;
+  description: string;
+}
+
+export interface SessionGraphEdge {
+  edge_id: string;
+  source_id: string;
+  target_id: string;
+  relation: string;
+}
+
+export interface ContradictionCandidate {
+  claim_a_id: string;
+  claim_b_id: string;
+  claim_a_text: string;
+  claim_b_text: string;
+  explanation: string;
+  edge_id: string;
+}
+
 export interface GuideDiagramNode {
   id: string;
   label: string;

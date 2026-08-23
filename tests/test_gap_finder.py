@@ -96,6 +96,29 @@ def test_find_candidates_topology_decides_not_llm(fake_db):
     assert candidates[0].score == 1.0  # exactly one common neighbor
 
 
+def test_find_candidates_goal_boosts_a_matching_pair(fake_db):
+    """A session goal overlapping a candidate's node names/descriptions
+    nudges its score up - the ranking mechanism behind steering gap
+    suggestions toward what the researcher said they're working on."""
+    gm, a, b, shared = _populated_graph(fake_db)
+    gf = GapFinder(gm, explain_fn=_stub_explain)
+
+    baseline = gf.find_candidates()[0]
+    boosted = gf.find_candidates(goal="sparse concept research")[0]
+
+    assert boosted.score > baseline.score
+
+
+def test_find_candidates_goal_with_no_overlap_does_not_boost(fake_db):
+    gm, a, b, shared = _populated_graph(fake_db)
+    gf = GapFinder(gm, explain_fn=_stub_explain)
+
+    baseline = gf.find_candidates()[0]
+    unrelated = gf.find_candidates(goal="completely unrelated topic xyz")[0]
+
+    assert unrelated.score == baseline.score
+
+
 def test_find_candidates_backfills_when_top_candidate_is_a_coincidence(fake_db):
     """A "coincidence" verdict must not consume a slot in the returned
     results - the next-ranked pair from the already-over-fetched pool

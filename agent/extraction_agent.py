@@ -80,6 +80,13 @@ class ExtractionAgent:
         self._document_extractor = document_extractor or PdfTextExtractor()
         self._structured_extractor = structured_extractor or ChunkOnlyStructuredExtractor()
 
+    def parse_document(self, paper_id: str, pdf_path: str) -> DocumentIngestionResult:
+        """The fast, local (non-LLM) half of extract_one on its own -
+        callers that only need chunked text (e.g. guide pre-generation
+        run concurrently with the slow structured-extraction call below)
+        don't need to wait on or trigger that call."""
+        return self._document_extractor.extract(paper_id, pdf_path)
+
     def extract_one(
         self, paper_id: str, pdf_path: str, *, fail_closed: bool = True
     ) -> ExtractionOutcome:
