@@ -71,6 +71,9 @@ class PaperStore:
         snapshot = self._collection.document(paper_id).get()
         return snapshot.to_dict() if snapshot.exists else None
 
+    def delete(self, paper_id: str) -> None:
+        self._collection.document(paper_id).delete()
+
 
 class SessionStore:
     def __init__(self, db_client: Any) -> None:
@@ -88,3 +91,6 @@ class SessionStore:
     def list(self) -> list[dict[str, Any]]:
         sessions = [snapshot.to_dict() for snapshot in self._collection.stream()]
         return sorted(sessions, key=lambda session: str(session.get("updated_at", "")), reverse=True)
+
+    def delete(self, session_id: str) -> None:
+        self._collection.document(session_id).delete()

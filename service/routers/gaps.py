@@ -15,9 +15,18 @@ router = APIRouter(prefix="/gaps", tags=["gaps"], dependencies=[Depends(require_
 def list_gaps(
     node_type: NodeType | None = None,
     limit: int = 5,
+    session_id: str | None = None,
     state: AppState = Depends(get_state),
 ) -> list[GapCandidate]:
-    return state.gap_finder.find_candidates(node_type=node_type, limit=limit)
+    goal = None
+    if session_id is not None:
+        session = next(
+            (s for s in state.session_store.list() if s.get("id") == session_id), None
+        )
+        goal = session.get("goal") if session else None
+    return state.gap_finder.find_candidates(
+        node_type=node_type, limit=limit, session_id=session_id, goal=goal
+    )
 
 
 @router.post("/feedback", status_code=204)

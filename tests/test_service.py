@@ -7,11 +7,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 from agent.clarification_orchestrator import ClarificationOrchestrator
+from agent.contradiction_finder import ContradictionFinder
 from agent.document_ingestion import PdfTextExtractor
 from agent.extraction_agent import ChunkOnlyStructuredExtractor, ExtractionAgent
 from agent.gap_finder import GapFinder
 from agent.general_chat import GeneralChatAgent
 from agent.graph_manager import GraphManager
+from agent.schema import Edge, EdgeType, Node, NodeType, ProvenanceTag
 from agent.paper_guide import GuideSection, PaperGuide, PaperGuideAgent
 from agent.query_agent import QueryAgent
 from agent.research_store import ResearchStore
@@ -21,6 +23,15 @@ from service.app import app
 from service.deps import get_state
 from service.state import AppState
 from service.storage import PaperStore, SessionStore, UploadTokenStore
+
+
+def _no_op_judge(claim_a: str, claim_b: str):
+    """Stands in for GeminiContradictionJudge in fixtures that don't test
+    contradiction-checking behavior itself - never makes a live call,
+    unlike constructing a real GeminiContradictionJudge with no client,
+    which would lazily build a real genai.Client from whatever
+    GOOGLE_CLOUD_PROJECT happens to be set in the ambient environment."""
+    return None
 
 
 @pytest.fixture
@@ -39,6 +50,7 @@ def app_state(fake_db, tmp_path) -> AppState:
         general_chat=GeneralChatAgent(),
         paper_guide=PaperGuideAgent(),
         gap_finder=GapFinder(graph, db_client=fake_db),
+        contradiction_finder=ContradictionFinder(graph, judge=_no_op_judge, db_client=fake_db),
         extraction_agent=ExtractionAgent(
             document_extractor=PdfTextExtractor(allowed_root=str(tmp_path)),
             structured_extractor=ChunkOnlyStructuredExtractor(),
@@ -127,6 +139,137 @@ def test_sessions_create_and_list_round_trip(client):
 
     listed = client.get("/sessions").json()
     assert any(s["id"] == created["id"] and s["name"] == "AI session" for s in listed)
+
+
+def test_rename_session_updates_name(client):
+    created = client.post("/sessions", json={"name": "Untitled session"}).json()
+
+    response = client.patch(f"/sessions/{created['id']}", json={"name": "Biology"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == created["id"]
+    assert body["name"] == "Biology"
+    assert body["created_at"] == created["created_at"]
+
+    listed = client.get("/sessions").json()
+    assert any(s["id"] == created["id"] and s["name"] == "Biology" for s in listed)
+
+
+def test_session_goal_round_trips_and_survives_rename(client):
+    created = client.post(
+        "/sessions", json={"name": "AI session", "goal": "benchmark retrieval methods"}
+    ).json()
+    assert created["goal"] == "benchmark retrieval methods"
+
+    listed = client.get("/sessions").json()
+    match = next(s for s in listed if s["id"] == created["id"])
+    assert match["goal"] == "benchmark retrieval methods"
+
+    renamed = client.patch(f"/sessions/{created['id']}", json={"name": "Biology"}).json()
+    assert renamed["goal"] == "benchmark retrieval methods"
+
+
+def test_session_without_goal_defaults_to_none(client):
+    created = client.post("/sessions", json={"name": "No goal session"}).json()
+    assert created["goal"] is None
+
+
+def test_session_graph_endpoint_returns_only_that_sessions_nodes(client, app_state):
+    created = client.post("/sessions", json={"name": "Graph session"}).json()
+    session_id = created["id"]
+    a = Node(id="node-a", type=NodeType.CONCEPT, name="In Session", session_id=session_id)
+    b = Node(id="node-b", type=NodeType.CONCEPT, name="Other Session", session_id="other-session")
+    app_state.graph.add_node(a)
+    app_state.graph.add_node(b)
+    app_state.graph.add_edge(
+        Edge(
+            id="edge-1",
+            source_id=a.id,
+            target_id=a.id,
+            type=EdgeType.SUPPORTS,
+            provenance=ProvenanceTag.EXTRACTED,
+            source_quote="quote",
+            session_id=session_id,
+        )
+    )
+
+    response = client.get(f"/sessions/{session_id}/graph")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [n["node_id"] for n in body["nodes"]] == ["node-a"]
+    assert len(body["edges"]) == 1
+
+
+def test_session_graph_endpoint_404s_for_unknown_session(client):
+    response = client.get("/sessions/does-not-exist/graph")
+    assert response.status_code == 404
+
+
+def test_contradictions_check_endpoint_returns_empty_when_nothing_to_compare(client):
+    created = client.post("/sessions", json={"name": "Contradictions session"}).json()
+
+    response = client.post(f"/sessions/{created['id']}/contradictions/check")
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_contradictions_check_endpoint_404s_for_unknown_session(client):
+    response = client.post("/sessions/does-not-exist/contradictions/check")
+    assert response.status_code == 404
+
+
+def test_rename_session_404_for_unknown_session(client):
+    response = client.patch("/sessions/does-not-exist", json={"name": "Anything"})
+
+    assert response.status_code == 404
+
+
+def test_delete_session_cascades_papers_graph_and_clarifications(client, app_state):
+    """Full cascade: deleting a session removes its papers, the graph
+    nodes/edges it added, its chunks, and any clarification question
+    referencing one of those nodes - not just the session record."""
+    created = client.post("/sessions", json={"name": "To delete"}).json()
+    session_id = created["id"]
+
+    app_state.paper_store.save(
+        "paper-a", title="Paper A", status="ready", session_id=session_id
+    )
+    app_state.chunks.upsert_paper("paper-a", ["Some paper text about apples."])
+    provisional = Node(
+        id="provisional-node",
+        type=NodeType.CONCEPT,
+        name="New Concept",
+        session_id=session_id,
+    )
+    candidate = Node(id="candidate-node", type=NodeType.CONCEPT, name="Existing Concept")
+    app_state.graph.add_node(provisional)
+    app_state.graph.add_node(candidate)
+    app_state.clarification.register_entity_merge_question(
+        provisional_node_id=provisional.id,
+        entity_name="New Concept",
+        candidate_node_id=candidate.id,
+        candidate_name="Existing Concept",
+    )
+
+    response = client.delete(f"/sessions/{session_id}")
+
+    assert response.status_code == 204
+    assert not any(s["id"] == session_id for s in client.get("/sessions").json())
+    assert not any(p["id"] == "paper-a" for p in app_state.paper_store.list())
+    assert app_state.chunks.paper_chunks("paper-a") == []
+    assert "provisional-node" not in app_state.graph.graph
+    assert app_state.clarification.pending() == []
+    # A node from a different session that never touched this one is untouched.
+    assert "candidate-node" in app_state.graph.graph
+
+
+def test_delete_session_404_for_unknown_session(client):
+    response = client.delete("/sessions/does-not-exist")
+
+    assert response.status_code == 404
 
 
 def test_query_feedback_accepts_and_returns_no_content(client):
@@ -426,6 +569,119 @@ def test_arxiv_ingest_persists_the_given_session_id(client, app_state, monkeypat
         p for p in app_state.paper_store.list() if p["id"] == "arxiv-2101.00001"
     )
     assert saved["session_id"] == "session-xyz"
+
+
+def _fake_extract_one(paper_id, path, fail_closed=False):
+    from agent.document_ingestion import DocumentIngestionResult
+    from agent.extraction_agent import ExtractionOutcome
+    from agent.schema import ExtractionResult
+
+    return ExtractionOutcome(
+        paper_id=paper_id,
+        document=DocumentIngestionResult(
+            paper_id=paper_id, pdf_path=path, pages=[], raw_text="text", chunks=["text"]
+        ),
+        result=ExtractionResult(
+            paper_id=paper_id, entities=[], relations=[], chunks=["text"]
+        ),
+    )
+
+
+def _fake_parse_document(paper_id, path):
+    from agent.document_ingestion import DocumentIngestionResult
+
+    return DocumentIngestionResult(
+        paper_id=paper_id, pdf_path=path, pages=[], raw_text="text", chunks=["text"]
+    )
+
+
+def test_papers_upload_pregenerates_and_caches_the_guide(client, app_state, monkeypatch):
+    """The guide worker in _ingest runs concurrently with extraction - by
+    the time /papers returns, a successful guide should already be
+    cached on the paper record, with no separate /guide call needed."""
+    monkeypatch.setattr(app_state.extraction_agent, "extract_one", _fake_extract_one)
+    monkeypatch.setattr(app_state.extraction_agent, "parse_document", _fake_parse_document)
+
+    response = client.post(
+        "/papers",
+        files={"file": ("paper.pdf", b"%PDF-1.4 fake", "application/pdf")},
+        data={"paper_id": "pregen-paper"},
+    )
+
+    assert response.status_code == 200
+    saved = next(p for p in app_state.paper_store.list() if p["id"] == "pregen-paper")
+    assert isinstance(saved["guide"], dict)
+    assert saved["guide"]["sections"]
+
+
+def test_papers_upload_survives_a_failing_guide_worker(client, app_state, monkeypatch):
+    """A guide-generation failure must never affect the paper ingest
+    itself - the paper still ends up ready, just without a cached guide,
+    and a later on-demand /guide call still works normally."""
+    monkeypatch.setattr(app_state.extraction_agent, "extract_one", _fake_extract_one)
+    monkeypatch.setattr(app_state.extraction_agent, "parse_document", _fake_parse_document)
+
+    def failing_generate(title, chunks):
+        raise RuntimeError("Gemini exploded")
+
+    monkeypatch.setattr(app_state.paper_guide, "generate", failing_generate)
+
+    response = client.post(
+        "/papers",
+        files={"file": ("paper.pdf", b"%PDF-1.4 fake", "application/pdf")},
+        data={"paper_id": "guide-fails-paper"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ready"
+    saved = next(p for p in app_state.paper_store.list() if p["id"] == "guide-fails-paper")
+    assert saved["guide"] is None
+
+    # Undo the failing patch - the real on-demand path (no cache hit,
+    # since guide is None) should still work normally afterward.
+    monkeypatch.undo()
+    guide_response = client.post("/papers/guide-fails-paper/guide")
+    assert guide_response.status_code == 200
+
+
+def test_papers_upload_discards_a_pregenerated_guide_on_extraction_failure(
+    client, app_state, monkeypatch
+):
+    """Extraction failing must still 422 and mark the paper failed even
+    when the concurrently-run guide worker succeeds - that guide result
+    must be discarded, not leak onto a paper that never really ingested."""
+    from agent.extraction_agent import ExtractionIssue, ExtractionOutcome
+
+    def failing_extract_one(paper_id, path, fail_closed=False):
+        return ExtractionOutcome(
+            paper_id=paper_id,
+            issue=ExtractionIssue(
+                paper_id=paper_id, stage="document_ingestion", message="bad pdf"
+            ),
+        )
+
+    monkeypatch.setattr(app_state.extraction_agent, "extract_one", failing_extract_one)
+    monkeypatch.setattr(app_state.extraction_agent, "parse_document", _fake_parse_document)
+
+    response = client.post(
+        "/papers",
+        files={"file": ("paper.pdf", b"%PDF-1.4 fake", "application/pdf")},
+        data={"paper_id": "extraction-fails-paper"},
+    )
+
+    assert response.status_code == 422
+    saved = next(
+        p for p in app_state.paper_store.list() if p["id"] == "extraction-fails-paper"
+    )
+    assert saved["status"] == "failed"
+    # fake_db's set(merge=True) replaces the whole document rather than
+    # truly merging (documented simplification elsewhere in this test
+    # suite), so the failed-status save - which doesn't itself pass
+    # guide= - leaves the key absent here rather than explicitly None.
+    # Real Firestore's actual merge would keep the earlier guide=None
+    # from the initial "processing" save; either way, nothing readable
+    # as a real guide payload survives.
+    assert saved.get("guide") is None
 
 
 def test_papers_list_filters_by_session_id(client, app_state):

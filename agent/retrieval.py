@@ -151,6 +151,24 @@ class ChunkIndex:
                 next_chunk_id=data.get("next_chunk_id"),
             )
 
+    def remove_paper(self, paper_id: str) -> int:
+        """Drop every chunk for paper_id from both the in-memory index and
+        Firestore - same removal logic upsert_paper already runs on stale
+        chunks during a re-ingest, just callable on its own for a real
+        delete rather than only as a side effect of adding new chunks."""
+        stale_ids = [
+            chunk_id
+            for chunk_id, record in self._records.items()
+            if record.paper_id == paper_id
+        ]
+        for chunk_id in stale_ids:
+            del self._records[chunk_id]
+        if self._db is not None:
+            persisted = self._db.collection("chunks")
+            for snapshot in list(persisted.where("paper_id", "==", paper_id).stream()):
+                persisted.document(snapshot.id).delete()
+        return len(stale_ids)
+
     def upsert_paper(
         self, paper_id: str, chunks: list[str] | list[ExtractionChunk]
     ) -> list[str]:

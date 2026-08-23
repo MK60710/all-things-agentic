@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
 import secrets
 import uuid
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import requests
@@ -21,6 +23,10 @@ from service.schemas import (
 )
 from service.state import AppState
 from agent.paper_guide import PaperGuide
+from agent.retrieval import ChunkRecord
+from agent.schema import ExtractionChunk
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/papers", tags=["papers"])
 
@@ -62,6 +68,57 @@ def _file_chunks(file: UploadFile, chunk_size: int = 1024 * 1024) -> Iterable[by
         yield chunk
 
 
+def _pregenerate_guide(
+    state: AppState, *, paper_id: str, path: Path, title: str
+) -> PaperGuide | None:
+    """Runs concurrently with extract_one (see _ingest) - independently
+    re-parses the same PDF (fast, local, not an LLM call) rather than
+    waiting on extraction's document, so the guide's own slow Gemini call
+    overlaps with extraction's instead of following it. Any failure here
+    - a bad PDF, a Gemini error - just means no guide yet, exactly like
+    today's on-demand /guide endpoint failing; it must never affect
+    whether the paper itself ingests successfully.
+
+    Builds its own throwaway ChunkRecords in memory rather than calling
+    ChunkIndex.upsert_paper - PaperGuideAgent.generate only reads
+    ordinal/text/page metadata off them, never persisted state, and this
+    runs before extraction's own pass/fail is known. Persisting chunks
+    here would leave them reachable by chat/search even when extraction
+    goes on to fail and the paper is never actually ready - real
+    research_store.ingest (the durable, session-scoped write) still only
+    ever runs after a successful extraction, unchanged.
+    """
+    try:
+        document = state.extraction_agent.parse_document(paper_id, str(path))
+        raw_chunks = document.chunk_metadata or [
+            ExtractionChunk(text=text, ordinal=index)
+            for index, text in enumerate(document.chunks)
+        ]
+        chunks = [
+            ChunkRecord(
+                id=f"guide-preview:{paper_id}:{index}",
+                paper_id=paper_id,
+                ordinal=chunk.ordinal,
+                text=chunk.text,
+                embedding=[],
+                page_start=chunk.page_start,
+                page_end=chunk.page_end,
+                section=chunk.section,
+                source=chunk.source,
+                content_type=chunk.content_type,
+            )
+            for index, chunk in enumerate(raw_chunks)
+        ]
+        if not chunks:
+            return None
+        return state.paper_guide.generate(title, chunks)
+    except Exception:
+        logger.warning(
+            "Concurrent guide pre-generation failed for %s", paper_id, exc_info=True
+        )
+        return None
+
+
 def _ingest(
     state: AppState,
     *,
@@ -77,9 +134,26 @@ def _ingest(
     # guide=None invalidates any previously generated walkthrough on a
     # re-ingest of the same paper_id - stale content shouldn't be served
     # from cache once the underlying extraction reruns.
-    state.paper_store.save(paper_id, **metadata, status="processing", session_id=session_id, guide=None)
-    outcome = state.extraction_agent.extract_one(paper_id, str(path), fail_closed=False)
+    state.paper_store.save(paper_id, **metadata, status="extracting", session_id=session_id, guide=None)
+    # Entity extraction and the guide walkthrough are two independent
+    # slow Gemini calls over the same PDF - neither depends on the
+    # other's output (see _pregenerate_guide) - so they run concurrently
+    # instead of back-to-back. Wall-clock cost becomes whichever is
+    # slower, not both summed.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        extraction_future = pool.submit(
+            state.extraction_agent.extract_one, paper_id, str(path), fail_closed=False
+        )
+        guide_future = pool.submit(
+            _pregenerate_guide, state, paper_id=paper_id, path=path, title=title
+        )
+        outcome = extraction_future.result()
+        guide = guide_future.result()
+
     if outcome.result is None:
+        # Extraction genuinely failed - discard any concurrently-computed
+        # guide rather than caching a walkthrough for a paper that never
+        # successfully ingested.
         message = outcome.issue.message if outcome.issue else "extraction failed"
         state.paper_store.save(paper_id, **metadata, status="failed", error=message, session_id=session_id)
         raise HTTPException(status_code=422, detail=message)
@@ -93,7 +167,15 @@ def _ingest(
         session_id=session_id,
     )
     pending_added = len(state.clarification.pending()) - pending_before
-    state.paper_store.save(paper_id, **metadata, status="ready", session_id=session_id)
+    # Caches the concurrently pre-generated guide (None if that worker
+    # failed) so the frontend's separate POST /papers/{id}/guide call -
+    # unchanged, still fires after this response - finds it already
+    # warm via create_paper_guide's existing cache check, instead of
+    # running a second full generation.
+    guide_payload = guide.model_dump(mode="json") if guide is not None else None
+    state.paper_store.save(
+        paper_id, **metadata, status="ready", session_id=session_id, guide=guide_payload
+    )
 
     new_nodes: list[GraphVizNode] = []
     new_edges: list[GraphVizEdge] = []
@@ -187,6 +269,16 @@ def list_papers(
     return [PaperMetadata.model_validate(item) for item in papers]
 
 
+@router.get("/{paper_id}/status")
+def get_paper_status(paper_id: str, state: AppState = Depends(get_state)) -> dict[str, str]:
+    """Lightweight poll target for ingest progress - deliberately just the
+    status string, not the full PaperMetadata list_papers already returns,
+    so the frontend can poll every second or two during a "Reading..."
+    card without pulling the whole papers list on each tick."""
+    paper = state.paper_store.get(paper_id)
+    return {"status": paper.get("status", "unknown") if paper else "unknown"}
+
+
 @router.post(
     "/{paper_id}/detach",
     response_model=PaperMetadata,
@@ -258,6 +350,19 @@ def ingest_arxiv(body: ArxivIngestRequest, state: AppState = Depends(get_state))
     if not dest.is_relative_to(upload_root):
         raise HTTPException(status_code=400, detail="invalid arXiv identifier")
     url = f"https://arxiv.org/pdf/{arxiv_id}"
+    # Written before the download starts, not just at _ingest's own first
+    # write - a concurrent GET /papers/{id}/status poll (see below) needs
+    # something to find from the moment the "Reading..." card appears,
+    # not several seconds later once the PDF finishes downloading.
+    state.paper_store.save(
+        pid,
+        title=body.title,
+        authors=body.authors,
+        abstract=body.abstract,
+        pdf_url=body.pdf_url or url,
+        status="downloading",
+        session_id=body.session_id,
+    )
     try:
         response = requests.get(
             url,

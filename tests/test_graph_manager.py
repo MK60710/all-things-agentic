@@ -145,6 +145,95 @@ def test_get_incident_edges_deduplicates_and_resolves_names(fake_db):
     assert edges_from_b == edges_from_a
 
 
+def test_export_session_graph_only_returns_nodes_tagged_to_that_session(fake_db):
+    gm = _make_manager(fake_db)
+    a = _node("Session A Concept")
+    a.session_id = "session-a"
+    b = _node("Session B Concept")
+    b.session_id = "session-b"
+    gm.add_node(a)
+    gm.add_node(b)
+
+    export = gm.export_session_graph("session-a")
+
+    assert [n.node_id for n in export.nodes] == [a.id]
+
+
+def test_export_session_graph_includes_edges_between_session_nodes(fake_db):
+    gm = _make_manager(fake_db)
+    a, b = _node("Method A"), _node("Metric B")
+    a.session_id = b.session_id = "session-a"
+    gm.add_node(a)
+    gm.add_node(b)
+    gm.add_edge(
+        Edge(
+            id=str(uuid.uuid4()),
+            source_id=a.id,
+            target_id=b.id,
+            type=EdgeType.USES,
+            provenance=ProvenanceTag.EXTRACTED,
+            source_quote="quote",
+            session_id="session-a",
+        )
+    )
+
+    export = gm.export_session_graph("session-a")
+
+    assert len(export.edges) == 1
+    assert export.edges[0].source_id == a.id
+    assert export.edges[0].target_id == b.id
+
+
+def test_export_session_graph_drops_edge_reaching_outside_the_session(fake_db):
+    """Strict scoping: an edge with only one endpoint in the session must
+    not appear, even if the edge itself or the other node exists in the
+    graph - the Graph Explorer never reaches into the shared graph."""
+    gm = _make_manager(fake_db)
+    a = _node("Session A Concept")
+    a.session_id = "session-a"
+    b = _node("Shared Graph Concept")
+    b.session_id = "session-b"
+    gm.add_node(a)
+    gm.add_node(b)
+    gm.add_edge(
+        Edge(
+            id=str(uuid.uuid4()),
+            source_id=a.id,
+            target_id=b.id,
+            type=EdgeType.USES,
+            provenance=ProvenanceTag.EXTRACTED,
+            source_quote="quote",
+            session_id="session-a",
+        )
+    )
+
+    export = gm.export_session_graph("session-a")
+
+    assert export.edges == []
+
+
+def test_export_session_graph_excludes_same_as_merge_edges(fake_db):
+    gm = _make_manager(fake_db)
+    a, b = _node("Duplicate Name"), _node("duplicate name")
+    a.session_id = b.session_id = "session-a"
+    gm.add_node(a)
+    gm.add_node(b)
+    gm.add_edge(
+        Edge(
+            id=str(uuid.uuid4()),
+            source_id=b.id,
+            target_id=a.id,
+            type=EdgeType.SAME_AS,
+            provenance=ProvenanceTag.INFERRED,
+            session_id="session-a",
+        )
+    )
+
+    export = gm.export_session_graph("session-a")
+
+    assert export.edges == []
+
+
 def test_get_node_returns_none_for_unknown_id(fake_db):
     gm = _make_manager(fake_db)
     assert gm.get_node("does-not-exist") is None
@@ -801,3 +890,71 @@ def test_concurrent_search_and_mutation_does_not_crash(fake_db):
         t.join()
 
     assert not errors, f"concurrent access raised: {errors}"
+
+
+def test_remove_by_session_deletes_owned_nodes_and_edges_live_and_in_firestore(
+    fake_db,
+):
+    gm = _make_manager(fake_db)
+    owned = _node("Session Node")
+    owned.session_id = "session-a"
+    other = _node("Other Session Node")
+    gm.add_node(owned)
+    gm.add_node(other)
+    edge = Edge(
+        id=str(uuid.uuid4()),
+        source_id=owned.id,
+        target_id=other.id,
+        type=EdgeType.USES,
+        provenance=ProvenanceTag.EXTRACTED,
+        session_id="session-a",
+    )
+    gm.add_edge(edge)
+
+    removed = gm.remove_by_session("session-a")
+
+    assert removed == {owned.id}
+    assert owned.id not in gm.graph
+    assert other.id in gm.graph
+    assert gm.graph.number_of_edges() == 0
+    # A fresh manager rehydrating from the same fake_db must not resurrect
+    # the removed node/edge - proves the Firestore docs were deleted too,
+    # not just the in-memory graph.
+    rehydrated = _make_manager(fake_db)
+    assert owned.id not in rehydrated.graph
+    assert other.id in rehydrated.graph
+    assert rehydrated.graph.number_of_edges() == 0
+
+
+def test_remove_by_session_removes_a_different_sessions_edge_to_a_dying_node(
+    fake_db,
+):
+    """An edge that belongs to a *different* session but touches a node
+    being removed must also go - otherwise it dangles, and worse,
+    resurrects the deleted node as a bare stub on the next rehydrate
+    (add_edge auto-creates missing endpoint nodes)."""
+    gm = _make_manager(fake_db)
+    dying = _node("Dying Node")
+    dying.session_id = "session-a"
+    survivor = _node("Survivor Node")
+    survivor.session_id = "session-b"
+    gm.add_node(dying)
+    gm.add_node(survivor)
+    edge = Edge(
+        id=str(uuid.uuid4()),
+        source_id=survivor.id,
+        target_id=dying.id,
+        type=EdgeType.USES,
+        provenance=ProvenanceTag.EXTRACTED,
+        session_id="session-b",
+    )
+    gm.add_edge(edge)
+
+    gm.remove_by_session("session-a")
+
+    assert survivor.id in gm.graph
+    assert dying.id not in gm.graph
+    assert gm.graph.number_of_edges() == 0
+    rehydrated = _make_manager(fake_db)
+    assert survivor.id in rehydrated.graph
+    assert dying.id not in rehydrated.graph

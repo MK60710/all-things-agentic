@@ -1,4 +1,4 @@
-import type { GapCandidate, GraphVizEdge, GraphVizNode, PaperGuide, PendingQuestion, QueryResponse } from "./types";
+import type { ContradictionCandidate, GapCandidate, GraphVizEdge, GraphVizNode, PaperGuide, PendingQuestion, QueryResponse, SessionGraphEdge, SessionGraphNode } from "./types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL;
 
@@ -28,13 +28,14 @@ export interface SessionMetadata {
   id: string;
   name: string;
   created_at: string;
+  goal?: string | null;
 }
 
-export async function createSession(name: string): Promise<SessionMetadata> {
+export async function createSession(name: string, goal?: string): Promise<SessionMetadata> {
   const response = await fetch("/api/sessions", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name }),
+    body: JSON.stringify({ name, goal: goal || undefined }),
   });
   const data = await response.json() as SessionMetadata & { error?: string };
   if (!response.ok) throw new Error(data.error ?? "Could not create the session");
@@ -46,6 +47,25 @@ export async function listSessions(): Promise<SessionMetadata[]> {
   const data = await response.json() as SessionMetadata[] & { error?: string };
   if (!response.ok) throw new Error((data as unknown as { error?: string }).error ?? "Could not load sessions");
   return data;
+}
+
+export async function renameSession(sessionId: string, name: string): Promise<SessionMetadata> {
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+  const data = await response.json() as SessionMetadata & { error?: string };
+  if (!response.ok) throw new Error(data.error ?? "Could not rename the session");
+  return data;
+}
+
+export async function deleteSession(sessionId: string): Promise<void> {
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({})) as { error?: string };
+    throw new Error(data.error ?? "Could not delete the session");
+  }
 }
 
 export async function listPapersForSession(sessionId: string): Promise<PaperContext[]> {
@@ -79,12 +99,14 @@ export async function askAssistant(
   message: string,
   history: ChatHistoryItem[],
   papers?: PaperContext[] | null,
+  goal?: string | null,
+  nodeId?: string,
 ): Promise<QueryResponse> {
   const paperIds = papers?.map((paper) => paper.id) ?? [];
   const response = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message, history, paper_ids: paperIds }),
+    body: JSON.stringify({ message, history, paper_ids: paperIds, goal: goal || undefined, node_id: nodeId }),
   });
 
   const data = await response.json() as Partial<QueryResponse> & { error?: string };
@@ -126,6 +148,24 @@ export async function uploadPaper(
   const data = await response.json() as PaperIngestResult & { detail?: string };
   if (!response.ok) throw new Error(data.detail ?? `Paper upload failed (${response.status})`);
   return data;
+}
+
+// Mirrors service/routers/papers.py's _sanitize_paper_id(f"arxiv-{arxiv_id}")
+// so the frontend can predict an in-flight ingest's paper_id and poll its
+// status before the ingest request itself has returned. Arxiv IDs matching
+// _ARXIV_ID are almost always already-safe characters (digits/dots, or the
+// legacy category/number form with a slash) - this only has to replicate
+// the same substitution, not validate the id.
+function sanitizeArxivPaperId(arxivId: string): string {
+  const cleaned = `arxiv-${arxivId}`.replace(/[^A-Za-z0-9._-]/g, "_");
+  return cleaned.replace(/^[._-]+/, "").replace(/[._-]+$/, "") || arxivId;
+}
+
+export async function getPaperStatus(arxivId: string): Promise<string> {
+  const response = await fetch(`/api/papers/${encodeURIComponent(sanitizeArxivPaperId(arxivId))}/status`);
+  if (!response.ok) return "unknown";
+  const data = await response.json() as { status?: string };
+  return data.status ?? "unknown";
 }
 
 export async function ingestArxivPaper(
@@ -187,10 +227,28 @@ export async function answerClarification(id: string, optionId: string): Promise
   return data;
 }
 
-export async function listGaps(limit = 3): Promise<GapCandidate[]> {
-  const response = await fetch(`/api/gaps?limit=${limit}`);
+export async function listGaps(limit = 3, sessionId?: string): Promise<GapCandidate[]> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (sessionId) params.set("session_id", sessionId);
+  const response = await fetch(`/api/gaps?${params.toString()}`);
   if (!response.ok) throw new Error("Could not load suggestions");
   return await response.json() as GapCandidate[];
+}
+
+export async function getSessionGraph(
+  sessionId: string,
+): Promise<{ nodes: SessionGraphNode[]; edges: SessionGraphEdge[] }> {
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/graph`);
+  const data = await response.json() as { nodes: SessionGraphNode[]; edges: SessionGraphEdge[]; error?: string };
+  if (!response.ok) throw new Error(data.error ?? "Could not load the graph");
+  return data;
+}
+
+export async function checkForContradictions(sessionId: string): Promise<ContradictionCandidate[]> {
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/contradictions/check`, { method: "POST" });
+  const data = await response.json() as ContradictionCandidate[] & { error?: string };
+  if (!response.ok) throw new Error((data as unknown as { error?: string }).error ?? "Could not check for contradictions");
+  return data;
 }
 
 export async function recordGapFeedback(nodeAId: string, nodeBId: string, interesting: boolean): Promise<void> {

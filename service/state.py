@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from google.cloud import firestore
 
 from agent.clarification_orchestrator import ClarificationOrchestrator
+from agent.contradiction_finder import ContradictionFinder, GeminiContradictionJudge
 from agent.document_ingestion import PdfTextExtractor
 from agent.extraction_agent import ExtractionAgent
 from agent.gap_finder import GapFinder, GeminiExplainer
@@ -36,6 +37,7 @@ class AppState:
     general_chat: GeneralChatAgent
     paper_guide: PaperGuideAgent
     gap_finder: GapFinder
+    contradiction_finder: ContradictionFinder
     extraction_agent: ExtractionAgent
     research_store: ResearchStore
     upload_root: str
@@ -87,6 +89,11 @@ def build_state() -> AppState:
         explain_fn=GeminiExplainer(project=project, location=location),
         db_client=db,
     )
+    contradiction_finder = ContradictionFinder(
+        graph,
+        judge=GeminiContradictionJudge(project=project, location=location),
+        db_client=db,
+    )
 
     upload_root = os.environ.get("UPLOAD_ROOT", "/tmp/uploads")
     os.makedirs(upload_root, exist_ok=True)
@@ -106,6 +113,7 @@ def build_state() -> AppState:
         general_chat=general_chat,
         paper_guide=paper_guide,
         gap_finder=gap_finder,
+        contradiction_finder=contradiction_finder,
         extraction_agent=extraction_agent,
         research_store=research_store,
         upload_root=upload_root,

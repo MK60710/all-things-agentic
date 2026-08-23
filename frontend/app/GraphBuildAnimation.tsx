@@ -3,19 +3,10 @@
 import dynamic from "next/dynamic";
 import { useEffect, useRef, useState } from "react";
 import type { GraphVizEdge, GraphVizNode } from "@/lib/types";
+import { TYPE_COLORS, DEFAULT_NODE_COLOR } from "@/lib/graphColors";
 
 const ForceGraph2D = dynamic(() => import("react-force-graph-2d"), { ssr: false });
 
-const TYPE_COLORS: Record<string, string> = {
-  PAPER: "#2d283c",
-  CONCEPT: "#6658d5",
-  METHOD: "#347eaa",
-  MODEL: "#a34f3e",
-  BENCHMARK_DATASET: "#5a9e6f",
-  METRIC: "#c98a2e",
-  CLAIM: "#8a5ba3",
-};
-const DEFAULT_NODE_COLOR = "#9b96a4";
 const REVEAL_INTERVAL_MS = 200;
 
 interface GraphNode {

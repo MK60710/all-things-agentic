@@ -37,6 +37,16 @@ class ChatRequest(BaseModel):
     # already accepts paper_ids: set[str] | None as a multi-paper filter,
     # this was only ever exposed here as if it took just one.
     paper_ids: list[str] | None = None
+    # The current session's stated goal (SessionMetadata.goal), passed
+    # through on every turn rather than looked up server-side from
+    # session_id - the frontend already holds it in currentSession state,
+    # and /chat has no session_id field to look it up by.
+    goal: str | None = Field(default=None, max_length=300)
+    # Set when the frontend already knows exactly which node the question
+    # is about - e.g. clicking a specific candidate on an ambiguous
+    # result - so QueryAgent skips text search/ambiguity detection and
+    # evaluates that node directly.
+    node_id: str | None = None
 
 
 class UploadTokenResponse(BaseModel):
@@ -70,12 +80,17 @@ class PaperMetadata(BaseModel):
 
 class SessionCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=200)
+    # Only meaningful on creation - the rename endpoint reuses this same
+    # request model but only ever changes name, carrying the existing goal
+    # through unchanged (see rename_session in routers/sessions.py).
+    goal: str | None = Field(default=None, max_length=300)
 
 
 class SessionMetadata(BaseModel):
     id: str
     name: str
     created_at: str
+    goal: str | None = None
 
 
 class FeedbackRequest(BaseModel):
@@ -156,6 +171,25 @@ class GraphVizEdge(BaseModel):
     source_id: str
     target_id: str
     relation: str
+
+
+class SessionGraphNode(BaseModel):
+    node_id: str
+    name: str
+    type: str
+    description: str = ""
+
+
+class SessionGraphEdge(BaseModel):
+    edge_id: str
+    source_id: str
+    target_id: str
+    relation: str
+
+
+class SessionGraphResponse(BaseModel):
+    nodes: list[SessionGraphNode]
+    edges: list[SessionGraphEdge]
 
 
 class PaperIngestResponse(BaseModel):

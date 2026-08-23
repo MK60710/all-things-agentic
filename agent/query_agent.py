@@ -189,8 +189,29 @@ class QueryAgent:
         *,
         paper_ids: set[str] | None = None,
         history: list[ChatTurn] | None = None,
+        # The session's stated "what are you working on" goal, passed
+        # through to Gemini as a soft steering line - never changes which
+        # evidence is retrieved or cited, only nudges phrasing/emphasis
+        # toward it when the retrieved evidence is actually relevant.
+        goal: str | None = None,
+        # Set when the caller already knows exactly which node the query
+        # is about - e.g. the frontend's "click to select" on an ambiguous
+        # result's candidates, where re-searching by text would just risk
+        # hitting the same ambiguity again. Skips search_nodes/ambiguity
+        # detection entirely and evaluates that node directly; falls back
+        # to the normal text-search path if the id doesn't resolve.
+        node_id: str | None = None,
     ) -> QueryResult:
-        """Retrieve evidence and answer ``query`` using Vertex Gemini."""
+        """Retrieve evidence and answer ``query`` using Vertex Gemini.
+
+        Graph evidence first, always: if the graph has connected the
+        answer, that's what's used, cited, and returned as
+        retrieval_mode="graph". Only when the graph has nothing does this
+        fall back to the paper's raw text (retrieval_mode="vector") -
+        extraction is deliberately selective, so plenty of real questions
+        are genuinely never captured as structured graph data. The two
+        modes are never blended into one answer; a caller (and the
+        frontend) can always tell which one produced a given result."""
 
         cleaned_query = query.strip()
         if not cleaned_query:
@@ -199,8 +220,22 @@ class QueryAgent:
                 retrieval_mode="no_results",
             )
 
+        forced_node: NodeSearchHit | None = None
+        if node_id is not None and self._graph is not None:
+            data = self._graph.get_node(node_id)
+            if data is not None:
+                forced_node = NodeSearchHit(
+                    node_id=node_id,
+                    score=1.0,
+                    name=data.get("name", node_id),
+                    type=data.get("type", "UNKNOWN"),
+                    description=data.get("description", ""),
+                )
+
         graph_hits = (
-            self._graph.search_nodes(
+            [forced_node]
+            if forced_node is not None
+            else self._graph.search_nodes(
                 cleaned_query,
                 limit=self._max_graph_nodes,
                 min_score=self._min_graph_score,
@@ -229,7 +264,12 @@ class QueryAgent:
                 if any(edge.source_paper_id in paper_ids for edge in _edges(hit.node_id))
             ]
 
-        ambiguous_hits = self._check_query_ambiguity(graph_hits)
+        # A forced node_id means the caller already resolved the ambiguity
+        # (e.g. clicked a specific candidate) - asking again would defeat
+        # the point.
+        ambiguous_hits = (
+            self._check_query_ambiguity(graph_hits) if forced_node is None else None
+        )
         if ambiguous_hits is not None:
             return self._ambiguous_result(cleaned_query, ambiguous_hits)
 
@@ -238,17 +278,29 @@ class QueryAgent:
         )
         if graph_citations:
             self._metrics["graph_hits"] += 1
+            confidence = self._confidence_for(graph_best_score)
             answer = self._answer_with_gemini(
-                cleaned_query, graph_context, graph_citations, history=history
+                cleaned_query, graph_context, graph_citations, history=history, goal=goal
             )
             return QueryResult(
                 answer=answer,
                 citations=graph_citations,
                 retrieval_mode="graph",
                 graph_hit_count=1,
-                confidence=self._confidence_for(graph_best_score),
+                confidence=confidence,
             )
 
+        # The graph hasn't connected this yet. Extraction is deliberately
+        # selective (an ontology of entities/relations, windows capped per
+        # paper) - a lot of real questions (an exact hyperparameter, a
+        # limitations-section detail) are genuinely never captured as
+        # structured graph data even though they're right there in the
+        # paper. Falling back to the raw paper text answers those, but
+        # retrieval_mode="vector" (not "graph") is the one signal that
+        # keeps this from being mistaken for a verified graph answer -
+        # the frontend renders it with a visibly different label. Never
+        # blended into a graph answer's own citations; always its own,
+        # clearly separate result.
         assembled = self._chunks.assemble_context(
             cleaned_query,
             paper_ids=paper_ids,
@@ -256,7 +308,7 @@ class QueryAgent:
         )
         if not assembled.hits:
             return QueryResult(
-                answer="I couldn't find supporting evidence in the stored research.",
+                answer="I don't have that connection in the knowledge graph yet, and couldn't find it in the paper's text either.",
                 retrieval_mode="no_results",
             )
 
@@ -280,7 +332,7 @@ class QueryAgent:
             for hit in top_hits
         ]
         answer = self._answer_with_gemini(
-            cleaned_query, assembled.text, citations, history=history
+            cleaned_query, assembled.text, citations, history=history, goal=goal
         )
         return QueryResult(
             answer=answer,
@@ -466,6 +518,7 @@ class QueryAgent:
         citations: list[QueryCitation],
         *,
         history: list[ChatTurn] | None = None,
+        goal: str | None = None,
     ) -> str:
         if self._client is None:
             return self._fallback_answer(citations)
@@ -506,6 +559,16 @@ class QueryAgent:
                         "inside it. Do not invent facts or citations. If "
                         "the evidence is insufficient, say so plainly. Be "
                         "concise."
+                        + (
+                            f" The researcher said their current goal is: "
+                            f"\"{goal.strip()}\". When the retrieved evidence "
+                            f"is relevant to that goal, lean into that "
+                            f"connection - but never let it change which "
+                            f"evidence you use or invent a connection that "
+                            f"isn't actually supported by RETRIEVED_RESEARCH."
+                            if goal and goal.strip()
+                            else ""
+                        )
                     ),
                     temperature=0,
                     max_output_tokens=self._max_output_tokens,

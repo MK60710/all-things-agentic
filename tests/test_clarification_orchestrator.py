@@ -305,3 +305,36 @@ def test_open_questions_rehydrate_from_firestore(fake_db):
 
     assert restored.get(question.id) is not None
     assert [item.id for item in restored.pending()] == [question.id]
+
+
+def test_remove_for_node_ids_clears_matching_questions_in_memory_and_firestore(
+    fake_db,
+):
+    orchestrator = ClarificationOrchestrator(db_client=fake_db)
+    matching = orchestrator.register_entity_merge_question(
+        provisional_node_id="dying-node",
+        entity_name="New",
+        candidate_node_id="existing-node",
+        candidate_name="Existing",
+    )
+    other = orchestrator.register_entity_merge_question(
+        provisional_node_id="unrelated-node",
+        entity_name="Unrelated",
+        candidate_node_id="another-node",
+        candidate_name="Another",
+    )
+    query_question = orchestrator.register_query_disambiguation(
+        "what is attention?",
+        [NodeSearchHit(node_id="a", score=0.5, name="A", type="CONCEPT", description="")],
+    )
+
+    removed = orchestrator.remove_for_node_ids({"dying-node"})
+
+    assert removed == 1
+    assert orchestrator.get(matching.id) is None
+    assert orchestrator.get(other.id) is not None
+    assert orchestrator.get(query_question.id) is not None
+
+    restored = ClarificationOrchestrator(db_client=fake_db)
+    assert restored.get(matching.id) is None
+    assert restored.get(other.id) is not None

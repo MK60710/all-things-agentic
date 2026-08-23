@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field
 
 from agent.graph_manager import GraphManager, IncidentEdge
 from agent.schema import NodeType
-from agent.text_utils import escape_tag_delimiters
+from agent.text_utils import escape_tag_delimiters, search_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -413,11 +413,42 @@ class GapFinder:
                 )
         return citations
 
+    # Additive, not a re-ranking multiplier - a goal match nudges an
+    # already-plausible pair (real shared neighbors) ahead of similar-sized
+    # pairs, it never invents relevance a pair's own topology doesn't have.
+    # Same order of magnitude as a single user "interesting" rating
+    # (_node_boost's +/-1.0 per side) so one goal match is a comparable
+    # signal to one piece of explicit feedback, not a dominant one.
+    GOAL_BOOST_WEIGHT = 1.0
+
+    def _goal_boost(self, goal_tokens: frozenset[str], data: dict) -> float:
+        if not goal_tokens:
+            return 0.0
+        node_tokens = search_tokens(f"{data.get('name', '')} {data.get('description', '')}")
+        if not node_tokens:
+            return 0.0
+        overlap = goal_tokens & node_tokens
+        if not overlap:
+            return 0.0
+        return self.GOAL_BOOST_WEIGHT * (len(overlap) / len(goal_tokens))
+
     def find_candidates(
-        self, node_type: NodeType | None = None, limit: int = 5
+        self,
+        node_type: NodeType | None = None,
+        limit: int = 5,
+        session_id: str | None = None,
+        # The session's stated "what are you working on" goal (free text,
+        # SessionMetadata.goal) - purely a ranking nudge toward pairs whose
+        # nodes relate to it. Never filters candidates out: an off-goal
+        # pair with strong real topology can still outrank an on-goal one,
+        # same as _node_boost.
+        goal: str | None = None,
     ) -> list[GapCandidate]:
-        pairs = self._gm.find_sparse_pairs(node_type=node_type, limit=limit * 3)
+        pairs = self._gm.find_sparse_pairs(
+            node_type=node_type, limit=limit * 3, session_id=session_id
+        )
         undirected = self._gm.graph.to_undirected()
+        goal_tokens = frozenset(search_tokens(goal)) if goal else frozenset()
 
         pool = []
         for a_id, b_id in pairs:
@@ -431,6 +462,9 @@ class GapFinder:
             b_data = self._gm.graph.nodes[b_id]
             common_ids = list(nx.common_neighbors(undirected, a_id, b_id))
             base_score = float(len(common_ids))
+            goal_score = self._goal_boost(goal_tokens, a_data) + self._goal_boost(
+                goal_tokens, b_data
+            )
             pool.append(
                 GapCandidate(
                     node_a_id=a_id,
@@ -438,7 +472,7 @@ class GapFinder:
                     node_a_name=a_data.get("name", a_id),
                     node_b_name=b_data.get("name", b_id),
                     common_neighbor_ids=common_ids,
-                    score=base_score + boost,
+                    score=base_score + boost + goal_score,
                 )
             )
 

@@ -135,6 +135,28 @@ class IncidentEdge:
 
 
 @dataclass
+class SessionGraphNode:
+    node_id: str
+    name: str
+    type: str
+    description: str
+
+
+@dataclass
+class SessionGraphEdge:
+    edge_id: str
+    source_id: str
+    target_id: str
+    relation: str
+
+
+@dataclass
+class SessionGraphExport:
+    nodes: list[SessionGraphNode]
+    edges: list[SessionGraphEdge]
+
+
+@dataclass
 class GraphIngestionReport:
     paper_id: str
     paper_node_id: str
@@ -224,6 +246,51 @@ class GraphManager:
                 **edge.model_dump(mode="json"),
             )
             return edge.id
+
+    def remove_by_session(self, session_id: str) -> set[str]:
+        """Cascade-delete every node/edge tagged with session_id, from
+        both the live in-memory graph and Firestore. Returns the removed
+        node ids so a caller (session delete) can also clean up anything
+        else keyed off them, like pending clarification questions.
+
+        Edges are collected up front as (source, target, key) triples,
+        before any removal - both every edge touching a removed node
+        (regardless of which session added that edge - an edge to a
+        node that's about to disappear is dead either way, and leaving
+        its Firestore doc behind would resurrect the node as a bare,
+        data-less stub on the next _rehydrate(), since add_edge
+        auto-creates missing endpoint nodes) and every edge this session
+        added directly, even between nodes it doesn't own (reused via
+        canonicalization, so wouldn't otherwise be touched).
+        """
+        with self._lock:
+            node_ids = {
+                node_id
+                for node_id, data in self.graph.nodes(data=True)
+                if data.get("session_id") == session_id
+            }
+            edges_to_remove: dict[str, tuple[str, str, str]] = {}
+            for node_id in node_ids:
+                for source, target, key in self.graph.in_edges(node_id, keys=True):
+                    edges_to_remove[key] = (source, target, key)
+                for source, target, key in self.graph.out_edges(node_id, keys=True):
+                    edges_to_remove[key] = (source, target, key)
+            for source, target, key, data in self.graph.edges(keys=True, data=True):
+                if data.get("session_id") == session_id:
+                    edges_to_remove[key] = (source, target, key)
+
+            for source, target, key in edges_to_remove.values():
+                if self.graph.has_edge(source, target, key):
+                    self.graph.remove_edge(source, target, key)
+                self._db.collection("edges").document(key).delete()
+
+            for node_id in node_ids:
+                if node_id in self.graph:
+                    self.graph.remove_node(node_id)
+                self._db.collection("nodes").document(node_id).delete()
+                self._node_token_cache.pop(node_id, None)
+
+            return node_ids
 
     def resolve_alias(
         self, canonical_id: str, alias_id: str, distinct: bool = False
@@ -413,6 +480,52 @@ class GraphManager:
                 )
             return edges
 
+    def export_session_graph(self, session_id: str) -> SessionGraphExport:
+        """All nodes/edges tagged with session_id, as a flat list for a
+        client-side force layout (Graph Explorer). Strict scoping: an edge
+        is only included when BOTH endpoints belong to this session - it
+        never reaches into the shared graph, unlike get_incident_edges
+        which follows a single node's real edges regardless of who added
+        them. Same data.get("session_id") == session_id filter convention
+        as remove_by_session/find_sparse_pairs."""
+        with self._lock:
+            nodes = [
+                SessionGraphNode(
+                    node_id=node_id,
+                    name=data.get("name", node_id),
+                    type=data.get("type", "UNKNOWN"),
+                    description=data.get("description", ""),
+                )
+                for node_id, data in self.graph.nodes(data=True)
+                if data.get("session_id") == session_id
+            ]
+            node_ids = {n.node_id for n in nodes}
+            seen: set[str] = set()
+            edges: list[SessionGraphEdge] = []
+            for source_id, target_id, edge_id, data in self.graph.edges(
+                keys=True, data=True
+            ):
+                if (
+                    edge_id in seen
+                    or source_id not in node_ids
+                    or target_id not in node_ids
+                ):
+                    continue
+                if data.get("type") == EdgeType.SAME_AS.value:
+                    # The merge marker itself, not a real relation - same
+                    # exclusion as get_incident_edges.
+                    continue
+                seen.add(edge_id)
+                edges.append(
+                    SessionGraphEdge(
+                        edge_id=edge_id,
+                        source_id=source_id,
+                        target_id=target_id,
+                        relation=data.get("type", "UNKNOWN"),
+                    )
+                )
+            return SessionGraphExport(nodes=nodes, edges=edges)
+
     def _stable_node_id(
         self, paper_id: str, name: str, node_type: NodeType
     ) -> str:
@@ -443,15 +556,24 @@ class GraphManager:
         )
 
     def find_sparse_pairs(
-        self, node_type: NodeType | None = None, limit: int = 10
+        self,
+        node_type: NodeType | None = None,
+        limit: int = 10,
+        session_id: str | None = None,
     ) -> list[tuple[str, str]]:
         """Candidate pairs with no direct edge but at least one common
-        neighbor — topology decides, not LLM guessing."""
+        neighbor — topology decides, not LLM guessing.
+
+        session_id, when given, restricts candidates to nodes tagged with
+        that session (same tagging remove_by_session already relies on) -
+        otherwise gap suggestions draw from every paper ever ingested in
+        any session, not just what's actually in this one."""
         with self._lock:
             candidates = [
                 n
                 for n, data in self.graph.nodes(data=True)
-                if node_type is None or data.get("type") == node_type.value
+                if (node_type is None or data.get("type") == node_type.value)
+                and (session_id is None or data.get("session_id") == session_id)
             ]
             undirected = self.graph.to_undirected()
             pairs: list[tuple[str, str, int]] = []
