@@ -981,6 +981,21 @@ def test_papers_upload_sanitizes_unsafe_paper_id_characters(client, app_state):
         assert "/" not in response.json()["paper_id"]
 
 
+def test_paper_status_endpoint_requires_api_key_when_secret_is_set(client, app_state, monkeypatch):
+    """Every other /papers route already required this - status was the
+    one route missing it, letting anyone poll ingest status for any
+    paper_id with no key once API_SHARED_SECRET is set."""
+    app_state.paper_store.save("paper-a", title="Paper A", status="ready")
+    monkeypatch.setenv("API_SHARED_SECRET", "correct-secret")
+
+    unauthenticated = client.get("/papers/paper-a/status")
+    assert unauthenticated.status_code == 401
+
+    authenticated = client.get("/papers/paper-a/status", headers={"X-API-Key": "correct-secret"})
+    assert authenticated.status_code == 200
+    assert authenticated.json()["status"] == "ready"
+
+
 def test_require_api_key_rejects_wrong_key(client, monkeypatch):
     monkeypatch.setenv("API_SHARED_SECRET", "correct-secret")
     response = client.post(
@@ -1032,6 +1047,47 @@ def test_paper_chat_is_scoped_to_requested_paper(client, app_state):
 
     assert response.status_code == 200
     assert {item["paper_id"] for item in response.json()["citations"]} == {"paper-b"}
+
+
+def test_chat_drops_paper_ids_not_actually_in_the_given_session(client, app_state):
+    """If the client's paper_ids array has drifted from the server's real
+    session membership (stale fetch, missed refetch after switching
+    sessions), a paper_id that isn't actually in the given session_id
+    must be dropped server-side rather than silently answered against -
+    a session_id with no matching real membership must not leak evidence
+    from a paper the caller doesn't actually have in that session."""
+    app_state.chunks.upsert_paper("paper-a", ["Alpha paper studies apples."])
+    app_state.chunks.upsert_paper("paper-b", ["Beta paper studies bananas."])
+    app_state.paper_store.save("paper-a", title="Alpha", status="ready", session_id="session-a")
+    # paper-b deliberately NOT tagged to session-a.
+
+    response = client.post(
+        "/chat",
+        json={
+            "message": "What do the papers study?",
+            "paper_ids": ["paper-a", "paper-b"],
+            "session_id": "session-a",
+        },
+    )
+
+    assert response.status_code == 200
+    cited_papers = {item["paper_id"] for item in response.json()["citations"]}
+    assert cited_papers <= {"paper-a"}
+    assert "paper-b" not in cited_papers
+
+
+def test_chat_without_session_id_keeps_trusting_the_client_paper_ids(client, app_state):
+    """session_id is optional - omitting it (unscoped/general chat, or
+    any caller with no session concept) must behave exactly as before,
+    with no server-side filtering applied."""
+    app_state.chunks.upsert_paper("paper-a", ["Alpha paper studies apples."])
+
+    response = client.post(
+        "/chat", json={"message": "What does the paper study?", "paper_ids": ["paper-a"]}
+    )
+
+    assert response.status_code == 200
+    assert {item["paper_id"] for item in response.json()["citations"]} == {"paper-a"}
 
 
 def test_paper_chat_scopes_to_a_multi_paper_working_set(client, app_state):

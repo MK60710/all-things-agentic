@@ -185,6 +185,25 @@ def test_feedback_boosts_future_ranking(fake_db):
     assert ab_score_after > ab_score_before
 
 
+def test_record_feedback_ignores_ids_that_are_not_real_nodes(fake_db):
+    """A stale or malformed client-supplied node id must not silently
+    pollute the shared, never-cleaned-up _node_boost/_dismissed_pairs
+    state - only ids that correspond to a real node in the graph should
+    ever be recorded."""
+    gm, a, b, shared = _populated_graph(fake_db)
+    gf = GapFinder(gm, explain_fn=_stub_explain)
+
+    gf.record_feedback("does-not-exist-1", "does-not-exist-2", interesting=True)
+
+    assert gf._node_boost == {}
+    assert gf._dismissed_pairs == set()
+
+    # A real node paired with a bogus one is rejected too - both ids
+    # must be real, not just one of them.
+    gf.record_feedback(a.id, "does-not-exist", interesting=True)
+    assert gf._node_boost == {}
+
+
 def test_not_interesting_feedback_excludes_the_pair_from_future_results(fake_db):
     """"Not interesting" is a hard, permanent exclusion (mirrors
     GraphManager._known_distinct), not just a soft score nudge via

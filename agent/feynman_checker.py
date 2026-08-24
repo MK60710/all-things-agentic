@@ -12,23 +12,19 @@ remembered across visits (deliberately kept simple for v1).
 from __future__ import annotations
 
 import json
-import logging
-import os
-import threading
 from collections import Counter
 from collections.abc import Callable
 from typing import Literal
 
 from google import genai
-from google.genai import types as genai_types
 from pydantic import BaseModel
 
-from agent.graph_manager import GraphManager, _session_ids
+from agent.gemini_judge import LazyVertexClient, call_structured_judge
+from agent.graph_manager import GraphManager
+from agent.session_membership import session_ids as _session_ids
 from agent.query_agent import QueryCitation
 from agent.schema import NodeType
 from agent.text_utils import escape_tag_delimiters
-
-logger = logging.getLogger(__name__)
 
 # A node whose description adds fewer than this many characters beyond its
 # own name (e.g. "PrefixEmbed" described only as "PrefixEmbed method") has
@@ -98,13 +94,15 @@ _GEMINI_SYSTEM_INSTRUCTION = (
 )
 
 
-class GeminiFeynmanJudge:
+class GeminiFeynmanJudge(LazyVertexClient):
     """Calls Gemini via Vertex AI to grade a researcher's explanation.
 
     Same auth/fallback contract as GeminiContradictionJudge: Application
     Default Credentials, not an API key. Any failure - outage, quota, bad
     schema - returns None rather than raising or guessing, since a failed
-    judgment must never be mistaken for a real verdict.
+    judgment must never be mistaken for a real verdict. The actual
+    Gemini call/response-parsing mechanics live in agent.gemini_judge,
+    shared with every other judge in this codebase.
     """
 
     def __init__(
@@ -116,27 +114,10 @@ class GeminiFeynmanJudge:
         timeout_ms: int = 15_000,
         max_output_tokens: int = 250,
     ):
+        super().__init__(client=client, project=project, location=location)
         self._model = model
         self._timeout_ms = timeout_ms
         self._max_output_tokens = max_output_tokens
-        self._project = project
-        self._location = location
-        # Guards lazy client construction, mirroring GeminiContradictionJudge -
-        # a bad ADC/project config must surface inside the try/except below,
-        # not in __init__.
-        self._lock = threading.Lock()
-        self._client = client
-
-    def _get_client(self) -> genai.Client:
-        with self._lock:
-            if self._client is None:
-                self._client = genai.Client(
-                    vertexai=True,
-                    project=self._project or os.environ.get("GOOGLE_CLOUD_PROJECT"),
-                    location=self._location
-                    or os.environ.get("GOOGLE_CLOUD_LOCATION", "global"),
-                )
-            return self._client
 
     def __call__(
         self, node_name: str, node_description: str, user_explanation: str
@@ -151,47 +132,16 @@ class GeminiFeynmanJudge:
             + json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
             + "</feynman_check>"
         )
-        try:
-            response = self._get_client().models.generate_content(
-                model=self._model,
-                contents=contents,
-                config=genai_types.GenerateContentConfig(
-                    system_instruction=_GEMINI_SYSTEM_INSTRUCTION,
-                    temperature=0,
-                    max_output_tokens=self._max_output_tokens,
-                    http_options=genai_types.HttpOptions(timeout=self._timeout_ms),
-                    # "thinking" tokens count against max_output_tokens and
-                    # can silently consume nearly all of it on a short
-                    # grading task - same reasoning as every other judge in
-                    # this codebase.
-                    thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
-                    response_mime_type="application/json",
-                    response_schema=_VerdictPayload,
-                ),
-            )
-            raw = (response.text or "").strip()
-            candidates = getattr(response, "candidates", None) or []
-            finish_reason = candidates[0].finish_reason if candidates else None
-            truncated = finish_reason == genai_types.FinishReason.MAX_TOKENS
-            if raw and not truncated:
-                try:
-                    return _VerdictPayload.model_validate_json(raw)
-                except ValueError:
-                    logger.warning(
-                        "GeminiFeynmanJudge response failed schema validation",
-                        exc_info=True,
-                    )
-            elif truncated:
-                logger.warning(
-                    "GeminiFeynmanJudge response was truncated by max_output_tokens"
-                )
-            else:
-                logger.warning("GeminiFeynmanJudge got an empty response")
-        except Exception:
-            # Never let a Gemini outage/quota/config issue raise - the
-            # frontend just shows "couldn't grade that, try again".
-            logger.warning("GeminiFeynmanJudge call failed", exc_info=True)
-        return None
+        return call_structured_judge(
+            self._get_client,
+            model=self._model,
+            contents=contents,
+            system_instruction=_GEMINI_SYSTEM_INSTRUCTION,
+            response_schema=_VerdictPayload,
+            max_output_tokens=self._max_output_tokens,
+            timeout_ms=self._timeout_ms,
+            caller_name="GeminiFeynmanJudge",
+        )
 
 
 def _node_degree_in_paper(graph_manager: GraphManager, paper_id: str) -> Counter[str]:
