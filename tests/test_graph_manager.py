@@ -234,6 +234,78 @@ def test_export_session_graph_excludes_same_as_merge_edges(fake_db):
     assert export.edges == []
 
 
+def test_export_session_graph_derives_and_dedupes_node_citations(fake_db):
+    """A node's citations come from its own in-session edges' real
+    provenance (paper_id/section), not a separate field on the node
+    itself - and a node touched by several edges into the same
+    paper/section must not produce repeat entries."""
+    gm = _make_manager(fake_db)
+    a, b, c = _node("Method A"), _node("Metric B"), _node("Concept C")
+    a.session_id = b.session_id = c.session_id = "session-a"
+    gm.add_node(a)
+    gm.add_node(b)
+    gm.add_node(c)
+    gm.add_edge(
+        Edge(
+            id=str(uuid.uuid4()),
+            source_id=a.id,
+            target_id=b.id,
+            type=EdgeType.USES,
+            provenance=ProvenanceTag.EXTRACTED,
+            source_quote="A uses B.",
+            source_paper_id="paper-1",
+            source_section="Method",
+            session_id="session-a",
+        )
+    )
+    gm.add_edge(
+        Edge(
+            id=str(uuid.uuid4()),
+            source_id=a.id,
+            target_id=c.id,
+            type=EdgeType.SUPPORTS,
+            provenance=ProvenanceTag.EXTRACTED,
+            source_quote="A supports C.",
+            source_paper_id="paper-1",
+            source_section="Method",  # same (paper, section) as the edge above
+            session_id="session-a",
+        )
+    )
+
+    export = gm.export_session_graph("session-a")
+
+    node_a = next(n for n in export.nodes if n.node_id == a.id)
+    assert [(cit.paper_id, cit.section) for cit in node_a.citations] == [
+        ("paper-1", "Method")
+    ]
+
+
+def test_export_session_graph_node_citations_skip_inferred_edges(fake_db):
+    """An INFERRED edge (no real paper/section behind it, e.g. a
+    Contradiction Finder edge) must not show up as a fabricated
+    citation."""
+    gm = _make_manager(fake_db)
+    a, b = _node("Claim A"), _node("Claim B")
+    a.session_id = b.session_id = "session-a"
+    gm.add_node(a)
+    gm.add_node(b)
+    gm.add_edge(
+        Edge(
+            id=str(uuid.uuid4()),
+            source_id=a.id,
+            target_id=b.id,
+            type=EdgeType.CONTRADICTS,
+            provenance=ProvenanceTag.INFERRED,
+            source_quote="They disagree.",
+            session_id="session-a",
+        )
+    )
+
+    export = gm.export_session_graph("session-a")
+
+    assert all(n.citations == [] for n in export.nodes)
+
+
 def test_get_node_returns_none_for_unknown_id(fake_db):
     gm = _make_manager(fake_db)
     assert gm.get_node("does-not-exist") is None

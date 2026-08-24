@@ -214,6 +214,48 @@ def test_session_graph_endpoint_404s_for_unknown_session(client):
     assert response.status_code == 404
 
 
+def test_bibliography_endpoint_returns_real_bibtex_for_the_sessions_papers(client, app_state):
+    created = client.post("/sessions", json={"name": "Bib session"}).json()
+    session_id = created["id"]
+    app_state.paper_store.save(
+        "arxiv-2106.09685", title="LoRA", authors="Edward J. Hu", status="ready", session_id=session_id
+    )
+
+    response = client.get(f"/sessions/{session_id}/bibliography")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/x-bibtex")
+    assert "@misc{arxiv_2106_09685," in response.text
+    assert "title = {LoRA}" in response.text
+
+
+def test_bibliography_endpoint_only_includes_this_sessions_papers(client, app_state):
+    created = client.post("/sessions", json={"name": "Bib session"}).json()
+    session_id = created["id"]
+    app_state.paper_store.save("paper-mine", title="Mine", status="ready", session_id=session_id)
+    app_state.paper_store.save("paper-other", title="Other", status="ready", session_id="a-different-session")
+
+    response = client.get(f"/sessions/{session_id}/bibliography")
+
+    assert "paper_mine" in response.text.replace("-", "_")
+    assert "Other" not in response.text
+
+
+def test_bibliography_endpoint_degrades_gracefully_for_a_session_with_no_papers(client):
+    created = client.post("/sessions", json={"name": "Empty bib session"}).json()
+    session_id = created["id"]
+
+    response = client.get(f"/sessions/{session_id}/bibliography")
+
+    assert response.status_code == 200
+    assert "No papers" in response.text
+
+
+def test_bibliography_endpoint_404s_for_unknown_session(client):
+    response = client.get("/sessions/does-not-exist/bibliography")
+    assert response.status_code == 404
+
+
 def test_contradictions_check_endpoint_returns_empty_when_nothing_to_compare(client):
     created = client.post("/sessions", json={"name": "Contradictions session"}).json()
 

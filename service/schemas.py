@@ -173,11 +173,18 @@ class GraphVizEdge(BaseModel):
     relation: str
 
 
+class NodeCitationOut(BaseModel):
+    paper_id: str
+    section: str | None = None
+    source_quote: str = ""
+
+
 class SessionGraphNode(BaseModel):
     node_id: str
     name: str
     type: str
     description: str = ""
+    citations: list[NodeCitationOut] = Field(default_factory=list)
 
 
 class SessionGraphEdge(BaseModel):

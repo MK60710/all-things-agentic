@@ -244,6 +244,15 @@ export async function getSessionGraph(
   return data;
 }
 
+export async function getSessionBibliography(sessionId: string): Promise<string> {
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/bibliography`);
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({})) as { error?: string };
+    throw new Error(data.error ?? "Could not export citations");
+  }
+  return response.text();
+}
+
 export async function checkForContradictions(sessionId: string): Promise<ContradictionCandidate[]> {
   const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/contradictions/check`, { method: "POST" });
   const data = await response.json() as ContradictionCandidate[] & { error?: string };
