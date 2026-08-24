@@ -101,12 +101,13 @@ export async function askAssistant(
   papers?: PaperContext[] | null,
   goal?: string | null,
   nodeId?: string,
+  sessionId?: string,
 ): Promise<QueryResponse> {
   const paperIds = papers?.map((paper) => paper.id) ?? [];
   const response = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message, history, paper_ids: paperIds, goal: goal || undefined, node_id: nodeId }),
+    body: JSON.stringify({ message, history, paper_ids: paperIds, goal: goal || undefined, node_id: nodeId, session_id: sessionId }),
   });
 
   const data = await response.json() as Partial<QueryResponse> & { error?: string };

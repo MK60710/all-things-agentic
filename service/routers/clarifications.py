@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from agent.graph_manager import _session_ids
+from agent.session_membership import session_ids as _session_ids
 from service.deps import get_state, require_api_key
 from service.schemas import AnswerClarificationRequest, PendingQuestionOut
 from service.state import AppState

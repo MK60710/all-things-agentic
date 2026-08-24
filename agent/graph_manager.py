@@ -36,6 +36,7 @@ from agent.schema import (
     NodeType,
     ProvenanceTag,
 )
+from agent.session_membership import session_ids as _session_ids
 from agent.text_utils import search_tokens
 
 logger = logging.getLogger(__name__)
@@ -45,22 +46,6 @@ logger = logging.getLogger(__name__)
 # condition for a Clarification Orchestrator question.
 CANONICALIZATION_HIGH = 0.92
 CANONICALIZATION_LOW = 0.75
-
-
-def _session_ids(data: dict) -> list[str]:
-    """A node/edge's real session membership, read from the persisted
-    "session_ids" list this module writes (see GraphManager.add_node/
-    add_edge). Falls back to the old single "session_id" field for data
-    written before multi-session membership existed - this is what lets
-    ~90% of the graph's pre-existing legacy-tagged nodes keep working
-    exactly as before with no migration script, and self-heal into the
-    new list-based model for free the next time anything re-touches
-    them."""
-    session_ids = data.get("session_ids")
-    if session_ids:
-        return session_ids
-    legacy = data.get("session_id")
-    return [legacy] if legacy else []
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -843,49 +828,62 @@ class GraphManager:
                 )
                 continue
             embedding = embedding_fn(entity) if embedding_fn is not None else None
-            canonical = self.canonicalize(
-                entity.name, embedding=embedding, node_type=entity.type
-            )
-            if canonical.decision == "auto_merge" and canonical.matched_node_id:
-                node_id = canonical.matched_node_id
-                reused = True
-                # Reusing an existing node id is not itself a write - a
-                # real add_node call is needed here too, or this
-                # session's membership never gets recorded on it at all.
-                # Confirmed live and by a failing test: the single most
-                # common case this whole fix targets (a well-known
-                # entity reused across sessions via canonicalization)
-                # was silently skipping accumulation entirely. Keeps the
-                # existing node's own name/description/type - this is
-                # the same real-world entity, not new content to merge
-                # in, so nothing about it should change except which
-                # sessions can now see it.
-                existing_data = self.graph.nodes[node_id]
-                self.add_node(
-                    Node(
-                        id=node_id,
-                        type=NodeType(existing_data["type"]),
-                        name=existing_data.get("name", entity.name),
-                        description=existing_data.get("description", ""),
-                        entity_embedding=existing_data.get("entity_embedding"),
-                        session_id=session_id,
+            # canonicalize's decision and the write that acts on it must
+            # happen as one atomic unit under the same lock acquisition -
+            # canonicalize() and add_node() each already lock internally,
+            # but each *releases* before this method regains control, so
+            # without wrapping the pair, two concurrent
+            # apply_extraction_result calls introducing the same new
+            # entity name can each see "new" (neither has written yet)
+            # and each create a separate node for the same real-world
+            # entity. This method's own docstring documented that gap as
+            # an accepted, unresolved race; closing it here. The lock is
+            # reentrant (RLock), so canonicalize/add_node re-acquiring it
+            # internally on the same thread is safe.
+            with self._lock:
+                canonical = self.canonicalize(
+                    entity.name, embedding=embedding, node_type=entity.type
+                )
+                if canonical.decision == "auto_merge" and canonical.matched_node_id:
+                    node_id = canonical.matched_node_id
+                    reused = True
+                    # Reusing an existing node id is not itself a write - a
+                    # real add_node call is needed here too, or this
+                    # session's membership never gets recorded on it at all.
+                    # Confirmed live and by a failing test: the single most
+                    # common case this whole fix targets (a well-known
+                    # entity reused across sessions via canonicalization)
+                    # was silently skipping accumulation entirely. Keeps the
+                    # existing node's own name/description/type - this is
+                    # the same real-world entity, not new content to merge
+                    # in, so nothing about it should change except which
+                    # sessions can now see it.
+                    existing_data = self.graph.nodes[node_id]
+                    self.add_node(
+                        Node(
+                            id=node_id,
+                            type=NodeType(existing_data["type"]),
+                            name=existing_data.get("name", entity.name),
+                            description=existing_data.get("description", ""),
+                            entity_embedding=existing_data.get("entity_embedding"),
+                            session_id=session_id,
+                        )
                     )
-                )
-            else:
-                node_id = self._stable_node_id(
-                    extraction.paper_id, entity.name, entity.type
-                )
-                self.add_node(
-                    Node(
-                        id=node_id,
-                        type=entity.type,
-                        name=entity.name,
-                        description=entity.description,
-                        entity_embedding=embedding,
-                        session_id=session_id,
+                else:
+                    node_id = self._stable_node_id(
+                        extraction.paper_id, entity.name, entity.type
                     )
-                )
-                reused = False
+                    self.add_node(
+                        Node(
+                            id=node_id,
+                            type=entity.type,
+                            name=entity.name,
+                            description=entity.description,
+                            entity_embedding=embedding,
+                            session_id=session_id,
+                        )
+                    )
+                    reused = False
                 already_distinct = canonical.matched_node_id is not None and tuple(
                     sorted((canonical.matched_node_id, node_id))
                 ) in self._known_distinct

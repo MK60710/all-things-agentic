@@ -749,7 +749,7 @@ export default function Home() {
     setQuery("");
     setLoading(true);
     try {
-      const response = await askAssistant(question, history, effectivePapers, currentSession?.goal, nodeId);
+      const response = await askAssistant(question, history, effectivePapers, currentSession?.goal, nodeId, currentSession?.id);
       setMessages((current) => [...current, {
         id: crypto.randomUUID(),
         role: "assistant",

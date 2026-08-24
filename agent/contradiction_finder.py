@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import threading
 import uuid
 from collections.abc import Callable
@@ -24,10 +23,11 @@ from datetime import datetime, timezone
 from typing import Any, Literal
 
 from google import genai
-from google.genai import types as genai_types
 from pydantic import BaseModel
 
-from agent.graph_manager import GraphManager, _cosine_similarity, _session_ids
+from agent.gemini_judge import LazyVertexClient, call_structured_judge
+from agent.graph_manager import GraphManager, _cosine_similarity
+from agent.session_membership import session_ids as _session_ids
 from agent.schema import Edge, EdgeType, NodeType, ProvenanceTag
 from agent.text_utils import escape_tag_delimiters
 
@@ -75,14 +75,16 @@ _GEMINI_SYSTEM_INSTRUCTION = (
 )
 
 
-class GeminiContradictionJudge:
+class GeminiContradictionJudge(LazyVertexClient):
     """Calls Gemini via Vertex AI to judge whether two claims disagree.
 
     Same auth/fallback contract as gap_finder.py's GeminiExplainer: ADC
     (not an API key), matching the rest of this project's auth
     convention. Any failure - outage, quota, bad schema - returns None
     rather than raising or guessing, since a failed judgment must never
-    be mistaken for (or cached as) a real verdict.
+    be mistaken for (or cached as) a real verdict. The actual Gemini
+    call/response-parsing mechanics live in agent.gemini_judge, shared
+    with every other judge in this codebase.
     """
 
     def __init__(
@@ -94,29 +96,10 @@ class GeminiContradictionJudge:
         timeout_ms: int = 15_000,
         max_output_tokens: int = 200,
     ):
+        super().__init__(client=client, project=project, location=location)
         self._model = model
         self._timeout_ms = timeout_ms
         self._max_output_tokens = max_output_tokens
-        self._project = project
-        self._location = location
-        # Guards lazy client construction, mirroring GeminiExplainer's
-        # identical reasoning in gap_finder.py - a bad ADC/project config
-        # must surface inside the try/except below, not in __init__,
-        # or this class's own "auth issues never crash the caller"
-        # promise breaks on first construction.
-        self._lock = threading.Lock()
-        self._client = client
-
-    def _get_client(self) -> genai.Client:
-        with self._lock:
-            if self._client is None:
-                self._client = genai.Client(
-                    vertexai=True,
-                    project=self._project or os.environ.get("GOOGLE_CLOUD_PROJECT"),
-                    location=self._location
-                    or os.environ.get("GOOGLE_CLOUD_LOCATION", "global"),
-                )
-            return self._client
 
     def __call__(self, claim_a: str, claim_b: str) -> _VerdictPayload | None:
         payload = {
@@ -128,48 +111,16 @@ class GeminiContradictionJudge:
             + json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
             + "</claim_pair>"
         )
-        try:
-            response = self._get_client().models.generate_content(
-                model=self._model,
-                contents=contents,
-                config=genai_types.GenerateContentConfig(
-                    system_instruction=_GEMINI_SYSTEM_INSTRUCTION,
-                    temperature=0,
-                    max_output_tokens=self._max_output_tokens,
-                    http_options=genai_types.HttpOptions(timeout=self._timeout_ms),
-                    # Same reasoning as GeminiExplainer: "thinking" tokens
-                    # count against max_output_tokens and can silently
-                    # consume nearly all of it on a short judgment task.
-                    thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
-                    response_mime_type="application/json",
-                    response_schema=_VerdictPayload,
-                ),
-            )
-            raw = (response.text or "").strip()
-            candidates = getattr(response, "candidates", None) or []
-            finish_reason = candidates[0].finish_reason if candidates else None
-            truncated = finish_reason == genai_types.FinishReason.MAX_TOKENS
-            if raw and not truncated:
-                try:
-                    return _VerdictPayload.model_validate_json(raw)
-                except ValueError:
-                    logger.warning(
-                        "GeminiContradictionJudge response failed schema "
-                        "validation",
-                        exc_info=True,
-                    )
-            elif truncated:
-                logger.warning(
-                    "GeminiContradictionJudge response was truncated by "
-                    "max_output_tokens"
-                )
-            else:
-                logger.warning("GeminiContradictionJudge got an empty response")
-        except Exception:
-            # Never let a Gemini outage/quota/config issue raise out of
-            # check_session - same tradeoff GeminiExplainer makes.
-            logger.warning("GeminiContradictionJudge call failed", exc_info=True)
-        return None
+        return call_structured_judge(
+            self._get_client,
+            model=self._model,
+            contents=contents,
+            system_instruction=_GEMINI_SYSTEM_INSTRUCTION,
+            response_schema=_VerdictPayload,
+            max_output_tokens=self._max_output_tokens,
+            timeout_ms=self._timeout_ms,
+            caller_name="GeminiContradictionJudge",
+        )
 
 
 def _has_contradicts_edge(graph_manager: GraphManager, a_id: str, b_id: str) -> bool:
@@ -200,6 +151,13 @@ class ContradictionFinder:
         # re-pay for a verdict already reached. Mirrors gap_finder.py's
         # _dismissed_pairs/feedback_events rehydration pattern.
         self._checked_pairs: set[tuple[str, str]] = set()
+        # Protects _checked_pairs's check-then-reserve step below - two
+        # concurrent check_session calls (a double-click, or two tabs on
+        # the same session) must not both pass the "not already checked"
+        # test for the same pair before either has reserved it, or both
+        # would call the paid Gemini judge and both would write a
+        # duplicate CONTRADICTS edge for the same pair.
+        self._pairs_lock = threading.Lock()
         if self._db is not None:
             self._rehydrate()
 
@@ -216,52 +174,91 @@ class ContradictionFinder:
         """Compare this session's CLAIM nodes pairwise for genuine
         disagreement. The embedding-similarity pre-filter is the full
         extent of what decides which pairs are even worth asking about -
-        Gemini only judges the survivors, it never invents candidates."""
-        claims = [
-            (node_id, data)
-            for node_id, data in self._gm.graph.nodes(data=True)
-            if data.get("type") == NodeType.CLAIM.value
-            and session_id in _session_ids(data)
-        ]
+        Gemini only judges the survivors, it never invents candidates.
 
-        pool: list[tuple[str, str, float]] = []
-        for i, (a_id, a_data) in enumerate(claims):
-            a_embedding = a_data.get("entity_embedding")
-            if not a_embedding:
-                continue
-            for b_id, b_data in claims[i + 1 :]:
-                b_embedding = b_data.get("entity_embedding")
-                if not b_embedding:
-                    continue
-                pair = tuple(sorted((a_id, b_id)))
-                if pair in self._checked_pairs or _has_contradicts_edge(
-                    self._gm, a_id, b_id
-                ):
-                    continue
-                similarity = _cosine_similarity(a_embedding, b_embedding)
-                if similarity >= self._similarity_threshold:
-                    pool.append((a_id, b_id, similarity))
+        Reads GraphManager's graph through its own lock (self._gm._lock,
+        the same RLock every GraphManager method already holds for its
+        own body) rather than iterating it raw - a concurrent ingest on
+        another thread mutating the graph mid-iteration here would
+        otherwise raise "dictionary changed size during iteration" and
+        500 this request. Only held for the snapshot read, not across
+        the slow per-pair Gemini judge calls below - holding a shared
+        lock across an external API call would block every other
+        request touching the graph for the duration of this whole check.
+        """
+        with self._gm._lock:
+            claims = [
+                (node_id, data)
+                for node_id, data in self._gm.graph.nodes(data=True)
+                if data.get("type") == NodeType.CLAIM.value
+                and session_id in _session_ids(data)
+            ]
 
-        # Most-similar pairs first - if max_llm_calls truncates the pool,
-        # the pairs most likely to actually be about the same thing get
-        # judged before more speculative ones.
-        pool.sort(key=lambda p: -p[2])
+            pool: list[tuple[str, str, float]] = []
+            for i, (a_id, a_data) in enumerate(claims):
+                a_embedding = a_data.get("entity_embedding")
+                if not a_embedding:
+                    continue
+                for b_id, b_data in claims[i + 1 :]:
+                    b_embedding = b_data.get("entity_embedding")
+                    if not b_embedding:
+                        continue
+                    pair = tuple(sorted((a_id, b_id)))
+                    if pair in self._checked_pairs or _has_contradicts_edge(
+                        self._gm, a_id, b_id
+                    ):
+                        continue
+                    similarity = _cosine_similarity(a_embedding, b_embedding)
+                    if similarity >= self._similarity_threshold:
+                        pool.append((a_id, b_id, similarity))
+
+            # Most-similar pairs first - if max_llm_calls truncates the pool,
+            # the pairs most likely to actually be about the same thing get
+            # judged before more speculative ones.
+            pool.sort(key=lambda p: -p[2])
+
+            # Snapshot the text needed for judging while still under the
+            # graph lock - the judge calls themselves happen after it's
+            # released, below.
+            snapshot = []
+            for a_id, b_id, _similarity in pool[:max_llm_calls]:
+                a_data = self._gm.graph.nodes[a_id]
+                b_data = self._gm.graph.nodes[b_id]
+                snapshot.append(
+                    (
+                        a_id,
+                        b_id,
+                        a_data.get("description") or a_data.get("name", ""),
+                        b_data.get("description") or b_data.get("name", ""),
+                    )
+                )
 
         results: list[ContradictionCandidate] = []
-        for a_id, b_id, _similarity in pool[:max_llm_calls]:
-            a_data = self._gm.graph.nodes[a_id]
-            b_data = self._gm.graph.nodes[b_id]
-            a_text = a_data.get("description") or a_data.get("name", "")
-            b_text = b_data.get("description") or b_data.get("name", "")
+        for a_id, b_id, a_text, b_text in snapshot:
+            pair = tuple(sorted((a_id, b_id)))
+            with self._pairs_lock:
+                if pair in self._checked_pairs:
+                    # Either genuinely already judged, or a concurrent
+                    # call already reserved it below and is judging it
+                    # right now - either way, this call must not also
+                    # judge/write it.
+                    continue
+                # Reserved eagerly, before the (slow, paid) judge call -
+                # this is what actually prevents two concurrent calls
+                # from both judging and both writing a duplicate edge
+                # for the same pair, not just recording the result after
+                # the fact.
+                self._checked_pairs.add(pair)
+
             verdict = self._judge(a_text, b_text)
             if verdict is None:
                 # A failed call, not a real "consistent"/"unrelated"
-                # answer - must not be marked checked, or a transient
+                # answer - must not stay marked checked, or a transient
                 # Gemini outage would permanently skip this pair.
+                with self._pairs_lock:
+                    self._checked_pairs.discard(pair)
                 continue
 
-            pair = tuple(sorted((a_id, b_id)))
-            self._checked_pairs.add(pair)
             if self._db is not None:
                 self._db.collection("claim_comparisons").document(
                     str(uuid.uuid4())
