@@ -16,6 +16,7 @@ from agent.clarification_orchestrator import ClarificationOrchestrator
 from agent.contradiction_finder import ContradictionFinder, GeminiContradictionJudge
 from agent.document_ingestion import PdfTextExtractor
 from agent.extraction_agent import ExtractionAgent
+from agent.feynman_checker import FeynmanChecker, GeminiFeynmanJudge
 from agent.gap_finder import GapFinder, GeminiExplainer
 from agent.gemini_extractor import GeminiStructuredExtractor
 from agent.general_chat import GeneralChatAgent
@@ -38,6 +39,7 @@ class AppState:
     paper_guide: PaperGuideAgent
     gap_finder: GapFinder
     contradiction_finder: ContradictionFinder
+    feynman_checker: FeynmanChecker
     extraction_agent: ExtractionAgent
     research_store: ResearchStore
     upload_root: str
@@ -94,6 +96,10 @@ def build_state() -> AppState:
         judge=GeminiContradictionJudge(project=project, location=location),
         db_client=db,
     )
+    feynman_checker = FeynmanChecker(
+        graph,
+        judge=GeminiFeynmanJudge(project=project, location=location),
+    )
 
     upload_root = os.environ.get("UPLOAD_ROOT", "/tmp/uploads")
     os.makedirs(upload_root, exist_ok=True)
@@ -114,6 +120,7 @@ def build_state() -> AppState:
         paper_guide=paper_guide,
         gap_finder=gap_finder,
         contradiction_finder=contradiction_finder,
+        feynman_checker=feynman_checker,
         extraction_agent=extraction_agent,
         research_store=research_store,
         upload_root=upload_root,

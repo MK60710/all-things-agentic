@@ -10,6 +10,7 @@ from agent.clarification_orchestrator import ClarificationOrchestrator
 from agent.contradiction_finder import ContradictionFinder
 from agent.document_ingestion import PdfTextExtractor
 from agent.extraction_agent import ChunkOnlyStructuredExtractor, ExtractionAgent
+from agent.feynman_checker import FeynmanChecker
 from agent.gap_finder import GapFinder
 from agent.general_chat import GeneralChatAgent
 from agent.graph_manager import GraphManager
@@ -34,6 +35,11 @@ def _no_op_judge(claim_a: str, claim_b: str):
     return None
 
 
+def _no_op_feynman_judge(node_name: str, node_description: str, explanation: str):
+    """Same reasoning as _no_op_judge, for GeminiFeynmanJudge."""
+    return None
+
+
 @pytest.fixture
 def app_state(fake_db, tmp_path) -> AppState:
     graph = GraphManager(project_id="test", db_client=fake_db)
@@ -51,6 +57,7 @@ def app_state(fake_db, tmp_path) -> AppState:
         paper_guide=PaperGuideAgent(),
         gap_finder=GapFinder(graph, db_client=fake_db),
         contradiction_finder=ContradictionFinder(graph, judge=_no_op_judge, db_client=fake_db),
+        feynman_checker=FeynmanChecker(graph, judge=_no_op_feynman_judge),
         extraction_agent=ExtractionAgent(
             document_extractor=PdfTextExtractor(allowed_root=str(tmp_path)),
             structured_extractor=ChunkOnlyStructuredExtractor(),
@@ -219,6 +226,118 @@ def test_contradictions_check_endpoint_returns_empty_when_nothing_to_compare(cli
 def test_contradictions_check_endpoint_404s_for_unknown_session(client):
     response = client.post("/sessions/does-not-exist/contradictions/check")
     assert response.status_code == 404
+
+
+def test_feynman_prompts_endpoint_404s_for_unknown_paper(client):
+    response = client.get("/papers/does-not-exist/feynman/prompts?session_id=session-a")
+    assert response.status_code == 404
+
+
+def test_feynman_prompts_endpoint_returns_testable_nodes_for_the_paper(client, app_state):
+    app_state.paper_store.save("paper-a", title="Paper A", status="ready", session_id="session-a")
+    paper = Node(id="paper-a", type=NodeType.PAPER, name="Paper A", description="Source paper", session_id="session-a")
+    concept = Node(id="concept-a", type=NodeType.CONCEPT, name="Concept A", description="A concept with a real, substantive description.", session_id="session-a")
+    app_state.graph.add_node(paper)
+    app_state.graph.add_node(concept)
+    app_state.graph.add_edge(
+        Edge(
+            id="edge-a",
+            source_id="paper-a",
+            target_id="concept-a",
+            type=EdgeType.USES,
+            provenance=ProvenanceTag.EXTRACTED,
+            source_paper_id="paper-a",
+            session_id="session-a",
+        )
+    )
+
+    response = client.get("/papers/paper-a/feynman/prompts?session_id=session-a")
+
+    assert response.status_code == 200
+    prompts = response.json()
+    assert len(prompts) == 1
+    assert prompts[0]["node_id"] == "concept-a"
+
+
+def test_feynman_check_endpoint_404s_for_unknown_paper(client):
+    response = client.post(
+        "/papers/does-not-exist/feynman/check",
+        json={"node_id": "concept-a", "session_id": "session-a", "explanation": "It helps."},
+    )
+    assert response.status_code == 404
+
+
+def _link_node_to_paper(app_state, node_id: str, paper_id: str, session_id: str) -> None:
+    app_state.graph.add_edge(
+        Edge(
+            id=f"edge-{node_id}-{paper_id}",
+            source_id=paper_id,
+            target_id=node_id,
+            type=EdgeType.USES,
+            provenance=ProvenanceTag.EXTRACTED,
+            source_paper_id=paper_id,
+            session_id=session_id,
+        )
+    )
+
+
+def test_feynman_check_endpoint_502s_when_the_judge_fails(client, app_state):
+    """app_state's feynman_checker uses _no_op_feynman_judge, which always
+    returns None - mirrors how a real Gemini outage should surface as a
+    clear error, not a fabricated verdict."""
+    app_state.paper_store.save("paper-a", title="Paper A", status="ready", session_id="session-a")
+    paper = Node(id="paper-a", type=NodeType.PAPER, name="Paper A", description="Source paper", session_id="session-a")
+    concept = Node(id="concept-a", type=NodeType.CONCEPT, name="Concept A", description="A concept", session_id="session-a")
+    app_state.graph.add_node(paper)
+    app_state.graph.add_node(concept)
+    _link_node_to_paper(app_state, "concept-a", "paper-a", "session-a")
+
+    response = client.post(
+        "/papers/paper-a/feynman/check",
+        json={"node_id": "concept-a", "session_id": "session-a", "explanation": "It helps."},
+    )
+
+    assert response.status_code == 502
+
+
+def test_feynman_check_endpoint_rejects_a_node_from_a_different_session(client, app_state):
+    """Router-level regression test for the live-confirmed cross-session
+    leak: a node_id that belongs to a different session must be rejected
+    before it ever reaches the judge, not just filtered client-side."""
+    app_state.paper_store.save("paper-a", title="Paper A", status="ready", session_id="session-a")
+    paper = Node(id="paper-a", type=NodeType.PAPER, name="Paper A", description="Source paper", session_id="session-a")
+    foreign_concept = Node(
+        id="foreign-concept",
+        type=NodeType.CONCEPT,
+        name="Foreign Concept",
+        description="Belongs to a different session entirely.",
+        session_id="session-b",
+    )
+    app_state.graph.add_node(paper)
+    app_state.graph.add_node(foreign_concept)
+    _link_node_to_paper(app_state, "foreign-concept", "paper-a", "session-b")
+
+    response = client.post(
+        "/papers/paper-a/feynman/check",
+        json={"node_id": "foreign-concept", "session_id": "session-a", "explanation": "attacker probe"},
+    )
+
+    assert response.status_code == 502
+
+
+def test_feynman_check_endpoint_rejects_an_oversized_explanation(client, app_state):
+    """Confirmed live: with no cap, a 5MB explanation was accepted and took
+    17+ seconds before failing - a free cost/DoS surface on a paid,
+    per-call Gemini endpoint. Must 422 before it ever reaches the graph
+    lookup or the judge, not fail slowly downstream."""
+    app_state.paper_store.save("paper-a", title="Paper A", status="ready", session_id="session-a")
+
+    response = client.post(
+        "/papers/paper-a/feynman/check",
+        json={"node_id": "concept-a", "session_id": "session-a", "explanation": "x" * 4001},
+    )
+
+    assert response.status_code == 422
 
 
 def test_rename_session_404_for_unknown_session(client):

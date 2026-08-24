@@ -86,6 +86,20 @@ export interface SessionGraphEdge {
   relation: string;
 }
 
+export interface FeynmanPrompt {
+  node_id: string;
+  node_name: string;
+  question: string;
+}
+
+export interface FeynmanCheckResult {
+  node_id: string;
+  node_name: string;
+  verdict: "strong" | "weak" | "wrong";
+  explanation: string;
+  citation?: Citation | null;
+}
+
 export interface ContradictionCandidate {
   claim_a_id: string;
   claim_b_id: string;

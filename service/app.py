@@ -15,7 +15,7 @@ import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from service.routers import chat, clarifications, contradictions, gaps, health, papers, query, sessions
+from service.routers import chat, clarifications, contradictions, feynman, gaps, health, papers, query, sessions
 from service.state import build_state
 
 
@@ -45,5 +45,5 @@ app.add_middleware(
     allow_headers=["Content-Type", "X-API-Key", "X-Upload-Token"],
 )
 
-for router in (health.router, chat.router, query.router, clarifications.router, gaps.router, contradictions.router, papers.router, sessions.router):
+for router in (health.router, chat.router, query.router, clarifications.router, gaps.router, contradictions.router, feynman.router, papers.router, sessions.router):
     app.include_router(router)
