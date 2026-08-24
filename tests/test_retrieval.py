@@ -162,3 +162,71 @@ def test_chunk_index_rehydrates_persisted_records(fake_db):
     assert restored.count() == 1
     assert hits[0].paper_id == "paper-restart"
     assert "survives restart" in hits[0].text
+
+
+def test_concurrent_search_and_upsert_does_not_crash(fake_db):
+    """_records is a plain dict shared across FastAPI's concurrently-run
+    sync route handlers (chat search vs. paper ingest) - same
+    "dictionary changed size during iteration" crash risk
+    GraphManager's own concurrency test guards against. Runs against a
+    real fake_db so the Firestore I/O path (moved outside self._lock in
+    upsert_paper/remove_paper, since it's real network calls that
+    shouldn't serialize concurrent searches for their duration) is
+    exercised concurrently too, not just the in-memory mutation.
+
+    Wraps _records in a dict subclass that sleeps on every
+    __setitem__/__delitem__ - confirmed by hand that without this delay,
+    pure-Python GIL scheduling does NOT reliably interleave these two
+    threads within a normal test run, so this test would pass even with
+    self._lock's protection completely removed. The delay widens the
+    window right at the mutation point (not e.g. inside embedding_fn,
+    which upsert_paper deliberately runs outside the lock now) so this
+    test actually fails if _lock's protection is ever removed - verified
+    directly: with the lock's usage stripped, this exact setup reliably
+    raised RuntimeError on every run; restored, zero errors."""
+    import threading
+
+    class _SlowDict(dict):
+        def __setitem__(self, key, value):
+            threading.Event().wait(0.002)
+            super().__setitem__(key, value)
+
+        def __delitem__(self, key):
+            threading.Event().wait(0.002)
+            super().__delitem__(key)
+
+    index = ChunkIndex(db_client=fake_db)
+    for i in range(20):
+        index.upsert_paper(f"seed-paper-{i}", [f"seed chunk about topic {i}"])
+    index._records = _SlowDict(index._records)
+
+    errors: list[Exception] = []
+    stop = threading.Event()
+
+    def searcher() -> None:
+        while not stop.is_set():
+            try:
+                index.search("seed chunk topic", min_score=0.0)
+            except Exception as exc:  # pragma: no cover - failure path only
+                errors.append(exc)
+                return
+
+    def writer() -> None:
+        for i in range(50):
+            try:
+                index.upsert_paper(f"concurrent-paper-{i}", [f"concurrent chunk {i}"])
+            except Exception as exc:  # pragma: no cover - failure path only
+                errors.append(exc)
+                return
+
+    threads = [threading.Thread(target=searcher) for _ in range(4)]
+    writer_thread = threading.Thread(target=writer)
+    for t in threads:
+        t.start()
+    writer_thread.start()
+    writer_thread.join()
+    stop.set()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"concurrent access raised: {errors}"

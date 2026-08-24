@@ -18,8 +18,10 @@ This script mirrors that - a doc still genuinely shared with another
 session survives, with just this session's membership stripped from it;
 only a doc that becomes ownerless is actually deleted. Older docs written
 before multi-session membership existed only ever had a single
-"session_id" field - _member_of below falls back to that, so this script
-still finds and correctly cleans up that legacy data too.
+"session_id" field - agent.session_membership.session_ids (the one
+shared implementation of this, also used by GraphManager and PaperStore)
+falls back to that, so this script still finds and correctly cleans up
+that legacy data too.
 """
 
 from __future__ import annotations
@@ -28,19 +30,15 @@ import argparse
 import os
 from typing import Any
 
+from agent.session_membership import session_ids as _session_ids
+
 
 def _member_of(data: dict, session_id: str) -> bool:
-    session_ids = data.get("session_ids")
-    if session_ids:
-        return session_id in session_ids
-    return data.get("session_id") == session_id
+    return session_id in _session_ids(data)
 
 
 def _remaining_sessions(data: dict, session_id: str) -> list[str]:
-    session_ids = data.get("session_ids")
-    if not session_ids:
-        session_ids = [data["session_id"]] if data.get("session_id") else []
-    return [s for s in session_ids if s != session_id]
+    return [s for s in _session_ids(data) if s != session_id]
 
 
 def _strip_or_delete(collection: Any, session_id: str) -> tuple[list[str], list[str]]:

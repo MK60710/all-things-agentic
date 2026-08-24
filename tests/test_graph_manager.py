@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import uuid
 
 import pytest
@@ -622,6 +623,58 @@ def test_apply_extraction_result_reused_node_adds_the_new_session_alongside_the_
     reused_node_id = report.node_writes[0].node_id
     assert report.node_writes[0].reused_existing_node is True
     assert gm.graph.nodes[reused_node_id]["session_ids"] == ["session-a", "session-b"]
+
+
+def test_concurrent_ingests_of_the_same_new_entity_do_not_create_duplicate_nodes(fake_db, monkeypatch):
+    """Two real threads, each ingesting a different paper that introduces
+    the exact same new entity name, must not each independently decide
+    "new" and create two separate nodes for the same real-world entity -
+    the exact race apply_extraction_result's own docstring used to
+    document as an accepted, unresolved gap.
+
+    canonicalize is patched to sleep briefly right after computing its
+    decision - GIL/thread scheduling alone doesn't reliably interleave
+    two tight, no-I/O method calls in-process, so without an artificial
+    pause here this test can pass even when the lock fix is missing
+    (verified: it did, before this patch was added). The pause forces a
+    real race window instead of depending on scheduling luck."""
+    gm = _make_manager(fake_db)
+    real_canonicalize = GraphManager.canonicalize
+
+    def slow_canonicalize(self, *args, **kwargs):
+        result = real_canonicalize(self, *args, **kwargs)
+        threading.Event().wait(0.05)
+        return result
+
+    monkeypatch.setattr(GraphManager, "canonicalize", slow_canonicalize)
+
+    def ingest(paper_id: str):
+        extraction = ExtractionResult(
+            paper_id=paper_id,
+            entities=[
+                ExtractedEntity(
+                    name="Retrieval-Augmented Generation",
+                    type=NodeType.CONCEPT,
+                    description="",
+                )
+            ],
+            relations=[],
+        )
+        gm.apply_extraction_result(extraction, session_id="session-a")
+
+    t1 = threading.Thread(target=ingest, args=("paper-one",))
+    t2 = threading.Thread(target=ingest, args=("paper-two",))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    matching_nodes = [
+        node_id
+        for node_id, data in gm.graph.nodes(data=True)
+        if data.get("name") == "Retrieval-Augmented Generation"
+    ]
+    assert len(matching_nodes) == 1
 
 
 def test_apply_extraction_result_paper_node_reingest_adds_the_new_session(fake_db):

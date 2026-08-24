@@ -42,6 +42,16 @@ class ChatRequest(BaseModel):
     # session_id - the frontend already holds it in currentSession state,
     # and /chat has no session_id field to look it up by.
     goal: str | None = Field(default=None, max_length=300)
+    # Optional: when given, the router validates paper_ids against this
+    # session's real paper membership server-side rather than trusting
+    # the client array outright - every other session-scoped route
+    # already resolves things from session_id server-side (gaps.py,
+    # feynman.py, sessions.py); chat was the one place scoping was only
+    # ever reconstructed and resent by the client with nothing to check
+    # it against. Optional (not required) so unscoped/general chat and
+    # any caller that genuinely has no session concept keep working
+    # unchanged.
+    session_id: str | None = Field(default=None, max_length=200)
     # Set when the frontend already knows exactly which node the question
     # is about - e.g. clicking a specific candidate on an ambiguous
     # result - so QueryAgent skips text search/ambiguity detection and

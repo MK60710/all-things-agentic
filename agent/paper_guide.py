@@ -57,7 +57,7 @@ class PaperGuideAgent:
         *,
         project: str | None = None,
         location: str = "global",
-        model: str = "gemini-2.5-flash-lite",
+        model: str = "gemini-3.5-flash-lite",
         client: Any | None = None,
         max_source_characters: int = 120_000,
     ) -> None:

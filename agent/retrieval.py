@@ -11,6 +11,7 @@ import hashlib
 import json
 import math
 import re
+import threading
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -120,6 +121,13 @@ class ChunkIndex:
         self._embedding_fn = embedding_fn or LocalHashingEmbedder()
         self._db = db_client
         self._records: dict[str, ChunkRecord] = {}
+        # FastAPI runs sync route handlers concurrently against one shared
+        # ChunkIndex instance (chat/query search+assemble_context reading
+        # _records while an ingest's upsert_paper mutates it on another
+        # thread) - same "dictionary changed size during iteration" crash
+        # risk GraphManager's own RLock exists to prevent, reached here by
+        # not having an equivalent lock at all.
+        self._lock = threading.RLock()
         if self._db is not None:
             self._rehydrate()
 
@@ -155,14 +163,25 @@ class ChunkIndex:
         """Drop every chunk for paper_id from both the in-memory index and
         Firestore - same removal logic upsert_paper already runs on stale
         chunks during a re-ingest, just callable on its own for a real
-        delete rather than only as a side effect of adding new chunks."""
-        stale_ids = [
-            chunk_id
-            for chunk_id, record in self._records.items()
-            if record.paper_id == paper_id
-        ]
-        for chunk_id in stale_ids:
-            del self._records[chunk_id]
+        delete rather than only as a side effect of adding new chunks.
+
+        The lock only wraps the in-memory dict mutation, not the Firestore
+        delete loop below - that's real network I/O, and the lock exists
+        to protect _records from concurrent mutation/iteration (the same
+        crash risk GraphManager's RLock prevents), not to make this
+        method atomic with Firestore. Holding it across N sequential
+        network deletes would otherwise block every concurrent chat
+        search for the duration of this call - see upsert_paper for the
+        same reasoning, it's the more consequential case since ingest
+        writes are far more numerous than a session teardown's deletes."""
+        with self._lock:
+            stale_ids = [
+                chunk_id
+                for chunk_id, record in self._records.items()
+                if record.paper_id == paper_id
+            ]
+            for chunk_id in stale_ids:
+                del self._records[chunk_id]
         if self._db is not None:
             persisted = self._db.collection("chunks")
             for snapshot in list(persisted.where("paper_id", "==", paper_id).stream()):
@@ -172,6 +191,16 @@ class ChunkIndex:
     def upsert_paper(
         self, paper_id: str, chunks: list[str] | list[ExtractionChunk]
     ) -> list[str]:
+        """The lock only wraps the in-memory _records mutation below, not
+        the Firestore reads/writes - those are real network calls, one
+        per chunk, and holding a shared lock across all of them would
+        serialize every concurrent chat search for the duration of the
+        whole ingest. The lock's job is protecting _records from
+        concurrent mutation/iteration (search/assemble_context/count all
+        take it too), not making this method atomic with Firestore -
+        Firestore writes here are already idempotent per chunk_id, so
+        doing them outside the lock changes nothing about correctness,
+        only how long other threads wait."""
         prepared: list[tuple[ExtractionChunk, str, str]] = []
         for ordinal, value in enumerate(chunks):
             chunk = (
@@ -192,44 +221,50 @@ class ChunkIndex:
             prepared.append((chunk, normalized, chunk_id))
 
         chunk_ids = [chunk_id for _, _, chunk_id in prepared]
-        stale_ids = [
-            chunk_id
-            for chunk_id, record in self._records.items()
-            if record.paper_id == paper_id and chunk_id not in chunk_ids
-        ]
-        for chunk_id in stale_ids:
-            del self._records[chunk_id]
+        records: list[ChunkRecord] = []
+        for index, (chunk, normalized, chunk_id) in enumerate(prepared):
+            records.append(
+                ChunkRecord(
+                    id=chunk_id,
+                    paper_id=paper_id,
+                    ordinal=chunk.ordinal,
+                    text=normalized,
+                    page_start=chunk.page_start,
+                    page_end=chunk.page_end,
+                    section=chunk.section,
+                    source=chunk.source,
+                    content_type=chunk.content_type,
+                    previous_chunk_id=chunk_ids[index - 1] if index > 0 else None,
+                    next_chunk_id=(
+                        chunk_ids[index + 1] if index + 1 < len(chunk_ids) else None
+                    ),
+                    embedding=self._embedding_fn(normalized),
+                )
+            )
+
+        with self._lock:
+            stale_ids = [
+                chunk_id
+                for chunk_id, record in self._records.items()
+                if record.paper_id == paper_id and chunk_id not in chunk_ids
+            ]
+            for chunk_id in stale_ids:
+                del self._records[chunk_id]
+            for record in records:
+                self._records[record.id] = record
+
         if self._db is not None:
             persisted = self._db.collection("chunks")
             matching = persisted.where("paper_id", "==", paper_id)
             for snapshot in list(matching.stream()):
                 if snapshot.id not in chunk_ids:
                     persisted.document(snapshot.id).delete()
-
-        for index, (chunk, normalized, chunk_id) in enumerate(prepared):
-            record = ChunkRecord(
-                id=chunk_id,
-                paper_id=paper_id,
-                ordinal=chunk.ordinal,
-                text=normalized,
-                page_start=chunk.page_start,
-                page_end=chunk.page_end,
-                section=chunk.section,
-                source=chunk.source,
-                content_type=chunk.content_type,
-                previous_chunk_id=chunk_ids[index - 1] if index > 0 else None,
-                next_chunk_id=(
-                    chunk_ids[index + 1] if index + 1 < len(chunk_ids) else None
-                ),
-                embedding=self._embedding_fn(normalized),
-            )
-            self._records[chunk_id] = record
-            if self._db is not None:
-                self._db.collection("chunks").document(chunk_id).set(
+            for record in records:
+                persisted.document(record.id).set(
                     {
                         "paper_id": paper_id,
                         "ordinal": record.ordinal,
-                        "text": normalized,
+                        "text": record.text,
                         "page_start": record.page_start,
                         "page_end": record.page_end,
                         "section": record.section,
@@ -253,37 +288,38 @@ class ChunkIndex:
     ) -> list[SearchHit]:
         if limit < 1:
             return []
-        query_embedding = self._embedding_fn(query)
-        query_tokens = _search_tokens(query)
-        hits = []
-        for record in self._records.values():
-            if paper_ids is not None and record.paper_id not in paper_ids:
-                continue
-            vector_score = max(
-                0.0, _cosine_similarity(query_embedding, record.embedding)
-            )
-            record_tokens = _search_tokens(record.text)
-            lexical_score = (
-                len(query_tokens & record_tokens) / len(query_tokens)
-                if query_tokens
-                else 0.0
-            )
-            score = 0.65 * lexical_score + 0.35 * vector_score
-            if score >= min_score:
-                hits.append(
-                    SearchHit(
-                        record.id,
-                        record.paper_id,
-                        record.text,
-                        score,
-                        record.ordinal,
-                        record.page_start,
-                        record.page_end,
-                        record.section,
-                    )
+        with self._lock:
+            query_embedding = self._embedding_fn(query)
+            query_tokens = _search_tokens(query)
+            hits = []
+            for record in self._records.values():
+                if paper_ids is not None and record.paper_id not in paper_ids:
+                    continue
+                vector_score = max(
+                    0.0, _cosine_similarity(query_embedding, record.embedding)
                 )
-        hits.sort(key=lambda hit: (-hit.score, hit.chunk_id))
-        return hits[:limit]
+                record_tokens = _search_tokens(record.text)
+                lexical_score = (
+                    len(query_tokens & record_tokens) / len(query_tokens)
+                    if query_tokens
+                    else 0.0
+                )
+                score = 0.65 * lexical_score + 0.35 * vector_score
+                if score >= min_score:
+                    hits.append(
+                        SearchHit(
+                            record.id,
+                            record.paper_id,
+                            record.text,
+                            score,
+                            record.ordinal,
+                            record.page_start,
+                            record.page_end,
+                            record.section,
+                        )
+                    )
+            hits.sort(key=lambda hit: (-hit.score, hit.chunk_id))
+            return hits[:limit]
 
     def assemble_context(
         self,
@@ -296,69 +332,72 @@ class ChunkIndex:
     ) -> AssembledContext:
         """Retrieve, expand around hits, and restore paper reading order."""
 
-        seeds = self.search(query, limit=limit, paper_ids=paper_ids)
-        selected: dict[str, tuple[ChunkRecord, float]] = {}
-        for seed in seeds:
-            record = self._records[seed.chunk_id]
-            selected[record.id] = (record, seed.score)
-            for direction in ("previous_chunk_id", "next_chunk_id"):
-                cursor = record
-                for _ in range(max(0, neighbor_window)):
-                    neighbor_id = getattr(cursor, direction)
-                    if neighbor_id is None or neighbor_id not in self._records:
-                        break
-                    cursor = self._records[neighbor_id]
-                    selected.setdefault(cursor.id, (cursor, seed.score))
+        with self._lock:
+            seeds = self.search(query, limit=limit, paper_ids=paper_ids)
+            selected: dict[str, tuple[ChunkRecord, float]] = {}
+            for seed in seeds:
+                record = self._records[seed.chunk_id]
+                selected[record.id] = (record, seed.score)
+                for direction in ("previous_chunk_id", "next_chunk_id"):
+                    cursor = record
+                    for _ in range(max(0, neighbor_window)):
+                        neighbor_id = getattr(cursor, direction)
+                        if neighbor_id is None or neighbor_id not in self._records:
+                            break
+                        cursor = self._records[neighbor_id]
+                        selected.setdefault(cursor.id, (cursor, seed.score))
 
-        ordered = sorted(
-            selected.values(), key=lambda item: (item[0].paper_id, item[0].ordinal)
-        )
-        hits: list[SearchHit] = []
-        sections: list[str] = []
-        used_characters = 0
-        for record, score in ordered:
-            page = (
-                str(record.page_start)
-                if record.page_start == record.page_end
-                else f"{record.page_start}-{record.page_end}"
+            ordered = sorted(
+                selected.values(), key=lambda item: (item[0].paper_id, item[0].ordinal)
             )
-            metadata: dict[str, str] = {
-                "paper_id": _escape_tag_delimiters(record.paper_id)
-            }
-            if record.section:
-                metadata["section"] = _escape_tag_delimiters(record.section)
-            if record.page_start is not None:
-                metadata["page"] = page
-            rendered = (
-                "<source_metadata>"
-                + json.dumps(metadata, ensure_ascii=True, separators=(",", ":"))
-                + "</source_metadata>\n"
-                + _escape_tag_delimiters(record.text)
-            )
-            if sections and used_characters + len(rendered) > max_characters:
-                break
-            sections.append(rendered)
-            used_characters += len(rendered)
-            hits.append(
-                SearchHit(
-                    record.id,
-                    record.paper_id,
-                    record.text,
-                    score,
-                    record.ordinal,
-                    record.page_start,
-                    record.page_end,
-                    record.section,
+            hits: list[SearchHit] = []
+            sections: list[str] = []
+            used_characters = 0
+            for record, score in ordered:
+                page = (
+                    str(record.page_start)
+                    if record.page_start == record.page_end
+                    else f"{record.page_start}-{record.page_end}"
                 )
-            )
-        return AssembledContext(hits=hits, text="\n\n".join(sections))
+                metadata: dict[str, str] = {
+                    "paper_id": _escape_tag_delimiters(record.paper_id)
+                }
+                if record.section:
+                    metadata["section"] = _escape_tag_delimiters(record.section)
+                if record.page_start is not None:
+                    metadata["page"] = page
+                rendered = (
+                    "<source_metadata>"
+                    + json.dumps(metadata, ensure_ascii=True, separators=(",", ":"))
+                    + "</source_metadata>\n"
+                    + _escape_tag_delimiters(record.text)
+                )
+                if sections and used_characters + len(rendered) > max_characters:
+                    break
+                sections.append(rendered)
+                used_characters += len(rendered)
+                hits.append(
+                    SearchHit(
+                        record.id,
+                        record.paper_id,
+                        record.text,
+                        score,
+                        record.ordinal,
+                        record.page_start,
+                        record.page_end,
+                        record.section,
+                    )
+                )
+            return AssembledContext(hits=hits, text="\n\n".join(sections))
 
     def count(self) -> int:
-        return len(self._records)
+        with self._lock:
+            return len(self._records)
 
     def paper_chunks(self, paper_id: str) -> list[ChunkRecord]:
         """Return one paper's indexed chunks in reading order for guided reading."""
-        return sorted(
-            (record for record in self._records.values() if record.paper_id == paper_id),
-            key=lambda record: record.ordinal,
-        )
+        with self._lock:
+            return sorted(
+                (record for record in self._records.values() if record.paper_id == paper_id),
+                key=lambda record: record.ordinal,
+            )

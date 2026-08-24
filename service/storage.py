@@ -8,6 +8,8 @@ import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from agent.session_membership import session_ids as _paper_session_ids
+
 
 class UploadTokenStore:
     def __init__(self, db_client: Any, *, ttl_seconds: int = 120) -> None:
@@ -50,21 +52,20 @@ class UploadTokenStore:
         return data
 
 
-def _paper_session_ids(data: dict[str, Any]) -> list[str]:
-    """Mirrors agent.graph_manager._session_ids's exact reasoning for the
-    same problem, one layer up: a paper record's real session membership,
-    falling back to the pre-multi-session "session_id" scalar field for
-    records written before this existed - no migration script needed."""
-    session_ids = data.get("session_ids")
-    if session_ids:
-        return session_ids
-    legacy = data.get("session_id")
-    return [legacy] if legacy else []
-
-
 class PaperStore:
     def __init__(self, db_client: Any) -> None:
         self._collection = db_client.collection("papers")
+        # save()'s and detach_session()'s session-membership merges are
+        # both a read-then-write over the same document - two concurrent
+        # calls (e.g. the same paper re-ingested into two sessions at
+        # once) can each read the same "before" state and then each
+        # write their own merged result, the second clobbering the
+        # first. This is the exact bug class save()'s own docstring says
+        # was already found and fixed once for the sequential case;
+        # this lock closes the same gap under real concurrency. In-
+        # process only, matching GraphManager's own RLock and this
+        # service's documented single-instance deploy profile.
+        self._lock = threading.Lock()
 
     def save(self, paper_id: str, **values: Any) -> dict[str, Any]:
         """A `session_id` kwarg is treated specially: it's session-
@@ -75,37 +76,39 @@ class PaperStore:
         a paper elsewhere silently made it vanish from its original
         session's paper list with no warning. Every other field keeps
         the exact same partial-field-merge behavior as before."""
-        if "session_id" in values:
-            new_session_id = values.pop("session_id")
-            existing = self.get(paper_id) or {}
-            merged = set(_paper_session_ids(existing))
-            if new_session_id:
-                merged.add(new_session_id)
-            values["session_ids"] = sorted(merged)
-        data = {
-            "id": paper_id,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-            **values,
-        }
-        self._collection.document(paper_id).set(data, merge=True)
-        return data
+        with self._lock:
+            if "session_id" in values:
+                new_session_id = values.pop("session_id")
+                existing = self.get(paper_id) or {}
+                merged = set(_paper_session_ids(existing))
+                if new_session_id:
+                    merged.add(new_session_id)
+                values["session_ids"] = sorted(merged)
+            data = {
+                "id": paper_id,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                **values,
+            }
+            self._collection.document(paper_id).set(data, merge=True)
+            return data
 
     def detach_session(self, paper_id: str, session_id: str) -> dict[str, Any]:
         """Removes just this one session's membership - the record (and
         its chunks/graph data) survives if another session still has it.
         The caller decides whether to fully delete once ownerless (see
         service/routers/sessions.py's delete_session cascade)."""
-        existing = self.get(paper_id) or {}
-        remaining = [s for s in _paper_session_ids(existing) if s != session_id]
-        data = {
-            **existing,
-            "id": paper_id,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-            "session_ids": remaining,
-        }
-        data.pop("session_id", None)
-        self._collection.document(paper_id).set(data, merge=True)
-        return data
+        with self._lock:
+            existing = self.get(paper_id) or {}
+            remaining = [s for s in _paper_session_ids(existing) if s != session_id]
+            data = {
+                **existing,
+                "id": paper_id,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "session_ids": remaining,
+            }
+            data.pop("session_id", None)
+            self._collection.document(paper_id).set(data, merge=True)
+            return data
 
     def list(self) -> list[dict[str, Any]]:
         papers = [snapshot.to_dict() for snapshot in self._collection.stream()]
