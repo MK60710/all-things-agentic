@@ -391,6 +391,43 @@ def test_delete_session_404_for_unknown_session(client):
     assert response.status_code == 404
 
 
+def test_delete_session_leaves_a_paper_shared_with_another_session_intact(client, app_state):
+    """A paper (and its graph node) added to two sessions must survive
+    deleting one of them - only removed once every session sharing it is
+    gone. Regression test for the exact live-confirmed bug: re-ingesting
+    a paper into a second session used to silently steal it from the
+    first, and this is the other half - deleting either session must not
+    destroy data the other one still legitimately owns."""
+    session_a = client.post("/sessions", json={"name": "Session A"}).json()["id"]
+    session_b = client.post("/sessions", json={"name": "Session B"}).json()["id"]
+
+    app_state.paper_store.save("shared-paper", title="Shared Paper", status="ready", session_id=session_a)
+    app_state.paper_store.save("shared-paper", title="Shared Paper", status="ready", session_id=session_b)
+    app_state.chunks.upsert_paper("shared-paper", ["Some shared paper text."])
+    shared_node = Node(id="shared-node", type=NodeType.CONCEPT, name="Shared Concept")
+    app_state.graph.add_node(shared_node)
+    app_state.graph.add_node(Node(**{**shared_node.model_dump(), "session_id": session_a}))
+    app_state.graph.add_node(Node(**{**shared_node.model_dump(), "session_id": session_b}))
+
+    response = client.delete(f"/sessions/{session_a}")
+
+    assert response.status_code == 204
+    # Session A is gone, but the shared paper/node survive via session B.
+    assert any(p["id"] == "shared-paper" for p in app_state.paper_store.list())
+    assert app_state.chunks.paper_chunks("shared-paper") != []
+    assert "shared-node" in app_state.graph.graph
+    listing = client.get("/papers", params={"session_id": session_b}).json()
+    assert {p["id"] for p in listing} == {"shared-paper"}
+
+    response = client.delete(f"/sessions/{session_b}")
+
+    assert response.status_code == 204
+    # Now the last session sharing it is gone too - it's actually removed.
+    assert not any(p["id"] == "shared-paper" for p in app_state.paper_store.list())
+    assert app_state.chunks.paper_chunks("shared-paper") == []
+    assert "shared-node" not in app_state.graph.graph
+
+
 def test_query_feedback_accepts_and_returns_no_content(client):
     response = client.post(
         "/query/feedback", json={"node_id": "some-node", "helpful": True}
@@ -648,7 +685,7 @@ def test_papers_upload_persists_the_given_session_id(client, app_state, monkeypa
 
     assert response.status_code == 200
     saved = next(p for p in app_state.paper_store.list() if p["id"] == "session-tagged-paper")
-    assert saved["session_id"] == "session-xyz"
+    assert saved["session_ids"] == ["session-xyz"]
 
 
 def test_arxiv_ingest_persists_the_given_session_id(client, app_state, monkeypatch):
@@ -687,7 +724,7 @@ def test_arxiv_ingest_persists_the_given_session_id(client, app_state, monkeypat
     saved = next(
         p for p in app_state.paper_store.list() if p["id"] == "arxiv-2101.00001"
     )
-    assert saved["session_id"] == "session-xyz"
+    assert saved["session_ids"] == ["session-xyz"]
 
 
 def _fake_extract_one(paper_id, path, fail_closed=False):
@@ -818,18 +855,18 @@ def test_papers_list_filters_by_session_id(client, app_state):
     assert ids == {"paper-a"}
 
 
-def test_detach_paper_clears_session_id_and_keeps_other_fields(client, app_state):
+def test_detach_paper_removes_only_the_given_sessions_membership(client, app_state):
     app_state.paper_store.save(
         "paper-a", title="Paper A", authors="A. Uthor", status="ready", session_id="session-a"
     )
 
-    response = client.post("/papers/paper-a/detach")
+    response = client.post("/papers/paper-a/detach", params={"session_id": "session-a"})
 
     assert response.status_code == 200
-    assert response.json()["session_id"] is None
+    assert response.json()["session_ids"] == []
 
     saved = next(p for p in app_state.paper_store.list() if p["id"] == "paper-a")
-    assert saved["session_id"] is None
+    assert saved["session_ids"] == []
     assert saved["title"] == "Paper A"
     assert saved["authors"] == "A. Uthor"
 
@@ -838,9 +875,31 @@ def test_detach_paper_clears_session_id_and_keeps_other_fields(client, app_state
     assert listing == []
 
 
+def test_detach_paper_leaves_a_paper_shared_with_another_session_intact(client, app_state):
+    """Adding the same paper to a second session, then detaching it from
+    the first, must not remove it from the second - confirmed live this
+    was previously the reverse bug (re-ingest silently stole it from the
+    first session entirely)."""
+    app_state.paper_store.save("paper-a", title="Paper A", status="ready", session_id="session-a")
+    app_state.paper_store.save("paper-a", title="Paper A", status="ready", session_id="session-b")
+
+    response = client.post("/papers/paper-a/detach", params={"session_id": "session-a"})
+
+    assert response.status_code == 200
+    assert response.json()["session_ids"] == ["session-b"]
+    listing = client.get("/papers", params={"session_id": "session-b"}).json()
+    assert {p["id"] for p in listing} == {"paper-a"}
+
+
 def test_detach_paper_404_for_unknown_paper(client):
-    response = client.post("/papers/does-not-exist/detach")
+    response = client.post("/papers/does-not-exist/detach", params={"session_id": "session-a"})
     assert response.status_code == 404
+
+
+def test_detach_paper_requires_session_id(client, app_state):
+    app_state.paper_store.save("paper-a", title="Paper A", status="ready", session_id="session-a")
+    response = client.post("/papers/paper-a/detach")
+    assert response.status_code == 422
 
 
 def test_papers_upload_rejects_path_traversal_in_paper_id(client, app_state, tmp_path):

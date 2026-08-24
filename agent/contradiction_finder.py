@@ -27,7 +27,7 @@ from google import genai
 from google.genai import types as genai_types
 from pydantic import BaseModel
 
-from agent.graph_manager import GraphManager, _cosine_similarity
+from agent.graph_manager import GraphManager, _cosine_similarity, _session_ids
 from agent.schema import Edge, EdgeType, NodeType, ProvenanceTag
 from agent.text_utils import escape_tag_delimiters
 
@@ -221,7 +221,7 @@ class ContradictionFinder:
             (node_id, data)
             for node_id, data in self._gm.graph.nodes(data=True)
             if data.get("type") == NodeType.CLAIM.value
-            and data.get("session_id") == session_id
+            and session_id in _session_ids(data)
         ]
 
         pool: list[tuple[str, str, float]] = []

@@ -14,6 +14,7 @@ from service.schemas import (
     SessionMetadata,
 )
 from service.state import AppState
+from service.storage import _paper_session_ids
 
 router = APIRouter(prefix="/sessions", tags=["sessions"], dependencies=[Depends(require_api_key)])
 
@@ -75,10 +76,12 @@ def get_session_graph(
 
 @router.delete("/{session_id}", status_code=204)
 def delete_session(session_id: str, state: AppState = Depends(get_state)) -> Response:
-    """Full cascade delete: the session's papers, graph nodes/edges,
-    chunks and clarifications go with it, not just the session record -
-    see agent/graph_manager.py's remove_by_session for why this can't be
-    a Firestore-only delete while the server is running."""
+    """Cascade delete, scoped to what actually becomes ownerless: a
+    paper (or graph node) still genuinely shared with another session
+    survives this session's deletion, only this session's membership is
+    removed from it - see PaperStore.detach_session and
+    agent/graph_manager.py's remove_by_session, both of which already
+    make this distinction rather than deleting unconditionally."""
     existing = next(
         (s for s in state.session_store.list() if s.get("id") == session_id), None
     )
@@ -86,12 +89,14 @@ def delete_session(session_id: str, state: AppState = Depends(get_state)) -> Res
         raise HTTPException(status_code=404, detail=f"no session {session_id!r}")
 
     papers = [
-        p for p in state.paper_store.list() if p.get("session_id") == session_id
+        p for p in state.paper_store.list() if session_id in _paper_session_ids(p)
     ]
     for paper in papers:
         paper_id = paper["id"]
-        state.chunks.remove_paper(paper_id)
-        state.paper_store.delete(paper_id)
+        updated = state.paper_store.detach_session(paper_id, session_id)
+        if not updated.get("session_ids"):
+            state.chunks.remove_paper(paper_id)
+            state.paper_store.delete(paper_id)
 
     removed_node_ids = state.graph.remove_by_session(session_id)
     state.clarification.remove_for_node_ids(removed_node_ids)
