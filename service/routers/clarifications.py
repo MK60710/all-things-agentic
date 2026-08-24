@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
+from agent.graph_manager import _session_ids
 from service.deps import get_state, require_api_key
 from service.schemas import AnswerClarificationRequest, PendingQuestionOut
 from service.state import AppState
@@ -12,8 +13,24 @@ router = APIRouter(
 
 
 @router.get("", response_model=list[PendingQuestionOut])
-def list_pending(state: AppState = Depends(get_state)) -> list[PendingQuestionOut]:
-    return [PendingQuestionOut.from_domain(q) for q in state.clarification.pending()]
+def list_pending(
+    session_id: str | None = Query(default=None),
+    state: AppState = Depends(get_state),
+) -> list[PendingQuestionOut]:
+    questions = state.clarification.pending()
+    if session_id is not None:
+        # Only entity_merge questions reference an ingest-created node
+        # (provisional_node_id) - a query_disambiguation question has no
+        # such field and is meant to be resolved within the same chat
+        # exchange it came from, so it's never filtered out here.
+        questions = [
+            q
+            for q in questions
+            if getattr(q, "provisional_node_id", None) is None
+            or session_id
+            in _session_ids(state.graph.graph.nodes.get(q.provisional_node_id, {}))
+        ]
+    return [PendingQuestionOut.from_domain(q) for q in questions]
 
 
 @router.get("/{question_id}", response_model=PendingQuestionOut)

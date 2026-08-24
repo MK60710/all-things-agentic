@@ -50,16 +50,60 @@ class UploadTokenStore:
         return data
 
 
+def _paper_session_ids(data: dict[str, Any]) -> list[str]:
+    """Mirrors agent.graph_manager._session_ids's exact reasoning for the
+    same problem, one layer up: a paper record's real session membership,
+    falling back to the pre-multi-session "session_id" scalar field for
+    records written before this existed - no migration script needed."""
+    session_ids = data.get("session_ids")
+    if session_ids:
+        return session_ids
+    legacy = data.get("session_id")
+    return [legacy] if legacy else []
+
+
 class PaperStore:
     def __init__(self, db_client: Any) -> None:
         self._collection = db_client.collection("papers")
 
     def save(self, paper_id: str, **values: Any) -> dict[str, Any]:
+        """A `session_id` kwarg is treated specially: it's session-
+        accumulating, not overwriting - re-ingesting an already-known
+        paper into a new session ADDS that session to the paper's
+        membership rather than stealing it from whichever session
+        originally added it. Confirmed live as a real bug: re-ingesting
+        a paper elsewhere silently made it vanish from its original
+        session's paper list with no warning. Every other field keeps
+        the exact same partial-field-merge behavior as before."""
+        if "session_id" in values:
+            new_session_id = values.pop("session_id")
+            existing = self.get(paper_id) or {}
+            merged = set(_paper_session_ids(existing))
+            if new_session_id:
+                merged.add(new_session_id)
+            values["session_ids"] = sorted(merged)
         data = {
             "id": paper_id,
             "updated_at": datetime.now(timezone.utc).isoformat(),
             **values,
         }
+        self._collection.document(paper_id).set(data, merge=True)
+        return data
+
+    def detach_session(self, paper_id: str, session_id: str) -> dict[str, Any]:
+        """Removes just this one session's membership - the record (and
+        its chunks/graph data) survives if another session still has it.
+        The caller decides whether to fully delete once ownerless (see
+        service/routers/sessions.py's delete_session cascade)."""
+        existing = self.get(paper_id) or {}
+        remaining = [s for s in _paper_session_ids(existing) if s != session_id]
+        data = {
+            **existing,
+            "id": paper_id,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "session_ids": remaining,
+        }
+        data.pop("session_id", None)
         self._collection.document(paper_id).set(data, merge=True)
         return data
 
@@ -70,3 +114,27 @@ class PaperStore:
     def get(self, paper_id: str) -> dict[str, Any] | None:
         snapshot = self._collection.document(paper_id).get()
         return snapshot.to_dict() if snapshot.exists else None
+
+    def delete(self, paper_id: str) -> None:
+        self._collection.document(paper_id).delete()
+
+
+class SessionStore:
+    def __init__(self, db_client: Any) -> None:
+        self._collection = db_client.collection("sessions")
+
+    def save(self, session_id: str, **values: Any) -> dict[str, Any]:
+        data = {
+            "id": session_id,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            **values,
+        }
+        self._collection.document(session_id).set(data, merge=True)
+        return data
+
+    def list(self) -> list[dict[str, Any]]:
+        sessions = [snapshot.to_dict() for snapshot in self._collection.stream()]
+        return sorted(sessions, key=lambda session: str(session.get("updated_at", "")), reverse=True)
+
+    def delete(self, session_id: str) -> None:
+        self._collection.document(session_id).delete()

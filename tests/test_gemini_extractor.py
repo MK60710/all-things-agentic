@@ -1,3 +1,5 @@
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -93,6 +95,39 @@ def test_extractor_caches_calls_and_preserves_chunks():
     assert len(first.relations) == 1
     assert second == first
     assert models.calls == 1
+
+
+def test_generate_content_sets_an_http_timeout():
+    """Regression: every other Gemini-calling class in this codebase
+    (GeneralChatAgent, QueryAgent, GapFinder's GeminiExplainer) sets
+    http_options' timeout - this one didn't, so a single slow/stuck Vertex
+    AI call could hang extract()'s per-window loop indefinitely instead of
+    ever reaching the per-window except Exception handling built to
+    isolate exactly this kind of failure. Confirmed live: a real paper
+    hung 20+ minutes with no exception and no progress."""
+    semantic = SemanticExtraction(entities=[], relations=[])
+    captured: dict = {}
+
+    class Models:
+        def generate_content(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(parsed=semantic, text=semantic.model_dump_json())
+
+    client = SimpleNamespace(models=Models())
+    extractor = GeminiStructuredExtractor(project="test", client=client, timeout_ms=12_345)
+    document = DocumentIngestionResult(
+        paper_id="paper-1",
+        pdf_path="paper.pdf",
+        pages=[],
+        raw_text="text",
+        chunks=["text"],
+    )
+
+    extractor.extract(document)
+
+    http_options = captured["config"].http_options
+    assert http_options is not None
+    assert http_options.timeout == 12_345
 
 
 def test_one_truncated_window_does_not_discard_other_windows():
@@ -232,6 +267,58 @@ def test_windows_beyond_the_call_cap_count_as_skipped():
 
     assert models.calls == 2  # only the cap's worth of windows attempted
     assert result.skipped_windows == 2  # the other 2 windows never ran
+
+
+def test_windows_are_extracted_concurrently_not_one_at_a_time():
+    """The whole point of parallelizing extract()'s per-window loop: wall
+    clock for N windows must be close to one window's latency, not N of
+    them summed - this is what turned a real paper's ~281s ingest
+    (8 windows x up to 30-35s each, fully sequential) into the dominant
+    remaining cost after guide pre-generation was already fixed."""
+    call_count = 0
+    lock = threading.Lock()
+
+    def make_entity(index: int) -> ExtractedEntity:
+        return ExtractedEntity(
+            name=f"Entity{index}", type=NodeType.CONCEPT, description="d"
+        )
+
+    class Models:
+        def generate_content(self, **kwargs):
+            nonlocal call_count
+            with lock:
+                index = call_count
+                call_count += 1
+            time.sleep(0.2)
+            semantic = SemanticExtraction(entities=[make_entity(index)], relations=[])
+            return SimpleNamespace(parsed=semantic, text=semantic.model_dump_json())
+
+    client = SimpleNamespace(models=Models())
+    extractor = GeminiStructuredExtractor(
+        project="test", client=client, max_characters_per_call=5
+    )
+    document = DocumentIngestionResult(
+        paper_id="paper-1",
+        pdf_path="paper.pdf",
+        pages=[],
+        raw_text="one two three four",
+        chunks=["one", "two", "three", "four"],
+    )
+
+    start = time.monotonic()
+    result = extractor.extract(document)
+    elapsed = time.monotonic() - start
+
+    # 4 windows x 0.2s would be 0.8s run sequentially - concurrent
+    # execution should land close to one window's latency.
+    assert elapsed < 0.6
+    assert {entity.name for entity in result.entities} == {
+        "Entity0",
+        "Entity1",
+        "Entity2",
+        "Entity3",
+    }
+    assert result.skipped_windows == 0
 
 
 def test_different_relation_types_between_same_pair_both_survive():

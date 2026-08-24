@@ -42,7 +42,8 @@ def test_graph_evidence_is_preferred_and_cited(fake_db):
 def test_low_relevance_graph_match_falls_back_to_chunk(fake_db):
     """A single generic shared token shouldn't lock in a low-relevance
     graph answer over a much more specific chunk match (the failure mode
-    behind min_graph_score)."""
+    behind min_graph_score) - and the fallback must be its own clearly
+    separate retrieval_mode, not blended into a graph answer."""
     graph = _graph(fake_db)
     index = ChunkIndex()
     index.upsert_paper(
@@ -55,6 +56,7 @@ def test_low_relevance_graph_match_falls_back_to_chunk(fake_db):
 
     assert result.retrieval_mode == "vector"
     assert result.citations[0].paper_id == "paper-2"
+    assert result.citations[0].source_kind == "chunk"
 
 
 def test_chunk_retrieval_is_used_when_graph_has_no_match():
@@ -70,26 +72,6 @@ def test_chunk_retrieval_is_used_when_graph_has_no_match():
     assert result.retrieval_mode == "vector"
     assert result.citations[0].paper_id == "paper-2"
     assert agent.metrics == {"graph_hits": 0, "vector_fallbacks": 1}
-
-
-def test_vector_citations_keep_the_top_scoring_hit():
-    """assemble_context orders hits by document position, not score - the
-    citation list must not silently drop the best match on truncation."""
-    index = ChunkIndex()
-    index.upsert_paper(
-        "paper-3",
-        [
-            "Unrelated background material about lab equipment.",
-            "A graph neural network improves node classification accuracy.",
-        ],
-    )
-    agent = QueryAgent(index, max_citations=1)
-
-    result = agent.answer("What improves node classification accuracy?")
-
-    assert result.retrieval_mode == "vector"
-    assert len(result.citations) == 1
-    assert "graph neural network" in result.citations[0].text
 
 
 def test_empty_retrieval_returns_no_results():
@@ -134,6 +116,44 @@ def test_gemini_receives_retrieved_context():
     assert calls[0]["config"].temperature == 0
 
 
+def test_goal_is_added_to_system_instruction_when_provided():
+    calls = []
+
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(text="Grounded answer")
+
+    client = SimpleNamespace(models=FakeModels())
+    index = ChunkIndex()
+    index.upsert_paper("paper-3b", ["The paper evaluates memory retrieval."])
+    agent = QueryAgent(index, client=client)
+
+    agent.answer("What does the paper evaluate?", goal="benchmarking retrieval methods")
+
+    instruction = calls[0]["config"].system_instruction
+    assert "benchmarking retrieval methods" in instruction
+
+
+def test_no_goal_leaves_system_instruction_unchanged():
+    calls = []
+
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(text="Grounded answer")
+
+    client = SimpleNamespace(models=FakeModels())
+    index = ChunkIndex()
+    index.upsert_paper("paper-3c", ["The paper evaluates memory retrieval."])
+    agent = QueryAgent(index, client=client)
+
+    agent.answer("What does the paper evaluate?")
+
+    instruction = calls[0]["config"].system_instruction
+    assert "current goal" not in instruction
+
+
 def test_gemini_empty_response_falls_back_to_evidence_summary():
     class FakeModels:
         def generate_content(self, **kwargs):
@@ -163,6 +183,53 @@ def test_gemini_call_failure_falls_back_instead_of_crashing():
 
     assert result.retrieval_mode == "vector"
     assert "Stored evidence about retries." in result.answer
+
+
+def test_vector_citations_keep_the_top_scoring_hit():
+    """assemble_context orders hits by document position, not score - the
+    citation list must not silently drop the best match on truncation."""
+    index = ChunkIndex()
+    index.upsert_paper(
+        "paper-3",
+        [
+            "Unrelated background material about lab equipment.",
+            "A graph neural network improves node classification accuracy.",
+        ],
+    )
+    agent = QueryAgent(index, max_citations=1)
+
+    result = agent.answer("What improves node classification accuracy?")
+
+    assert result.retrieval_mode == "vector"
+    assert len(result.citations) == 1
+    assert "graph neural network" in result.citations[0].text
+
+
+def test_low_confidence_vector_match_is_flagged_not_hidden():
+    """Same in-between case on the chunk-retrieval side - only 1 of 3
+    query tokens present caps the score below 0.6 regardless of the
+    vector-similarity component, so this must always land as low."""
+    index = ChunkIndex()
+    index.upsert_paper("paper-1", ["Something about gradient descent."])
+    agent = QueryAgent(index)
+
+    result = agent.answer("gradient unrelated tangent")
+
+    assert result.retrieval_mode == "vector"
+    assert result.confidence == "low"
+
+
+def test_confident_vector_match_is_not_flagged():
+    """Full lexical overlap guarantees score >= 0.65 regardless of the
+    vector-similarity component, so this must always land as confident."""
+    index = ChunkIndex()
+    index.upsert_paper("paper-1", ["A paper about gradient descent methods."])
+    agent = QueryAgent(index)
+
+    result = agent.answer("gradient descent methods")
+
+    assert result.retrieval_mode == "vector"
+    assert result.confidence == "confident"
 
 
 def _ambiguous_graph(fake_db) -> GraphManager:
@@ -224,6 +291,42 @@ def test_ambiguous_query_registers_a_pending_question_when_orchestrator_given(fa
     assert {opt.id for opt in pending[0].options} == {"method", "concept"}
 
 
+def test_forced_node_id_bypasses_ambiguity_check(fake_db):
+    """The frontend's 'click to select a candidate' flow - a query that
+    would normally be ambiguous must resolve directly to the chosen node
+    instead of asking the same clarifying question again."""
+    calls = []
+
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(text="Grounded answer about the method.")
+
+    agent = QueryAgent(
+        ChunkIndex(),
+        _ambiguous_graph(fake_db),
+        client=SimpleNamespace(models=FakeModels()),
+    )
+
+    result = agent.answer("attention", node_id="method")
+
+    assert result.retrieval_mode == "graph"
+    assert result.answer == "Grounded answer about the method."
+    assert [c.node_ids for c in result.citations] == [["method"]]
+    assert len(calls) == 1
+
+
+def test_forced_node_id_falls_back_to_search_when_id_unknown(fake_db):
+    """An unresolvable node_id (stale click, deleted node) must not crash
+    or silently return nothing useful - falls through to the normal
+    text-search path instead."""
+    agent = QueryAgent(ChunkIndex(), _ambiguous_graph(fake_db))
+
+    result = agent.answer("attention", node_id="does-not-exist")
+
+    assert result.retrieval_mode == "ambiguous"
+
+
 def test_low_confidence_graph_match_is_flagged_not_hidden(fake_db):
     """The in-between case from the Part 5 plan: a graph match that clears
     min_graph_score but is still a soft one (2 of 5 query tokens) must not
@@ -240,6 +343,33 @@ def test_low_confidence_graph_match_is_flagged_not_hidden(fake_db):
     assert result.confidence == "low"
 
 
+def test_low_confidence_graph_match_stays_graph_only(fake_db):
+    """A weak-but-real graph match (clears min_graph_score, just softly)
+    must stay graph-only, not get silently enriched with raw chunk text -
+    a graph answer's citations are always 100% graph evidence, never a mix
+    the user can't tell apart. The fact that only lives in the paper's raw
+    text (92% accuracy) is real graph-uncovered content; a query with no
+    graph hits at all is what should surface it, via the clearly separate
+    retrieval_mode="vector" path, not this one."""
+    graph = GraphManager(project_id="test", db_client=fake_db)
+    graph.add_node(
+        Node(id="n1", type=NodeType.METHOD, name="Sparse Retrieval System")
+    )
+    index = ChunkIndex()
+    index.upsert_paper(
+        "paper-1",
+        ["The sparse retrieval mechanism achieves 92% accuracy on the benchmark."],
+    )
+    agent = QueryAgent(index, graph)
+
+    result = agent.answer("sparse retrieval mechanism gradient clipping")
+
+    assert result.retrieval_mode == "graph"
+    assert result.confidence == "low"
+    assert all(citation.source_kind == "graph" for citation in result.citations)
+    assert not any("92%" in citation.text for citation in result.citations)
+
+
 def test_confident_graph_match_is_not_flagged(fake_db):
     graph = GraphManager(project_id="test", db_client=fake_db)
     graph.add_node(
@@ -250,33 +380,6 @@ def test_confident_graph_match_is_not_flagged(fake_db):
     result = agent.answer("memory retrieval method")
 
     assert result.retrieval_mode == "graph"
-    assert result.confidence == "confident"
-
-
-def test_low_confidence_vector_match_is_flagged_not_hidden():
-    """Same in-between case on the chunk-retrieval side - only 1 of 3
-    query tokens present caps the score below 0.6 regardless of the
-    vector-similarity component, so this must always land as low."""
-    index = ChunkIndex()
-    index.upsert_paper("paper-1", ["Something about gradient descent."])
-    agent = QueryAgent(index)
-
-    result = agent.answer("gradient unrelated tangent")
-
-    assert result.retrieval_mode == "vector"
-    assert result.confidence == "low"
-
-
-def test_confident_vector_match_is_not_flagged():
-    """Full lexical overlap guarantees score >= 0.65 regardless of the
-    vector-similarity component, so this must always land as confident."""
-    index = ChunkIndex()
-    index.upsert_paper("paper-1", ["A paper about gradient descent methods."])
-    agent = QueryAgent(index)
-
-    result = agent.answer("gradient descent methods")
-
-    assert result.retrieval_mode == "vector"
     assert result.confidence == "confident"
 
 
@@ -339,6 +442,29 @@ def test_record_feedback_writes_a_durable_event_when_db_client_given(fake_db):
     assert data["type"] == "query_rating"
     assert data["node_id"] == "method"
     assert data["helpful"] is True
+
+
+def test_node_boost_rehydrates_from_feedback_events_on_construction(fake_db):
+    """Regression: feedback_events was written for durability but never
+    read back, so 'capture feedback so it adapts' only held for the
+    lifetime of one running process - a restart silently forgot every
+    rating a user had given. A fresh QueryAgent pointed at the same
+    db_client must already reflect prior feedback, with no record_feedback
+    call on the new instance."""
+    graph = GraphManager(project_id="test", db_client=fake_db)
+    graph.add_node(
+        Node(id="strong", type=NodeType.METHOD, name="Retrieval Augmented Method")
+    )
+    graph.add_node(Node(id="weak", type=NodeType.METHOD, name="Retrieval Method"))
+    first_process = QueryAgent(ChunkIndex(), graph, db_client=fake_db)
+    first_process.record_feedback("strong", helpful=False)
+    first_process.record_feedback("weak", helpful=True)
+    first_process.record_feedback("weak", helpful=True)
+
+    restarted = QueryAgent(ChunkIndex(), graph, db_client=fake_db)
+
+    after_restart = restarted.answer("retrieval augmented method")
+    assert after_restart.citations[0].node_ids == ["weak"]
 
 
 def test_record_feedback_without_db_client_does_not_raise():

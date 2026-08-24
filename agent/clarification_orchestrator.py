@@ -207,6 +207,25 @@ class ClarificationOrchestrator:
     def get(self, question_id: str) -> PendingQuestion | None:
         return self._questions.get(question_id)
 
+    def remove_for_node_ids(self, node_ids: set[str]) -> int:
+        """Drop every question referencing any of node_ids as its
+        provisional or candidate node, from both memory and Firestore -
+        query_disambiguation questions have neither attribute and are
+        never touched. Same membership check scripts/clear_session.py
+        already uses for the same cleanup, just live rather than
+        Firestore-only."""
+        stale_ids = [
+            question_id
+            for question_id, question in self._questions.items()
+            if getattr(question, "provisional_node_id", None) in node_ids
+            or getattr(question, "candidate_node_id", None) in node_ids
+        ]
+        for question_id in stale_ids:
+            del self._questions[question_id]
+            if self._db is not None:
+                self._db.collection("clarifications").document(question_id).delete()
+        return len(stale_ids)
+
     def answer(self, question_id: str, option_id: str) -> PendingQuestion:
         """Apply a chosen option back to the system.
 

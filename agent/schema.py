@@ -49,6 +49,13 @@ class Node(BaseModel):
     name: str
     description: str = ""
     entity_embedding: list[float] | None = None
+    # Which ingest session created this node - set only when this node is
+    # genuinely new (see GraphManager.apply_extraction_result). A node a
+    # later session merely reuses via canonicalization keeps whichever
+    # session originally created it, which is what makes per-session
+    # cleanup (scripts/clear_session.py) safe: deleting session X never
+    # touches a node another session only referenced.
+    session_id: str | None = None
 
 
 class Edge(BaseModel):
@@ -64,6 +71,7 @@ class Edge(BaseModel):
         default_factory=lambda: datetime.now(timezone.utc)
     )
     valid_until: datetime | None = None
+    session_id: str | None = None
 
 
 class ExtractedEntity(BaseModel):

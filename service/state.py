@@ -13,8 +13,10 @@ from dataclasses import dataclass
 from google.cloud import firestore
 
 from agent.clarification_orchestrator import ClarificationOrchestrator
+from agent.contradiction_finder import ContradictionFinder, GeminiContradictionJudge
 from agent.document_ingestion import PdfTextExtractor
 from agent.extraction_agent import ExtractionAgent
+from agent.feynman_checker import FeynmanChecker, GeminiFeynmanJudge
 from agent.gap_finder import GapFinder, GeminiExplainer
 from agent.gemini_extractor import GeminiStructuredExtractor
 from agent.general_chat import GeneralChatAgent
@@ -24,7 +26,7 @@ from agent.query_agent import QueryAgent
 from agent.research_store import ResearchStore
 from agent.retrieval import ChunkIndex, LocalHashingEmbedder
 from agent.text_utils import entity_embedding_text
-from service.storage import PaperStore, UploadTokenStore
+from service.storage import PaperStore, SessionStore, UploadTokenStore
 
 
 @dataclass
@@ -36,11 +38,14 @@ class AppState:
     general_chat: GeneralChatAgent
     paper_guide: PaperGuideAgent
     gap_finder: GapFinder
+    contradiction_finder: ContradictionFinder
+    feynman_checker: FeynmanChecker
     extraction_agent: ExtractionAgent
     research_store: ResearchStore
     upload_root: str
     paper_store: PaperStore
     upload_tokens: UploadTokenStore
+    session_store: SessionStore
     _embedder: LocalHashingEmbedder | None = None
 
     def __post_init__(self) -> None:
@@ -86,6 +91,15 @@ def build_state() -> AppState:
         explain_fn=GeminiExplainer(project=project, location=location),
         db_client=db,
     )
+    contradiction_finder = ContradictionFinder(
+        graph,
+        judge=GeminiContradictionJudge(project=project, location=location),
+        db_client=db,
+    )
+    feynman_checker = FeynmanChecker(
+        graph,
+        judge=GeminiFeynmanJudge(project=project, location=location),
+    )
 
     upload_root = os.environ.get("UPLOAD_ROOT", "/tmp/uploads")
     os.makedirs(upload_root, exist_ok=True)
@@ -105,9 +119,12 @@ def build_state() -> AppState:
         general_chat=general_chat,
         paper_guide=paper_guide,
         gap_finder=gap_finder,
+        contradiction_finder=contradiction_finder,
+        feynman_checker=feynman_checker,
         extraction_agent=extraction_agent,
         research_store=research_store,
         upload_root=upload_root,
         paper_store=PaperStore(db),
         upload_tokens=UploadTokenStore(db),
+        session_store=SessionStore(db),
     )
