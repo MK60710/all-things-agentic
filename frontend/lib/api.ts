@@ -1,4 +1,4 @@
-import type { ContradictionCandidate, GapCandidate, GraphVizEdge, GraphVizNode, PaperGuide, PendingQuestion, QueryResponse, SessionGraphEdge, SessionGraphNode } from "./types";
+import type { ContradictionCandidate, FeynmanCheckResult, FeynmanPrompt, GapCandidate, GraphVizEdge, GraphVizNode, PaperGuide, PendingQuestion, QueryResponse, SessionGraphEdge, SessionGraphNode } from "./types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL;
 
@@ -248,6 +248,24 @@ export async function checkForContradictions(sessionId: string): Promise<Contrad
   const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/contradictions/check`, { method: "POST" });
   const data = await response.json() as ContradictionCandidate[] & { error?: string };
   if (!response.ok) throw new Error((data as unknown as { error?: string }).error ?? "Could not check for contradictions");
+  return data;
+}
+
+export async function getFeynmanPrompts(paperId: string, sessionId: string): Promise<FeynmanPrompt[]> {
+  const response = await fetch(`/api/papers/${encodeURIComponent(paperId)}/feynman/prompts?session_id=${encodeURIComponent(sessionId)}`);
+  const data = await response.json() as FeynmanPrompt[] & { error?: string };
+  if (!response.ok) throw new Error((data as unknown as { error?: string }).error ?? "Could not load a question about this paper");
+  return data;
+}
+
+export async function checkFeynmanExplanation(paperId: string, nodeId: string, sessionId: string, explanation: string): Promise<FeynmanCheckResult> {
+  const response = await fetch(`/api/papers/${encodeURIComponent(paperId)}/feynman/check`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ node_id: nodeId, session_id: sessionId, explanation }),
+  });
+  const data = await response.json() as FeynmanCheckResult & { error?: string };
+  if (!response.ok) throw new Error((data as { error?: string }).error ?? "Could not grade this explanation");
   return data;
 }
 

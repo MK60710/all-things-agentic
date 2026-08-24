@@ -5,9 +5,11 @@ import {
   answerClarification,
   askAssistant,
   buildPaperGuide,
+  checkFeynmanExplanation,
   createSession,
   deleteSession,
   detachPaper,
+  getFeynmanPrompts,
   getPaperStatus,
   ingestArxivPaper,
   listClarifications,
@@ -21,12 +23,13 @@ import {
   uploadPaper,
 } from "@/lib/api";
 import type { ChatHistoryItem, PaperContext, PaperIngestResult, PaperSearchResult, SessionMetadata } from "@/lib/api";
-import type { Citation, GapCandidate, PaperGuide, PendingQuestion, QueryResponse } from "@/lib/types";
+import type { Citation, FeynmanCheckResult, FeynmanPrompt, GapCandidate, PaperGuide, PendingQuestion, QueryResponse } from "@/lib/types";
 import GraphBuildAnimation from "./GraphBuildAnimation";
 import ConvergenceRitual from "./ConvergenceRitual";
 import GraphExplorer from "./GraphExplorer";
+import Tour, { TourStep } from "./Tour";
 
-type IconName = "atlas" | "plus" | "send" | "paper" | "search" | "upload" | "close" | "quote" | "check" | "globe" | "thumbUp" | "thumbDown" | "rename" | "graph";
+type IconName = "atlas" | "plus" | "send" | "paper" | "search" | "upload" | "close" | "quote" | "check" | "globe" | "thumbUp" | "thumbDown" | "rename" | "graph" | "help";
 type AddMode = "choose" | "upload" | "search";
 
 interface Message {
@@ -49,6 +52,9 @@ interface Message {
   guide?: PaperGuide;
   guideLoading?: boolean;
   guideError?: string;
+  // Which paper this guide walkthrough is for - lets the "Test yourself"
+  // check at the end scope its questions to this paper's own graph nodes.
+  paperId?: string;
   notice?: boolean;
   clarification?: PendingQuestion;
   // Set instead of `clarification` when more than one question arrives in
@@ -91,11 +97,45 @@ const icons: Record<IconName, React.ReactNode> = {
   thumbDown: <path d="M17 14V3h4v11zM17 14l-4 7a2 2 0 0 1-2-2v-5H5.5a2 2 0 0 1-2-2.4l1.5-7A2 2 0 0 1 7 3h10"/>,
   rename: <path d="M12 20h9M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/>,
   graph: <><circle cx="6" cy="6" r="2.6"/><circle cx="18" cy="6" r="2.6"/><circle cx="12" cy="18" r="2.6"/><path d="M8.3 6.7L15.7 6.7M7.4 8.2L10.6 15.8M16.6 8.2L13.4 15.8"/></>,
+  help: <><circle cx="12" cy="12" r="9"/><path d="M9.1 9a3 3 0 1 1 4.6 2.6c-.9.5-1.7 1.1-1.7 2.4"/><path d="M12 17.5h.01"/></>,
 };
 
 function Icon({ name, size = 19 }: { name: IconName; size?: number }) {
   return <svg aria-hidden="true" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">{icons[name]}</svg>;
 }
+
+const ATLAS_TOUR_STEPS: TourStep[] = [
+  {
+    target: ".brand",
+    title: "Welcome to Atlas",
+    body: "A quick tour of the essentials - five stops, feel free to skip anytime.",
+    placement: "bottom",
+  },
+  {
+    target: ".add-paper-button",
+    title: "Add a paper",
+    body: "Click here to upload a PDF or search arXiv. Atlas reads it, builds a real knowledge graph from what's inside, and walks you through it section by section automatically.",
+    placement: "bottom",
+  },
+  {
+    target: ".composer",
+    title: "Ask anything",
+    body: "Ask a question here at any time. Once a paper's added, answers cite the exact section and page they came from.",
+    placement: "top",
+  },
+  {
+    target: ".graph-explorer-toggle",
+    title: "Explore the graph",
+    body: "Once you've added a paper, open this to see every idea it extracted as a real, clickable graph - not just a summary.",
+    placement: "bottom",
+  },
+  {
+    target: ".session-switcher-toggle",
+    title: "Sessions",
+    body: "Each session is its own research thread with its own papers and graph. Switch or start a new one here anytime.",
+    placement: "bottom",
+  },
+];
 
 const FLOW_REVEAL_INTERVAL_MS = 200;
 
@@ -150,7 +190,7 @@ function FlowDiagram({ guide }: { guide: NonNullable<PaperGuide["sections"][numb
 
 type GuideStop = { kind: "overview" } | { kind: "section"; section: PaperGuide["sections"][number] };
 
-function GuidedReading({ guide }: { guide: PaperGuide }) {
+function GuidedReading({ guide, paperId, sessionId, onViewNodeInGraph }: { guide: PaperGuide; paperId?: string; sessionId?: string; onViewNodeInGraph: (nodeId: string) => void }) {
   const stops: GuideStop[] = [
     { kind: "overview" },
     ...guide.sections.map((section) => ({ kind: "section" as const, section })),
@@ -208,18 +248,152 @@ function GuidedReading({ guide }: { guide: PaperGuide }) {
     <footer className="guide-nav">
       <button type="button" onClick={() => goTo(stopIndex - 1)} disabled={stopIndex === 0}>← Back</button>
       {isLastStop ? (
-        <div className="guide-complete">
-          <div className="guide-complete-bar"><i/></div>
-          <div className="guide-complete-copy">
-            <span className="guide-complete-check"><Icon name="check" size={13}/></span>
-            <small>That’s the full walkthrough. Ask a question below and I’ll answer from this paper with page-level sources.</small>
+        paperId && sessionId ? (
+          <FeynmanCheck paperId={paperId} sessionId={sessionId} onViewNodeInGraph={onViewNodeInGraph}/>
+        ) : (
+          <div className="guide-complete">
+            <div className="guide-complete-bar"><i/></div>
+            <div className="guide-complete-copy">
+              <span className="guide-complete-check"><Icon name="check" size={13}/></span>
+              <small>That’s the full walkthrough. Ask a question below and I’ll answer from this paper with page-level sources.</small>
+            </div>
           </div>
-        </div>
+        )
       ) : (
         <button type="button" onClick={() => goTo(stopIndex + 1)}>Next →</button>
       )}
     </footer>
   </section>;
+}
+
+const FEYNMAN_VERDICT_HEADLINE: Record<FeynmanCheckResult["verdict"], string> = {
+  strong: "You’ve got it.",
+  weak: "Partly there.",
+  wrong: "Not quite.",
+};
+
+// Matches MAX_EXPLANATION_CHARS in service/routers/feynman.py - this is a
+// UX nicety (stops the browser from letting you type past the limit), the
+// real enforcement is the backend's Pydantic max_length.
+const MAX_EXPLANATION_CHARS = 4000;
+
+type FeynmanPhase = "loading" | "question" | "grading" | "result" | "error" | "done";
+
+// Sits in the exact slot the static "guide-complete" footer used to occupy
+// (the last stop of GuidedReading) - this is the Feynman Method's forced-
+// retrieval step (write your own explanation before being told the
+// answer), graded against this paper's own graph nodes rather than the
+// model's general knowledge. See agent/feynman_checker.py.
+function FeynmanCheck({ paperId, sessionId, onViewNodeInGraph }: { paperId: string; sessionId: string; onViewNodeInGraph: (nodeId: string) => void }) {
+  const [phase, setPhase] = useState<FeynmanPhase>("loading");
+  const [prompts, setPrompts] = useState<FeynmanPrompt[]>([]);
+  const [promptIndex, setPromptIndex] = useState(0);
+  const [explanation, setExplanation] = useState("");
+  const [result, setResult] = useState<FeynmanCheckResult | null>(null);
+  const [error, setError] = useState("");
+  // A React-state guard (checking `phase === "grading"`) is NOT enough here:
+  // React 18 batches state updates from synchronous events, so two rapid
+  // clicks in the same tick both read the same stale `phase` before either
+  // setPhase("grading") call has been applied, and both pass the guard -
+  // confirmed live, 3 rapid clicks fired 3 real grading calls. This ref is
+  // set synchronously, before any await, so the second click sees it
+  // immediately - same fix as the ingestControllers.current guard elsewhere
+  // in this file for the identical race class.
+  const submittingRef = useRef(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    getFeynmanPrompts(paperId, sessionId)
+      .then((loaded) => {
+        if (cancelled) return;
+        setPrompts(loaded);
+        setPhase(loaded.length > 0 ? "question" : "done");
+      })
+      .catch(() => { if (!cancelled) setPhase("done"); });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [paperId, sessionId]);
+
+  const currentPrompt = prompts[promptIndex];
+
+  async function submit() {
+    if (!currentPrompt || !explanation.trim() || submittingRef.current) return;
+    submittingRef.current = true;
+    setPhase("grading");
+    try {
+      const graded = await checkFeynmanExplanation(paperId, currentPrompt.node_id, sessionId, explanation.trim());
+      setResult(graded);
+      setPhase("result");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not grade this explanation.");
+      setPhase("error");
+    } finally {
+      submittingRef.current = false;
+    }
+  }
+
+  function next() {
+    setExplanation("");
+    setResult(null);
+    setError("");
+    if (promptIndex + 1 < prompts.length) {
+      setPromptIndex((index) => index + 1);
+      setPhase("question");
+    } else {
+      setPhase("done");
+    }
+  }
+
+  if (phase === "loading") return <div className="feynman-check"><small>Preparing a quick check on what you just read…</small></div>;
+
+  if (phase === "done") {
+    return <div className="guide-complete">
+      <div className="guide-complete-bar"><i/></div>
+      <div className="guide-complete-copy">
+        <span className="guide-complete-check"><Icon name="check" size={13}/></span>
+        <small>That’s the full walkthrough. Ask a question below and I’ll answer from this paper with page-level sources.</small>
+      </div>
+    </div>;
+  }
+
+  const graphNodeId = result?.citation?.source_kind === "graph" ? result.citation.node_ids?.[0] : undefined;
+
+  return <div className="feynman-check">
+    <div className="feynman-check-header"><span>Test yourself</span><small>{promptIndex + 1} of {prompts.length}</small></div>
+    {(phase === "question" || phase === "grading") && currentPrompt && <>
+      <p className="feynman-check-question">{currentPrompt.question}</p>
+      <textarea
+        className="feynman-check-input"
+        value={explanation}
+        onChange={(event) => setExplanation(event.target.value)}
+        placeholder="Explain it in your own words…"
+        disabled={phase === "grading"}
+        maxLength={MAX_EXPLANATION_CHARS}
+        rows={3}
+      />
+      <div className="feynman-check-actions">
+        <button type="button" className="feynman-check-skip" onClick={next}>Skip</button>
+        <button type="button" onClick={() => void submit()} disabled={phase === "grading" || !explanation.trim()}>
+          {phase === "grading" ? "Grading…" : "Check my understanding"}
+        </button>
+      </div>
+    </>}
+    {phase === "error" && <>
+      <p className="feynman-check-error">{error}</p>
+      <div className="feynman-check-actions">
+        <button type="button" className="feynman-check-skip" onClick={next}>Skip</button>
+        <button type="button" onClick={() => void submit()}>Try again</button>
+      </div>
+    </>}
+    {phase === "result" && result && <div className={`feynman-verdict feynman-verdict-${result.verdict}`}>
+      <strong>{FEYNMAN_VERDICT_HEADLINE[result.verdict]}</strong>
+      <p>{result.explanation}</p>
+      {graphNodeId && <button className="citation-view-graph" onClick={() => onViewNodeInGraph(graphNodeId)} title="View this node in the graph"><Icon name="graph" size={12}/>View in graph</button>}
+      <div className="feynman-check-actions">
+        <button type="button" onClick={next}>{promptIndex + 1 < prompts.length ? "Next question" : "Done"}</button>
+      </div>
+    </div>}
+  </div>;
 }
 
 export default function Home() {
@@ -242,6 +416,8 @@ export default function Home() {
   // one global flag blocking every other result while it's in progress.
   const [ingestingIds, setIngestingIds] = useState<Set<string>>(new Set());
   const [graphExplorerOpen, setGraphExplorerOpen] = useState(false);
+  const [tourOpen, setTourOpen] = useState(false);
+  const [tourSeen, setTourSeen] = useState(false);
   const [graphFocusNodeId, setGraphFocusNodeId] = useState<string | null>(null);
   // Polled from the backend while a card is mid-ingest, purely to turn the
   // flat "Reading…" label into real stage feedback (downloading vs.
@@ -290,6 +466,7 @@ export default function Home() {
     if (initRan.current) return;
     initRan.current = true;
     void initSession();
+    setTourSeen(window.localStorage.getItem("atlas-tour-seen") === "1");
   }, []);
   const sessionSwitcherRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
@@ -647,7 +824,7 @@ export default function Home() {
     setMessages((current) => [
       ...current,
       ...(announce ? [{ id: crypto.randomUUID(), role: "assistant" as const, text: `I've read "${nextPaper.title}". I'm building a guided walkthrough now, starting with the big picture, then moving through the paper section by section.`, notice: true }] : []),
-      { id: guideMessageId, role: "assistant", text: "", guideLoading: true },
+      { id: guideMessageId, role: "assistant", text: "", guideLoading: true, paperId: nextPaper.id },
     ]);
     try {
       const guide = await buildPaperGuide(nextPaper.id);
@@ -778,6 +955,7 @@ export default function Home() {
     <main className="assistant-app">
       <ConvergenceRitual entries={convergenceEntries} active={ingestingIds.size > 0} onSkip={() => {}}/>
       <GraphExplorer sessionId={currentSession?.id ?? null} active={graphExplorerOpen} onClose={() => setGraphExplorerOpen(false)} onAskInChat={askFromGraphExplorer} focusNodeId={graphFocusNodeId}/>
+      <Tour steps={ATLAS_TOUR_STEPS} active={tourOpen} onClose={() => { setTourOpen(false); setTourSeen(true); }}/>
       <header className="app-header">
         <div className="brand"><span><Icon name="atlas" size={21}/></span><strong>Atlas</strong></div>
         <div className={`mode-label ${papers.length ? "paper-mode" : ""}`}>
@@ -814,6 +992,7 @@ export default function Home() {
             title={papers.length === 0 ? "Add a paper to explore its graph" : "Explore this session's knowledge graph"}
             aria-label="Open graph explorer"
           ><Icon name="graph" size={17}/></button>
+          <button className="tour-help-button" onClick={() => setTourOpen(true)} title="Replay the walkthrough" aria-label="Replay the walkthrough"><Icon name="help" size={17}/></button>
           <button className="add-paper-button" onClick={() => openAddPaper()}><Icon name="plus" size={17}/>{papers.length ? "Add another" : "Add paper"}</button>
         </div>
       </header>
@@ -829,6 +1008,7 @@ export default function Home() {
                 <button onClick={() => ask(undefined, "Help me understand how AI agents use memory")}>Explain a research topic</button>
                 <button onClick={() => ask(undefined, "Help me brainstorm a research question")}>Brainstorm with me</button>
                 <button onClick={() => openAddPaper()}><Icon name="paper" size={15}/>Add a paper</button>
+                <button className="welcome-tour-button" onClick={() => setTourOpen(true)}><Icon name="help" size={15}/>{tourSeen ? "Retake the tour" : "Take the tour"}</button>
               </div>
             </div>
           ) : (
@@ -845,7 +1025,7 @@ export default function Home() {
                     {message.role === "assistant" && <small>{isGuideMessage ? "Atlas guide" : message.notice ? "Atlas" : "Gemini"}</small>}
                     {message.text && <p>{message.text}</p>}
                     {message.guideLoading && <div className="guide-building"><span/><div><strong>Building your guided reading</strong><small>Finding the paper's structure, simplifying each section, and drawing useful visual explanations…</small></div></div>}
-                    {message.guide && <GuidedReading guide={message.guide}/>}
+                    {message.guide && <GuidedReading guide={message.guide} paperId={message.paperId} sessionId={currentSession?.id} onViewNodeInGraph={viewNodeInGraph}/>}
                     {message.guideError && <span className="guide-error">{message.guideError}</span>}
                     {message.retrievalMode === "vector" && <span className="not-graph-note"><Icon name="globe" size={11}/>From the paper's text directly — not yet verified against the knowledge graph</span>}
                     {message.confidence === "low" && <span className="confidence-note">Low-confidence match — check the sources below.</span>}
