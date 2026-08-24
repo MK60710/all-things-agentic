@@ -33,7 +33,20 @@ class ChatHistoryItem(BaseModel):
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=8000)
     history: list[ChatHistoryItem] = Field(default_factory=list, max_length=20)
-    paper_id: str | None = None
+    # A session's working set, not a single paper - QueryAgent.answer()
+    # already accepts paper_ids: set[str] | None as a multi-paper filter,
+    # this was only ever exposed here as if it took just one.
+    paper_ids: list[str] | None = None
+    # The current session's stated goal (SessionMetadata.goal), passed
+    # through on every turn rather than looked up server-side from
+    # session_id - the frontend already holds it in currentSession state,
+    # and /chat has no session_id field to look it up by.
+    goal: str | None = Field(default=None, max_length=300)
+    # Set when the frontend already knows exactly which node the question
+    # is about - e.g. clicking a specific candidate on an ambiguous
+    # result - so QueryAgent skips text search/ambiguity detection and
+    # evaluates that node directly.
+    node_id: str | None = None
 
 
 class UploadTokenResponse(BaseModel):
@@ -50,6 +63,7 @@ class ArxivIngestRequest(BaseModel):
     authors: str | None = Field(default=None, max_length=2000)
     abstract: str | None = Field(default=None, max_length=10000)
     pdf_url: str | None = Field(default=None, alias="pdfUrl")
+    session_id: str | None = Field(default=None, max_length=200)
 
 
 class PaperMetadata(BaseModel):
@@ -61,6 +75,22 @@ class PaperMetadata(BaseModel):
     abstract: str | None = None
     pdf_url: str | None = Field(default=None, alias="pdfUrl")
     status: str
+    session_ids: list[str] = Field(default_factory=list)
+
+
+class SessionCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    # Only meaningful on creation - the rename endpoint reuses this same
+    # request model but only ever changes name, carrying the existing goal
+    # through unchanged (see rename_session in routers/sessions.py).
+    goal: str | None = Field(default=None, max_length=300)
+
+
+class SessionMetadata(BaseModel):
+    id: str
+    name: str
+    created_at: str
+    goal: str | None = None
 
 
 class FeedbackRequest(BaseModel):
@@ -129,6 +159,46 @@ class PendingQuestionOut(BaseModel):
         return cls(**base)
 
 
+class GraphVizNode(BaseModel):
+    node_id: str
+    name: str
+    type: str | None = None
+    reused_existing_node: bool = False
+
+
+class GraphVizEdge(BaseModel):
+    edge_id: str
+    source_id: str
+    target_id: str
+    relation: str
+
+
+class NodeCitationOut(BaseModel):
+    paper_id: str
+    section: str | None = None
+    source_quote: str = ""
+
+
+class SessionGraphNode(BaseModel):
+    node_id: str
+    name: str
+    type: str
+    description: str = ""
+    citations: list[NodeCitationOut] = Field(default_factory=list)
+
+
+class SessionGraphEdge(BaseModel):
+    edge_id: str
+    source_id: str
+    target_id: str
+    relation: str
+
+
+class SessionGraphResponse(BaseModel):
+    nodes: list[SessionGraphNode]
+    edges: list[SessionGraphEdge]
+
+
 class PaperIngestResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
@@ -144,4 +214,10 @@ class PaperIngestResponse(BaseModel):
     chunk_ids: list[str]
     entities_added: int
     relations_added: int
+    # The exact post-canonicalization node/edge writes from this ingest -
+    # GraphManager already computes these (GraphIngestionReport.node_writes/
+    # edge_writes), just never returned over HTTP. Powers the frontend's
+    # live graph-building animation with real data, not synthesized counts.
+    new_nodes: list[GraphVizNode] = Field(default_factory=list)
+    new_edges: list[GraphVizEdge] = Field(default_factory=list)
     pending_clarification_count: int

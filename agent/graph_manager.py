@@ -12,6 +12,7 @@ import logging
 import math
 import re
 import threading
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
@@ -46,6 +47,22 @@ CANONICALIZATION_HIGH = 0.92
 CANONICALIZATION_LOW = 0.75
 
 
+def _session_ids(data: dict) -> list[str]:
+    """A node/edge's real session membership, read from the persisted
+    "session_ids" list this module writes (see GraphManager.add_node/
+    add_edge). Falls back to the old single "session_id" field for data
+    written before multi-session membership existed - this is what lets
+    ~90% of the graph's pre-existing legacy-tagged nodes keep working
+    exactly as before with no migration script, and self-heal into the
+    new list-based model for free the next time anything re-touches
+    them."""
+    session_ids = data.get("session_ids")
+    if session_ids:
+        return session_ids
+    legacy = data.get("session_id")
+    return [legacy] if legacy else []
+
+
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
     if len(a) != len(b):
         return 0.0
@@ -58,7 +75,33 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
 
 
 def _normalize_name(name: str) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
+    # NFKC first: folds Unicode compatibility variants (e.g. the
+    # Mathematical Alphanumeric Symbols block - "𝑄" U+1D444 italic-math
+    # capital Q) down to their plain ASCII letters before the regex strips
+    # anything outside literal a-z0-9. Without this, an entity name that
+    # differs from an existing node only by a math-italic codepoint drops
+    # that codepoint entirely instead of matching it, missing the exact-
+    # match tier and landing in the fuzzy needs_clarification band instead.
+    normalized = unicodedata.normalize("NFKC", name)
+    return re.sub(r"[^a-z0-9]+", " ", normalized.lower()).strip()
+
+
+_ABBREVIATION_RE = re.compile(r"^(.+?)\s*\(([^()]+)\)$")
+
+
+def _abbreviation_of(name: str) -> str | None:
+    """If `name` is "Full Form (Abbrev)", return normalize(Abbrev) - the
+    bare-abbreviation side of the pair. Used only to auto-match a spelled-
+    out name against another entity whose name IS that bare abbreviation
+    (e.g. "moral ODD" against "moral operational design domain (moral
+    ODD)"). Deliberately not used to match two parenthetical forms against
+    each other - two names that each carry their own distinguishing prefix
+    (e.g. "explicit moral ODD (...)" vs "moral ODD (...)") stay a real
+    needs_clarification question instead of being silently merged."""
+    match = _ABBREVIATION_RE.match(name.strip())
+    if match is None:
+        return None
+    return _normalize_name(match.group(2))
 
 
 @dataclass
@@ -105,6 +148,36 @@ class IncidentEdge:
     source_quote: str
     source_paper_id: str | None
     source_section: str | None
+
+
+@dataclass
+class NodeCitation:
+    paper_id: str
+    section: str | None
+    source_quote: str
+
+
+@dataclass
+class SessionGraphNode:
+    node_id: str
+    name: str
+    type: str
+    description: str
+    citations: list[NodeCitation]
+
+
+@dataclass
+class SessionGraphEdge:
+    edge_id: str
+    source_id: str
+    target_id: str
+    relation: str
+
+
+@dataclass
+class SessionGraphExport:
+    nodes: list[SessionGraphNode]
+    edges: list[SessionGraphEdge]
 
 
 @dataclass
@@ -171,12 +244,26 @@ class GraphManager:
     # ---- Write tools ----
 
     def add_node(self, node: Node) -> str:
-        """Idempotent upsert on node.id — safe to retry."""
+        """Idempotent upsert on node.id — safe to retry.
+
+        Also session-accumulating: a node reused across multiple ingests
+        (via canonicalization, or the same paper_id re-ingested into a
+        different session) belongs to every session that has genuinely
+        used it, not just whichever session touched it first or last -
+        confirmed live as a real bug where re-ingesting an already-known
+        paper into a new session left it invisible there. The merged
+        list is computed once here so every caller (paper nodes, entity
+        nodes, implicit relation-endpoint nodes) gets this for free.
+        """
         with self._lock:
-            self._db.collection("nodes").document(node.id).set(
-                node.model_dump(mode="json"), merge=True
+            existing = self.graph.nodes.get(node.id)
+            merged_session_ids = sorted(
+                set(_session_ids(existing or {})) | set(_session_ids(node.model_dump(mode="json")))
             )
-            self.graph.add_node(node.id, **node.model_dump(mode="json"))
+            payload = node.model_dump(mode="json")
+            payload["session_ids"] = merged_session_ids
+            self._db.collection("nodes").document(node.id).set(payload, merge=True)
+            self.graph.add_node(node.id, **payload)
             # add_node is an upsert (name/description can change on retry
             # with richer data) - drop any stale cached tokens so
             # search_nodes below re-tokenizes from the current data on
@@ -185,18 +272,105 @@ class GraphManager:
             return node.id
 
     def add_edge(self, edge: Edge) -> str:
-        """Idempotent upsert on edge.id — safe to retry."""
+        """Idempotent upsert on edge.id — safe to retry. Session-
+        accumulating in the same way and for the same reason as
+        add_node above."""
         with self._lock:
-            self._db.collection("edges").document(edge.id).set(
-                edge.model_dump(mode="json"), merge=True
+            existing_edge = self.graph.get_edge_data(
+                edge.source_id, edge.target_id, key=edge.id
             )
+            merged_session_ids = sorted(
+                set(_session_ids(existing_edge or {})) | set(_session_ids(edge.model_dump(mode="json")))
+            )
+            payload = edge.model_dump(mode="json")
+            payload["session_ids"] = merged_session_ids
+            self._db.collection("edges").document(edge.id).set(payload, merge=True)
             self.graph.add_edge(
                 edge.source_id,
                 edge.target_id,
                 key=edge.id,
-                **edge.model_dump(mode="json"),
+                **payload,
             )
             return edge.id
+
+    def remove_by_session(self, session_id: str) -> set[str]:
+        """Removes this session's membership from every node/edge it
+        touches - a node/edge still genuinely shared with another
+        session survives (just has this session_id stripped from its
+        membership list); one that becomes ownerless is fully deleted,
+        from both the live in-memory graph and Firestore. Returns the
+        ids of nodes that were actually fully deleted, so a caller
+        (session delete) can clean up anything else keyed off them,
+        like pending clarification questions - a surviving shared node
+        must not have its clarification questions removed just because
+        one of its owning sessions went away.
+
+        Edges are collected up front, before any removal - both every
+        edge touching a node that's about to be fully deleted
+        (regardless of which session added that edge - an edge to a
+        node that's about to disappear is dead either way, and leaving
+        its Firestore doc behind would resurrect the node as a bare,
+        data-less stub on the next _rehydrate(), since add_edge
+        auto-creates missing endpoint nodes) and every edge that becomes
+        ownerless once this session's membership is stripped from it,
+        even between nodes it doesn't own (reused via canonicalization,
+        so wouldn't otherwise be touched).
+        """
+        with self._lock:
+            touched_node_ids = {
+                node_id
+                for node_id, data in self.graph.nodes(data=True)
+                if session_id in _session_ids(data)
+            }
+
+            fully_removed_node_ids: set[str] = set()
+            for node_id in touched_node_ids:
+                data = self.graph.nodes[node_id]
+                remaining = [s for s in _session_ids(data) if s != session_id]
+                if remaining:
+                    updated = {**data, "session_ids": remaining}
+                    self.graph.nodes[node_id]["session_ids"] = remaining
+                    self._db.collection("nodes").document(node_id).set(
+                        updated, merge=True
+                    )
+                else:
+                    fully_removed_node_ids.add(node_id)
+
+            edges_to_remove: dict[str, tuple[str, str, str]] = {}
+            for node_id in fully_removed_node_ids:
+                for source, target, key in self.graph.in_edges(node_id, keys=True):
+                    edges_to_remove[key] = (source, target, key)
+                for source, target, key in self.graph.out_edges(node_id, keys=True):
+                    edges_to_remove[key] = (source, target, key)
+
+            edges_to_update: list[tuple[str, str, str, dict]] = []
+            for source, target, key, data in self.graph.edges(keys=True, data=True):
+                if key in edges_to_remove or session_id not in _session_ids(data):
+                    continue
+                remaining = [s for s in _session_ids(data) if s != session_id]
+                if remaining:
+                    edges_to_update.append(
+                        (source, target, key, {**data, "session_ids": remaining})
+                    )
+                else:
+                    edges_to_remove[key] = (source, target, key)
+
+            for source, target, key in edges_to_remove.values():
+                if self.graph.has_edge(source, target, key):
+                    self.graph.remove_edge(source, target, key)
+                self._db.collection("edges").document(key).delete()
+
+            for source, target, key, updated in edges_to_update:
+                self.graph[source][target][key]["session_ids"] = updated["session_ids"]
+                self._db.collection("edges").document(key).set(updated, merge=True)
+
+            for node_id in fully_removed_node_ids:
+                if node_id in self.graph:
+                    self.graph.remove_node(node_id)
+                self._db.collection("nodes").document(node_id).delete()
+                self._node_token_cache.pop(node_id, None)
+
+            return fully_removed_node_ids
 
     def resolve_alias(
         self, canonical_id: str, alias_id: str, distinct: bool = False
@@ -386,6 +560,90 @@ class GraphManager:
                 )
             return edges
 
+    def export_session_graph(self, session_id: str) -> SessionGraphExport:
+        """All nodes/edges tagged with session_id, as a flat list for a
+        client-side force layout (Graph Explorer). Strict scoping: an edge
+        is only included when BOTH endpoints belong to this session - it
+        never reaches into the shared graph, unlike get_incident_edges
+        which follows a single node's real edges regardless of who added
+        them. Same session_id in _session_ids(data) membership check as
+        remove_by_session/find_sparse_pairs.
+
+        Each node also carries its own citations - which paper/section it
+        was actually extracted from, so the panel can say where an idea
+        came from instead of just its name/description. Derived from the
+        same in-session edge set below (not a separate graph traversal),
+        so a citation only ever points at something the edges list itself
+        also shows as real - deduped by (paper_id, section) so a node
+        touched by several edges into the same paper/section doesn't
+        produce repeat entries. An INFERRED edge (SAME_AS, a Contradiction
+        Finder edge) has no source_paper_id and contributes nothing."""
+        with self._lock:
+            node_data = {
+                node_id: data
+                for node_id, data in self.graph.nodes(data=True)
+                if session_id in _session_ids(data)
+            }
+            node_ids = set(node_data)
+            seen: set[str] = set()
+            edges: list[SessionGraphEdge] = []
+            citation_keys: dict[str, set[tuple[str, str | None]]] = {
+                node_id: set() for node_id in node_ids
+            }
+            citations: dict[str, list[NodeCitation]] = {
+                node_id: [] for node_id in node_ids
+            }
+            for source_id, target_id, edge_id, data in self.graph.edges(
+                keys=True, data=True
+            ):
+                if (
+                    edge_id in seen
+                    or source_id not in node_ids
+                    or target_id not in node_ids
+                ):
+                    continue
+                if data.get("type") == EdgeType.SAME_AS.value:
+                    # The merge marker itself, not a real relation - same
+                    # exclusion as get_incident_edges.
+                    continue
+                seen.add(edge_id)
+                edges.append(
+                    SessionGraphEdge(
+                        edge_id=edge_id,
+                        source_id=source_id,
+                        target_id=target_id,
+                        relation=data.get("type", "UNKNOWN"),
+                    )
+                )
+                paper_id = data.get("source_paper_id")
+                if not paper_id:
+                    continue
+                section = data.get("source_section")
+                key = (paper_id, section)
+                for endpoint in (source_id, target_id):
+                    if key in citation_keys[endpoint]:
+                        continue
+                    citation_keys[endpoint].add(key)
+                    citations[endpoint].append(
+                        NodeCitation(
+                            paper_id=paper_id,
+                            section=section,
+                            source_quote=data.get("source_quote") or "",
+                        )
+                    )
+
+            nodes = [
+                SessionGraphNode(
+                    node_id=node_id,
+                    name=data.get("name", node_id),
+                    type=data.get("type", "UNKNOWN"),
+                    description=data.get("description", ""),
+                    citations=citations[node_id],
+                )
+                for node_id, data in node_data.items()
+            ]
+            return SessionGraphExport(nodes=nodes, edges=edges)
+
     def _stable_node_id(
         self, paper_id: str, name: str, node_type: NodeType
     ) -> str:
@@ -416,15 +674,24 @@ class GraphManager:
         )
 
     def find_sparse_pairs(
-        self, node_type: NodeType | None = None, limit: int = 10
+        self,
+        node_type: NodeType | None = None,
+        limit: int = 10,
+        session_id: str | None = None,
     ) -> list[tuple[str, str]]:
         """Candidate pairs with no direct edge but at least one common
-        neighbor — topology decides, not LLM guessing."""
+        neighbor — topology decides, not LLM guessing.
+
+        session_id, when given, restricts candidates to nodes tagged with
+        that session (same tagging remove_by_session already relies on) -
+        otherwise gap suggestions draw from every paper ever ingested in
+        any session, not just what's actually in this one."""
         with self._lock:
             candidates = [
                 n
                 for n, data in self.graph.nodes(data=True)
-                if node_type is None or data.get("type") == node_type.value
+                if (node_type is None or data.get("type") == node_type.value)
+                and (session_id is None or session_id in _session_ids(data))
             ]
             undirected = self.graph.to_undirected()
             pairs: list[tuple[str, str, int]] = []
@@ -463,13 +730,35 @@ class GraphManager:
         """
         with self._lock:
             normalized = _normalize_name(name)
+            new_abbreviation = _abbreviation_of(name)
+            abbreviation_matches: list[str] = []
             for node_id, data in self.graph.nodes(data=True):
                 if node_type is not None and data.get("type") != node_type.value:
                     continue
                 if self._is_merged_alias(node_id):
                     continue
-                if _normalize_name(data.get("name", "")) == normalized:
+                existing_name = data.get("name", "")
+                if _normalize_name(existing_name) == normalized:
                     return CanonicalizationResult("auto_merge", node_id, 1.0)
+                # Bare-abbreviation match: one side is exactly "Full Form
+                # (Abbrev)" and the other is exactly "Abbrev" - as strong a
+                # signal as the exact-string match above. Collected rather
+                # than returned immediately: if the abbreviation happens to
+                # be shared by more than one differently-qualified existing
+                # name (e.g. "moral ODD" abbreviates both "moral
+                # operational design domain (moral ODD)" and "explicit
+                # moral operational design domain (moral ODD)"), which one
+                # a bare mention actually means is genuinely ambiguous and
+                # must fall through to the normal embedding-similarity /
+                # needs_clarification path below, not be silently decided
+                # by graph iteration order.
+                if new_abbreviation is not None and _normalize_name(existing_name) == new_abbreviation:
+                    abbreviation_matches.append(node_id)
+                elif normalized == _abbreviation_of(existing_name):
+                    abbreviation_matches.append(node_id)
+
+            if len(abbreviation_matches) == 1:
+                return CanonicalizationResult("auto_merge", abbreviation_matches[0], 1.0)
 
             if embedding is None:
                 return CanonicalizationResult("new")
@@ -500,6 +789,7 @@ class GraphManager:
         paper_name: str | None = None,
         embedding_fn: Callable[[ExtractedEntity], list[float] | None] | None = None,
         clarification: "ClarificationOrchestrator | None" = None,
+        session_id: str | None = None,
     ) -> GraphIngestionReport:
         """Persist structured extraction output with stable, retry-safe IDs.
 
@@ -518,11 +808,20 @@ class GraphManager:
         profile (see service/state.py) - revisit if that profile changes.
         """
 
+        # A paper's node id is deterministic from paper_id alone (see
+        # _stable_paper_node_id) - re-ingesting the same paper_id (e.g.
+        # the same arXiv id added into a second session) reuses the same
+        # node either way. add_node itself accumulates session
+        # membership on write, so this call is enough to make the paper
+        # (and, below, every reused entity) visible from both sessions -
+        # no special-casing needed here anymore.
+        paper_node_id = self._stable_paper_node_id(extraction.paper_id)
         paper_node = Node(
-            id=self._stable_paper_node_id(extraction.paper_id),
+            id=paper_node_id,
             type=NodeType.PAPER,
             name=paper_name or extraction.paper_id,
             description="Source paper",
+            session_id=session_id,
         )
         self.add_node(paper_node)
 
@@ -550,6 +849,28 @@ class GraphManager:
             if canonical.decision == "auto_merge" and canonical.matched_node_id:
                 node_id = canonical.matched_node_id
                 reused = True
+                # Reusing an existing node id is not itself a write - a
+                # real add_node call is needed here too, or this
+                # session's membership never gets recorded on it at all.
+                # Confirmed live and by a failing test: the single most
+                # common case this whole fix targets (a well-known
+                # entity reused across sessions via canonicalization)
+                # was silently skipping accumulation entirely. Keeps the
+                # existing node's own name/description/type - this is
+                # the same real-world entity, not new content to merge
+                # in, so nothing about it should change except which
+                # sessions can now see it.
+                existing_data = self.graph.nodes[node_id]
+                self.add_node(
+                    Node(
+                        id=node_id,
+                        type=NodeType(existing_data["type"]),
+                        name=existing_data.get("name", entity.name),
+                        description=existing_data.get("description", ""),
+                        entity_embedding=existing_data.get("entity_embedding"),
+                        session_id=session_id,
+                    )
+                )
             else:
                 node_id = self._stable_node_id(
                     extraction.paper_id, entity.name, entity.type
@@ -561,6 +882,7 @@ class GraphManager:
                         name=entity.name,
                         description=entity.description,
                         entity_embedding=embedding,
+                        session_id=session_id,
                     )
                 )
                 reused = False
@@ -614,12 +936,14 @@ class GraphManager:
                     relation.source_entity,
                     relation.source_type,
                     entity_to_node_id,
+                    session_id=session_id,
                 )
                 target_id = self._resolve_relation_endpoint(
                     extraction.paper_id,
                     relation.target_entity,
                     relation.target_type,
                     entity_to_node_id,
+                    session_id=session_id,
                 )
             except ValueError:
                 # An untyped relation endpoint whose name matches more than
@@ -639,14 +963,19 @@ class GraphManager:
                     exc_info=True,
                 )
                 continue
+            edge_id = self._stable_edge_id(
+                extraction.paper_id,
+                source_id,
+                target_id,
+                relation.relation,
+                relation.source_quote,
+            )
+            # Deterministic edge id, same re-ingest-collision reasoning as
+            # the paper node above - add_edge accumulates session
+            # membership on write, so re-ingesting this relation from a
+            # different session correctly adds it there too.
             edge = Edge(
-                id=self._stable_edge_id(
-                    extraction.paper_id,
-                    source_id,
-                    target_id,
-                    relation.relation,
-                    relation.source_quote,
-                ),
+                id=edge_id,
                 source_id=source_id,
                 target_id=target_id,
                 type=relation.relation,
@@ -654,6 +983,7 @@ class GraphManager:
                 source_paper_id=extraction.paper_id,
                 source_section=relation.source_section,
                 source_quote=relation.source_quote,
+                session_id=session_id,
             )
             self.add_edge(edge)
             edge_writes.append(
@@ -679,6 +1009,8 @@ class GraphManager:
         name: str,
         node_type: NodeType | None,
         entity_to_node_id: dict[tuple[str, NodeType], str],
+        *,
+        session_id: str | None = None,
     ) -> str:
         normalized = _normalize_name(name)
         if node_type is not None:
@@ -700,6 +1032,20 @@ class GraphManager:
 
         canonical = self.canonicalize(name, node_type=node_type)
         if canonical.decision == "auto_merge" and canonical.matched_node_id:
+            # Same accumulation gap as the main entity loop above: reusing
+            # an existing node id is not itself a write, so this
+            # session's membership must be recorded explicitly here too.
+            existing_data = self.graph.nodes[canonical.matched_node_id]
+            self.add_node(
+                Node(
+                    id=canonical.matched_node_id,
+                    type=NodeType(existing_data["type"]),
+                    name=existing_data.get("name", name),
+                    description=existing_data.get("description", ""),
+                    entity_embedding=existing_data.get("entity_embedding"),
+                    session_id=session_id,
+                )
+            )
             return canonical.matched_node_id
 
         resolved_type = node_type or NodeType.CONCEPT
@@ -710,6 +1056,7 @@ class GraphManager:
                 type=resolved_type,
                 name=name,
                 description="Implicit relation endpoint from extraction",
+                session_id=session_id,
             )
         )
         entity_to_node_id[(normalized, resolved_type)] = node_id

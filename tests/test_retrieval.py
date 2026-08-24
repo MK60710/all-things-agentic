@@ -43,6 +43,20 @@ def test_reprocessing_replaces_stale_chunks_in_memory_and_firestore(fake_db):
     assert not set(old_ids) & set(fake_db._collections["chunks"])
 
 
+def test_remove_paper_clears_records_in_memory_and_firestore(fake_db):
+    index = ChunkIndex(db_client=fake_db)
+    removed_ids = index.upsert_paper("paper-1", ["one", "two"])
+    index.upsert_paper("paper-2", ["unrelated"])
+
+    count = index.remove_paper("paper-1")
+
+    assert count == 2
+    assert index.count() == 1
+    assert index.paper_chunks("paper-1") == []
+    assert not set(removed_ids) & set(fake_db._collections["chunks"])
+    assert len(index.paper_chunks("paper-2")) == 1
+
+
 def test_assemble_context_expands_neighbors_and_restores_order():
     index = ChunkIndex()
     chunks = [

@@ -5,7 +5,7 @@ import time
 import uuid
 from types import SimpleNamespace
 
-from agent.gap_finder import GapFinder, GeminiExplainer
+from agent.gap_finder import Explanation, GapFinder, GeminiExplainer
 from agent.graph_manager import GraphManager
 from agent.schema import Edge, EdgeType, Node, NodeType, ProvenanceTag
 
@@ -54,6 +54,13 @@ def _stub_explain(name_a: str, name_b: str, evidence: list[str]) -> str:
     return f"stub explanation: {name_a} / {name_b} / {evidence}"
 
 
+def _json_payload(explanation: str, verdict: str = "gap") -> str:
+    """The shape a real Gemini call now returns under
+    response_schema=_ExplanationPayload - fake client fixtures below stand
+    in for that structured response, not free text."""
+    return json.dumps({"explanation": explanation, "verdict": verdict})
+
+
 def test_gap_finder_defaults_to_template_not_gemini(fake_db):
     """GapFinder's bare default must stay the zero-dependency template - a
     caller with no explicit explain_fn should never trigger a Gemini
@@ -89,6 +96,71 @@ def test_find_candidates_topology_decides_not_llm(fake_db):
     assert candidates[0].score == 1.0  # exactly one common neighbor
 
 
+def test_find_candidates_goal_boosts_a_matching_pair(fake_db):
+    """A session goal overlapping a candidate's node names/descriptions
+    nudges its score up - the ranking mechanism behind steering gap
+    suggestions toward what the researcher said they're working on."""
+    gm, a, b, shared = _populated_graph(fake_db)
+    gf = GapFinder(gm, explain_fn=_stub_explain)
+
+    baseline = gf.find_candidates()[0]
+    boosted = gf.find_candidates(goal="sparse concept research")[0]
+
+    assert boosted.score > baseline.score
+
+
+def test_find_candidates_goal_with_no_overlap_does_not_boost(fake_db):
+    gm, a, b, shared = _populated_graph(fake_db)
+    gf = GapFinder(gm, explain_fn=_stub_explain)
+
+    baseline = gf.find_candidates()[0]
+    unrelated = gf.find_candidates(goal="completely unrelated topic xyz")[0]
+
+    assert unrelated.score == baseline.score
+
+
+def test_find_candidates_backfills_when_top_candidate_is_a_coincidence(fake_db):
+    """A "coincidence" verdict must not consume a slot in the returned
+    results - the next-ranked pair from the already-over-fetched pool
+    (limit * 3) backfills it, so a real limit-sized batch still comes
+    back."""
+    gm = GraphManager(project_id="test-project", db_client=fake_db)
+
+    def make_pair(name: str, neighbor_count: int) -> tuple[Node, Node]:
+        a, b = _node(f"A_{name}"), _node(f"B_{name}")
+        gm.add_node(a)
+        gm.add_node(b)
+        previous_shared = None
+        for i in range(neighbor_count):
+            shared = _node(f"S_{name}_{i}")
+            gm.add_node(shared)
+            gm.add_edge(_edge(shared.id, a.id))
+            gm.add_edge(_edge(shared.id, b.id))
+            # Two shared neighbors of the same pair are themselves a common-
+            # neighbors pair (both connect to a and b) - a direct edge
+            # between them excludes that spurious pair from
+            # find_sparse_pairs (which skips anything with a direct edge
+            # already), so the only real sparse pair here stays (a, b).
+            if previous_shared is not None:
+                gm.add_edge(_edge(previous_shared.id, shared.id))
+            previous_shared = shared
+        return a, b
+
+    make_pair("strong", 2)  # score 2.0 - ranks first, but is a coincidence
+    weak_a, weak_b = make_pair("weak", 1)  # score 1.0 - the real backfill
+
+    def verdict_explain(name_a: str, name_b: str, evidence: list[str]) -> Explanation:
+        verdict = "coincidence" if name_a == "A_strong" else "gap"
+        return Explanation(f"explanation for {name_a}", cacheable=True, verdict=verdict)
+
+    gf = GapFinder(gm, explain_fn=verdict_explain)
+
+    results = gf.find_candidates(limit=1)
+
+    assert len(results) == 1
+    assert {results[0].node_a_id, results[0].node_b_id} == {weak_a.id, weak_b.id}
+
+
 def test_feedback_boosts_future_ranking(fake_db):
     gm, a, b, shared = _populated_graph(fake_db)
     other = _node("Unrelated Concept")
@@ -113,15 +185,19 @@ def test_feedback_boosts_future_ranking(fake_db):
     assert ab_score_after > ab_score_before
 
 
-def test_not_interesting_feedback_lowers_future_ranking(fake_db):
+def test_not_interesting_feedback_excludes_the_pair_from_future_results(fake_db):
+    """"Not interesting" is a hard, permanent exclusion (mirrors
+    GraphManager._known_distinct), not just a soft score nudge via
+    _node_boost - a high-connectivity pair could otherwise simply outweigh
+    the nudge and keep resurfacing no matter how many times it's
+    dismissed."""
     gm, a, b, shared = _populated_graph(fake_db)
     gf = GapFinder(gm, explain_fn=_stub_explain)
 
-    before = gf.find_candidates()[0].score
+    assert len(gf.find_candidates()) == 1
     gf.record_feedback(a.id, b.id, interesting=False)
-    after = gf.find_candidates()[0].score
 
-    assert after < before
+    assert gf.find_candidates() == []
 
 
 def test_feedback_writes_event_to_firestore(fake_db):
@@ -133,7 +209,22 @@ def test_feedback_writes_event_to_firestore(fake_db):
     events = list(fake_db.collection("feedback_events").stream())
     assert len(events) == 1
     assert events[0].to_dict()["type"] == "gap_rating"
-    assert events[0].to_dict()["interesting"] is True
+
+
+def test_node_boost_rehydrates_from_feedback_events_on_construction(fake_db):
+    """Regression: feedback_events was written for durability but never
+    read back, so 'adapts to the user's thinking' only held for the
+    lifetime of one running process. A fresh GapFinder pointed at the same
+    db_client must already reflect prior feedback (including a hard
+    dismiss), with no record_feedback call on the new instance."""
+    gm, a, b, shared = _populated_graph(fake_db)
+    first_process = GapFinder(gm, explain_fn=_stub_explain, db_client=fake_db)
+    assert len(first_process.find_candidates()) == 1
+    first_process.record_feedback(a.id, b.id, interesting=False)
+
+    restarted = GapFinder(gm, explain_fn=_stub_explain, db_client=fake_db)
+
+    assert restarted.find_candidates() == []
 
 
 class _FakeModels:
@@ -173,7 +264,9 @@ class _FakeGenaiClient:
 
 
 def test_gemini_explainer_returns_model_text():
-    fake_client = _FakeGenaiClient(text="  A genuinely interesting gap.  ")
+    fake_client = _FakeGenaiClient(
+        text=f"  {_json_payload('A genuinely interesting gap.')}  "
+    )
     explainer = GeminiExplainer(client=fake_client)
 
     result = explainer("Chain of Thought", "Reasoning", ["Prompting"])
@@ -200,7 +293,7 @@ def test_gemini_explainer_uses_json_tag_wrapped_payload():
     block, not string-concatenated field lines - matches the format
     assemble_context uses in retrieval.py for the same class of untrusted
     data."""
-    fake_client = _FakeGenaiClient(text="Explanation.")
+    fake_client = _FakeGenaiClient(text=_json_payload("Explanation."))
     explainer = GeminiExplainer(client=fake_client)
 
     explainer("Chain of Thought", "Reasoning", ["Prompting"])
@@ -223,7 +316,7 @@ def test_gemini_explainer_escapes_angle_brackets_in_untrusted_fields():
     name containing "</gap_candidate>" must not be able to close the tag
     early and forge a fake payload of its own (same fix, same reasoning,
     as retrieval.py's assemble_context)."""
-    fake_client = _FakeGenaiClient(text="Explanation.")
+    fake_client = _FakeGenaiClient(text=_json_payload("Explanation."))
     explainer = GeminiExplainer(client=fake_client)
 
     explainer(
@@ -248,6 +341,36 @@ def test_gemini_explainer_fallback_uses_original_unescaped_names():
 
     assert "A < B" in result
     assert "&lt;" not in result
+
+
+def test_gemini_explainer_returns_a_coincidence_verdict():
+    """The model's existing "or say if it looks more like a coincidence"
+    judgment - previously only visible as a sentence buried in the
+    explanation text - is now structured data GapFinder can filter on."""
+    fake_client = _FakeGenaiClient(
+        text=_json_payload("Unrelated overlap.", verdict="coincidence")
+    )
+    explainer = GeminiExplainer(client=fake_client)
+
+    result = explainer("FEVER", "PDDL", ["Retrieval-Augmented Generation"])
+
+    assert result == "Unrelated overlap."
+    assert result.verdict == "coincidence"
+
+
+def test_gemini_explainer_falls_back_when_response_is_not_valid_json(caplog):
+    """A response that fails schema validation must degrade to the
+    deterministic template with no verdict - never spuriously come back as
+    "coincidence" and get silently dropped by find_candidates."""
+    fake_client = _FakeGenaiClient(text="not valid json at all")
+    explainer = GeminiExplainer(client=fake_client)
+
+    with caplog.at_level("WARNING"):
+        result = explainer("A", "B", [])
+
+    assert "share context" in result  # the deterministic template's phrasing
+    assert getattr(result, "verdict", None) is None
+    assert "schema validation" in caplog.text
 
 
 def test_gemini_explainer_falls_back_on_empty_response(caplog):
@@ -290,7 +413,7 @@ def test_gemini_explainer_falls_back_when_client_construction_fails(monkeypatch)
 
 def test_gap_finder_uses_gemini_explainer_end_to_end(fake_db):
     gm, a, b, shared = _populated_graph(fake_db)
-    fake_client = _FakeGenaiClient(text="Real Gemini explanation.")
+    fake_client = _FakeGenaiClient(text=_json_payload("Real Gemini explanation."))
     gf = GapFinder(gm, explain_fn=GeminiExplainer(client=fake_client))
 
     candidates = gf.find_candidates()
@@ -303,7 +426,7 @@ def test_gap_finder_caches_explanation_across_calls(fake_db):
     find_candidates() call - the same pair must not be re-sent to Gemini
     just because its score changed."""
     gm, a, b, shared = _populated_graph(fake_db)
-    fake_client = _FakeGenaiClient(text="Real Gemini explanation.")
+    fake_client = _FakeGenaiClient(text=_json_payload("Real Gemini explanation."))
     gf = GapFinder(gm, explain_fn=GeminiExplainer(client=fake_client))
 
     gf.find_candidates()
@@ -324,7 +447,7 @@ def test_gap_finder_retries_after_transient_gemini_failure(fake_db):
     assert "share context" in first[0].explanation
 
     fake_client.models._error = None
-    fake_client.models._text = "Recovered Gemini explanation."
+    fake_client.models._text = _json_payload("Recovered Gemini explanation.")
     second = gf.find_candidates()
 
     assert fake_client.models.call_count == 2
@@ -376,7 +499,7 @@ def test_gemini_explainer_does_not_cache_a_truncated_response(fake_db):
     assert "share context" in first[0].explanation  # template, not the cutoff
 
     fake_client.models._finish_reason = None
-    fake_client.models._text = "A complete, untruncated explanation."
+    fake_client.models._text = _json_payload("A complete, untruncated explanation.")
     second = gf.find_candidates()
 
     assert fake_client.models.call_count == 2  # retried, not served from cache
@@ -396,7 +519,7 @@ def test_gemini_explainer_backoff_skips_live_call_after_failure():
     assert fake_client.models.call_count == 1
 
     fake_client.models._error = None
-    fake_client.models._text = "Recovered."
+    fake_client.models._text = _json_payload("Recovered.")
     second = explainer("A", "B", [])
 
     assert fake_client.models.call_count == 1  # skipped, still in backoff

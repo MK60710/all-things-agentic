@@ -145,6 +145,167 @@ def test_get_incident_edges_deduplicates_and_resolves_names(fake_db):
     assert edges_from_b == edges_from_a
 
 
+def test_export_session_graph_only_returns_nodes_tagged_to_that_session(fake_db):
+    gm = _make_manager(fake_db)
+    a = _node("Session A Concept")
+    a.session_id = "session-a"
+    b = _node("Session B Concept")
+    b.session_id = "session-b"
+    gm.add_node(a)
+    gm.add_node(b)
+
+    export = gm.export_session_graph("session-a")
+
+    assert [n.node_id for n in export.nodes] == [a.id]
+
+
+def test_export_session_graph_includes_edges_between_session_nodes(fake_db):
+    gm = _make_manager(fake_db)
+    a, b = _node("Method A"), _node("Metric B")
+    a.session_id = b.session_id = "session-a"
+    gm.add_node(a)
+    gm.add_node(b)
+    gm.add_edge(
+        Edge(
+            id=str(uuid.uuid4()),
+            source_id=a.id,
+            target_id=b.id,
+            type=EdgeType.USES,
+            provenance=ProvenanceTag.EXTRACTED,
+            source_quote="quote",
+            session_id="session-a",
+        )
+    )
+
+    export = gm.export_session_graph("session-a")
+
+    assert len(export.edges) == 1
+    assert export.edges[0].source_id == a.id
+    assert export.edges[0].target_id == b.id
+
+
+def test_export_session_graph_drops_edge_reaching_outside_the_session(fake_db):
+    """Strict scoping: an edge with only one endpoint in the session must
+    not appear, even if the edge itself or the other node exists in the
+    graph - the Graph Explorer never reaches into the shared graph."""
+    gm = _make_manager(fake_db)
+    a = _node("Session A Concept")
+    a.session_id = "session-a"
+    b = _node("Shared Graph Concept")
+    b.session_id = "session-b"
+    gm.add_node(a)
+    gm.add_node(b)
+    gm.add_edge(
+        Edge(
+            id=str(uuid.uuid4()),
+            source_id=a.id,
+            target_id=b.id,
+            type=EdgeType.USES,
+            provenance=ProvenanceTag.EXTRACTED,
+            source_quote="quote",
+            session_id="session-a",
+        )
+    )
+
+    export = gm.export_session_graph("session-a")
+
+    assert export.edges == []
+
+
+def test_export_session_graph_excludes_same_as_merge_edges(fake_db):
+    gm = _make_manager(fake_db)
+    a, b = _node("Duplicate Name"), _node("duplicate name")
+    a.session_id = b.session_id = "session-a"
+    gm.add_node(a)
+    gm.add_node(b)
+    gm.add_edge(
+        Edge(
+            id=str(uuid.uuid4()),
+            source_id=b.id,
+            target_id=a.id,
+            type=EdgeType.SAME_AS,
+            provenance=ProvenanceTag.INFERRED,
+            session_id="session-a",
+        )
+    )
+
+    export = gm.export_session_graph("session-a")
+
+    assert export.edges == []
+
+
+def test_export_session_graph_derives_and_dedupes_node_citations(fake_db):
+    """A node's citations come from its own in-session edges' real
+    provenance (paper_id/section), not a separate field on the node
+    itself - and a node touched by several edges into the same
+    paper/section must not produce repeat entries."""
+    gm = _make_manager(fake_db)
+    a, b, c = _node("Method A"), _node("Metric B"), _node("Concept C")
+    a.session_id = b.session_id = c.session_id = "session-a"
+    gm.add_node(a)
+    gm.add_node(b)
+    gm.add_node(c)
+    gm.add_edge(
+        Edge(
+            id=str(uuid.uuid4()),
+            source_id=a.id,
+            target_id=b.id,
+            type=EdgeType.USES,
+            provenance=ProvenanceTag.EXTRACTED,
+            source_quote="A uses B.",
+            source_paper_id="paper-1",
+            source_section="Method",
+            session_id="session-a",
+        )
+    )
+    gm.add_edge(
+        Edge(
+            id=str(uuid.uuid4()),
+            source_id=a.id,
+            target_id=c.id,
+            type=EdgeType.SUPPORTS,
+            provenance=ProvenanceTag.EXTRACTED,
+            source_quote="A supports C.",
+            source_paper_id="paper-1",
+            source_section="Method",  # same (paper, section) as the edge above
+            session_id="session-a",
+        )
+    )
+
+    export = gm.export_session_graph("session-a")
+
+    node_a = next(n for n in export.nodes if n.node_id == a.id)
+    assert [(cit.paper_id, cit.section) for cit in node_a.citations] == [
+        ("paper-1", "Method")
+    ]
+
+
+def test_export_session_graph_node_citations_skip_inferred_edges(fake_db):
+    """An INFERRED edge (no real paper/section behind it, e.g. a
+    Contradiction Finder edge) must not show up as a fabricated
+    citation."""
+    gm = _make_manager(fake_db)
+    a, b = _node("Claim A"), _node("Claim B")
+    a.session_id = b.session_id = "session-a"
+    gm.add_node(a)
+    gm.add_node(b)
+    gm.add_edge(
+        Edge(
+            id=str(uuid.uuid4()),
+            source_id=a.id,
+            target_id=b.id,
+            type=EdgeType.CONTRADICTS,
+            provenance=ProvenanceTag.INFERRED,
+            source_quote="They disagree.",
+            session_id="session-a",
+        )
+    )
+
+    export = gm.export_session_graph("session-a")
+
+    assert all(n.citations == [] for n in export.nodes)
+
+
 def test_get_node_returns_none_for_unknown_id(fake_db):
     gm = _make_manager(fake_db)
     assert gm.get_node("does-not-exist") is None
@@ -182,6 +343,80 @@ def test_canonicalize_low_similarity_is_new(fake_db):
     existing = _node("Transformer", embedding=[1.0, 0.0])
     gm.add_node(existing)
     result = gm.canonicalize("Reinforcement Learning", embedding=[0.0, 1.0])
+    assert result.decision == "new"
+
+
+def test_canonicalize_unicode_math_variant_auto_merges(fake_db):
+    """"𝑄" (U+1D444, Mathematical Italic Capital Q) is a different
+    codepoint than plain "Q" - without NFKC normalization it gets stripped
+    by _normalize_name entirely instead of matching, landing this pair in
+    needs_clarification instead of the exact-match auto_merge tier."""
+    gm = _make_manager(fake_db)
+    existing = _node("Cochran's Q statistic")
+    gm.add_node(existing)
+    result = gm.canonicalize("Cochran's \U0001d444 statistic")
+    assert result.decision == "auto_merge"
+    assert result.matched_node_id == existing.id
+
+
+def test_canonicalize_bare_abbreviation_matches_spelled_out_form(fake_db):
+    gm = _make_manager(fake_db)
+    existing = _node("moral operational design domain (moral ODD)")
+    gm.add_node(existing)
+    result = gm.canonicalize("moral ODD")
+    assert result.decision == "auto_merge"
+    assert result.matched_node_id == existing.id
+
+
+def test_canonicalize_spelled_out_form_matches_existing_bare_abbreviation(fake_db):
+    gm = _make_manager(fake_db)
+    existing = _node("moral ODD")
+    gm.add_node(existing)
+    result = gm.canonicalize("moral operational design domain (moral ODD)")
+    assert result.decision == "auto_merge"
+    assert result.matched_node_id == existing.id
+
+
+def test_canonicalize_does_not_match_two_differently_qualified_parenthetical_forms(
+    fake_db,
+):
+    """Two spelled-out forms that share an abbreviation but each carry
+    their own distinguishing prefix are a real judgment call, not an
+    auto-merge - this must fall through to the normal embedding path
+    rather than picking one silently."""
+    gm = _make_manager(fake_db)
+    existing = _node(
+        "explicit moral operational design domain (moral ODD)",
+        embedding=[1.0, 0.0],
+    )
+    gm.add_node(existing)
+    result = gm.canonicalize(
+        "moral operational design domain (moral ODD)", embedding=[0.0, 1.0]
+    )
+    assert result.decision == "new"
+
+
+def test_canonicalize_bare_abbreviation_ambiguous_across_two_forms_falls_through(
+    fake_db,
+):
+    """A bare abbreviation that matches more than one differently-qualified
+    spelled-out form in the graph must not be silently decided by
+    iteration order - it falls through to the embedding path like any
+    other ambiguous name."""
+    gm = _make_manager(fake_db)
+    gm.add_node(
+        _node(
+            "moral operational design domain (moral ODD)",
+            embedding=[1.0, 0.0],
+        )
+    )
+    gm.add_node(
+        _node(
+            "explicit moral operational design domain (moral ODD)",
+            embedding=[1.0, 0.0],
+        )
+    )
+    result = gm.canonicalize("moral ODD", embedding=[0.0, 1.0])
     assert result.decision == "new"
 
 
@@ -237,6 +472,47 @@ def test_find_sparse_pairs_requires_common_neighbor(fake_db):
     assert (a.id, b.id) in pairs or (b.id, a.id) in pairs
 
 
+def test_find_sparse_pairs_sees_a_node_shared_across_sessions_from_either_one(fake_db):
+    """Regression test for the live-confirmed bug: a node created by one
+    session and later reused by a second session's ingest (via
+    canonicalization) must be visible to session-scoped candidate
+    generation from BOTH sessions, not just the first."""
+    gm = _make_manager(fake_db)
+    a, b, shared = _node("A"), _node("B"), _node("Shared Neighbor")
+    a.session_id = "session-a"
+    b.session_id = "session-a"
+    gm.add_node(a)
+    gm.add_node(b)
+    gm.add_node(shared)
+    gm.add_node(Node(**{**shared.model_dump(), "session_id": "session-a"}))
+    gm.add_node(Node(**{**shared.model_dump(), "session_id": "session-b"}))
+    for target in (a, b):
+        gm.add_edge(
+            Edge(
+                id=str(uuid.uuid4()),
+                source_id=shared.id,
+                target_id=target.id,
+                type=EdgeType.SUPPORTS,
+                provenance=ProvenanceTag.EXTRACTED,
+                source_quote="quote",
+                session_id="session-a",
+            )
+        )
+
+    pairs_a = gm.find_sparse_pairs(session_id="session-a")
+    assert (a.id, b.id) in pairs_a or (b.id, a.id) in pairs_a
+
+    # session-b only owns the shared node itself (not a/b), so it has no
+    # sparse pairs of its own here - the real assertion is that the
+    # shared node's session filter doesn't silently exclude it either.
+    candidates_b = [
+        n
+        for n, data in gm.graph.nodes(data=True)
+        if "session-b" in data.get("session_ids", [])
+    ]
+    assert shared.id in candidates_b
+
+
 def test_rehydrate_loads_existing_data(fake_db):
     gm = _make_manager(fake_db)
     node = _node("Persisted Concept")
@@ -284,6 +560,85 @@ def test_apply_extraction_result_is_idempotent(fake_db):
     assert gm.graph.number_of_nodes() == 3
     assert gm.graph.number_of_edges() == 1
     assert second.edge_writes[0].edge_id == first.edge_writes[0].edge_id
+
+
+def test_apply_extraction_result_tags_new_nodes_and_edges_with_session_id(fake_db):
+    gm = _make_manager(fake_db)
+    extraction = ExtractionResult(
+        paper_id="paper-session-tag",
+        entities=[
+            ExtractedEntity(name="Chain of Thought", type=NodeType.CONCEPT, description=""),
+            ExtractedEntity(name="Reasoning", type=NodeType.CONCEPT, description=""),
+        ],
+        relations=[
+            ExtractedRelation(
+                source_entity="Chain of Thought",
+                relation=EdgeType.SUPPORTS,
+                target_entity="Reasoning",
+                source_quote="Chain of thought prompts can support reasoning.",
+            )
+        ],
+    )
+
+    report = gm.apply_extraction_result(
+        extraction, paper_name="Paper Title", session_id="session-a"
+    )
+
+    assert gm.graph.nodes[report.paper_node_id]["session_ids"] == ["session-a"]
+    for write in report.node_writes:
+        assert gm.graph.nodes[write.node_id]["session_ids"] == ["session-a"]
+    edge_write = report.edge_writes[0]
+    edge_data = gm.graph.edges[edge_write.source_id, edge_write.target_id, edge_write.edge_id]
+    assert edge_data["session_ids"] == ["session-a"]
+
+
+def test_apply_extraction_result_reused_node_adds_the_new_session_alongside_the_original(fake_db):
+    """A node created by one session and later merged into by a different
+    session's ingest must become visible to BOTH sessions, not just the
+    first - confirmed live as a real bug where a well-known entity reused
+    from an earlier session stayed invisible to whichever session reused
+    it, silently starving Gap Finder/Contradiction Finder/Feynman Check
+    of real data. scripts/clear_session.py's own cleanup now strips just
+    one session's membership rather than deleting a still-shared node."""
+    gm = _make_manager(fake_db)
+    first = ExtractionResult(
+        paper_id="paper-one",
+        entities=[
+            ExtractedEntity(name="Chain of Thought", type=NodeType.CONCEPT, description="")
+        ],
+        relations=[],
+    )
+    gm.apply_extraction_result(first, session_id="session-a")
+
+    second = ExtractionResult(
+        paper_id="paper-two",
+        entities=[
+            ExtractedEntity(name="chain of thought", type=NodeType.CONCEPT, description="")
+        ],  # casing differs - exact-match auto_merge into the session-a node
+        relations=[],
+    )
+    report = gm.apply_extraction_result(second, session_id="session-b")
+
+    reused_node_id = report.node_writes[0].node_id
+    assert report.node_writes[0].reused_existing_node is True
+    assert gm.graph.nodes[reused_node_id]["session_ids"] == ["session-a", "session-b"]
+
+
+def test_apply_extraction_result_paper_node_reingest_adds_the_new_session(fake_db):
+    """A paper's node id is deterministic from paper_id alone - re-ingesting
+    the same paper_id under a different session (e.g. the same arXiv id
+    added twice) must make it visible from BOTH sessions, not steal it
+    from the first or leave it invisible to the second - confirmed live
+    as a real bug where the second session got nothing."""
+    gm = _make_manager(fake_db)
+    extraction = ExtractionResult(paper_id="paper-reingest", entities=[], relations=[])
+
+    first = gm.apply_extraction_result(
+        extraction, paper_name="Paper Title", session_id="session-a"
+    )
+    gm.apply_extraction_result(extraction, paper_name="Paper Title", session_id="session-b")
+
+    assert gm.graph.nodes[first.paper_node_id]["session_ids"] == ["session-a", "session-b"]
 
 
 def test_relation_endpoint_uses_declared_entity_type(fake_db):
@@ -654,3 +1009,113 @@ def test_concurrent_search_and_mutation_does_not_crash(fake_db):
         t.join()
 
     assert not errors, f"concurrent access raised: {errors}"
+
+
+def test_remove_by_session_deletes_owned_nodes_and_edges_live_and_in_firestore(
+    fake_db,
+):
+    gm = _make_manager(fake_db)
+    owned = _node("Session Node")
+    owned.session_id = "session-a"
+    other = _node("Other Session Node")
+    gm.add_node(owned)
+    gm.add_node(other)
+    edge = Edge(
+        id=str(uuid.uuid4()),
+        source_id=owned.id,
+        target_id=other.id,
+        type=EdgeType.USES,
+        provenance=ProvenanceTag.EXTRACTED,
+        session_id="session-a",
+    )
+    gm.add_edge(edge)
+
+    removed = gm.remove_by_session("session-a")
+
+    assert removed == {owned.id}
+    assert owned.id not in gm.graph
+    assert other.id in gm.graph
+    assert gm.graph.number_of_edges() == 0
+    # A fresh manager rehydrating from the same fake_db must not resurrect
+    # the removed node/edge - proves the Firestore docs were deleted too,
+    # not just the in-memory graph.
+    rehydrated = _make_manager(fake_db)
+    assert owned.id not in rehydrated.graph
+    assert other.id in rehydrated.graph
+    assert rehydrated.graph.number_of_edges() == 0
+
+
+def test_remove_by_session_removes_a_different_sessions_edge_to_a_dying_node(
+    fake_db,
+):
+    """An edge that belongs to a *different* session but touches a node
+    being removed must also go - otherwise it dangles, and worse,
+    resurrects the deleted node as a bare stub on the next rehydrate
+    (add_edge auto-creates missing endpoint nodes)."""
+    gm = _make_manager(fake_db)
+    dying = _node("Dying Node")
+    dying.session_id = "session-a"
+    survivor = _node("Survivor Node")
+    survivor.session_id = "session-b"
+    gm.add_node(dying)
+    gm.add_node(survivor)
+    edge = Edge(
+        id=str(uuid.uuid4()),
+        source_id=survivor.id,
+        target_id=dying.id,
+        type=EdgeType.USES,
+        provenance=ProvenanceTag.EXTRACTED,
+        session_id="session-b",
+    )
+    gm.add_edge(edge)
+
+    gm.remove_by_session("session-a")
+
+    assert survivor.id in gm.graph
+    assert dying.id not in gm.graph
+    assert gm.graph.number_of_edges() == 0
+    rehydrated = _make_manager(fake_db)
+    assert survivor.id in rehydrated.graph
+    assert dying.id not in rehydrated.graph
+
+
+def test_remove_by_session_strips_membership_but_keeps_a_node_shared_with_another_session(
+    fake_db,
+):
+    """A node genuinely shared across two sessions (e.g. an entity reused
+    via canonicalization from an earlier ingest) must survive one of
+    those sessions being deleted - only removed once its last owning
+    session goes away. Same for an edge shared the same way."""
+    gm = _make_manager(fake_db)
+    shared = _node("Shared Node")
+    gm.add_node(shared)
+    gm.add_node(Node(**{**shared.model_dump(), "session_id": "session-a"}))
+    gm.add_node(Node(**{**shared.model_dump(), "session_id": "session-b"}))
+    other = _node("Other Node")
+    other.session_id = "session-a"
+    gm.add_node(other)
+    edge = Edge(
+        id=str(uuid.uuid4()),
+        source_id=shared.id,
+        target_id=other.id,
+        type=EdgeType.USES,
+        provenance=ProvenanceTag.EXTRACTED,
+    )
+    gm.add_edge(edge)
+    gm.add_edge(Edge(**{**edge.model_dump(), "session_id": "session-a"}))
+    gm.add_edge(Edge(**{**edge.model_dump(), "session_id": "session-b"}))
+
+    removed_first = gm.remove_by_session("session-a")
+
+    # "other" was only ever session-a's, so it (and the now-endpoint-less
+    # edge) are gone - but the shared node survives, just with session-a
+    # stripped from its membership.
+    assert removed_first == {other.id}
+    assert shared.id in gm.graph
+    assert gm.graph.nodes[shared.id]["session_ids"] == ["session-b"]
+    assert other.id not in gm.graph
+
+    removed_second = gm.remove_by_session("session-b")
+
+    assert removed_second == {shared.id}
+    assert shared.id not in gm.graph
