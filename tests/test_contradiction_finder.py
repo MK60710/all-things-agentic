@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+import time
 import uuid
 
 import pytest
@@ -175,3 +177,47 @@ def test_max_llm_calls_caps_how_many_pairs_get_judged(fake_db):
     finder.check_session("session-a", max_llm_calls=2)
 
     assert len(judge.calls) == 2
+
+
+def test_concurrent_check_session_calls_never_double_judge_the_same_pair(fake_db):
+    """Two real threads both calling check_session on the same session at
+    once (a double-click, or two tabs) must not both judge - and both
+    write a duplicate CONTRADICTS edge for - the same pair. The judge
+    sleeps briefly to make the race window realistic instead of relying
+    on GIL-timing luck."""
+    gm = _make_manager(fake_db)
+    a, b = _claim("Claim A", [1.0, 0.0]), _claim("Claim B", [1.0, 0.0])
+    gm.add_node(a)
+    gm.add_node(b)
+
+    class _SlowJudge:
+        def __init__(self):
+            self.calls: list[tuple[str, str]] = []
+            self._lock = threading.Lock()
+
+        def __call__(self, claim_a: str, claim_b: str):
+            with self._lock:
+                self.calls.append((claim_a, claim_b))
+            time.sleep(0.05)
+            return _VerdictPayload(verdict="contradicts", explanation="They disagree.")
+
+    judge = _SlowJudge()
+    finder = ContradictionFinder(gm, judge=judge)
+
+    results: list[list] = [None, None]
+
+    def run(index: int):
+        results[index] = finder.check_session("session-a")
+
+    t1 = threading.Thread(target=run, args=(0,))
+    t2 = threading.Thread(target=run, args=(1,))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    assert len(judge.calls) == 1  # not judged twice
+    total_results = len(results[0]) + len(results[1])
+    assert total_results == 1  # only one of the two calls got the result
+    edges = gm.get_incident_edges(a.id)
+    assert len(edges) == 1  # only one CONTRADICTS edge was ever written

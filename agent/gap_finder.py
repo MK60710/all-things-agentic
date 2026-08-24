@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import threading
 import time
 import uuid
@@ -23,9 +22,9 @@ from typing import Literal
 
 import networkx as nx
 from google import genai
-from google.genai import types as genai_types
 from pydantic import BaseModel, Field
 
+from agent.gemini_judge import LazyVertexClient, call_structured_judge
 from agent.graph_manager import GraphManager, IncidentEdge
 from agent.schema import NodeType
 from agent.text_utils import escape_tag_delimiters, search_tokens
@@ -117,7 +116,7 @@ class _ExplanationPayload(BaseModel):
     verdict: Literal["gap", "coincidence"]
 
 
-class GeminiExplainer:
+class GeminiExplainer(LazyVertexClient):
     """Calls Gemini via Vertex AI to explain a candidate research gap.
 
     Authenticates via Application Default Credentials (project IAM), not an
@@ -125,16 +124,23 @@ class GeminiExplainer:
     back to the deterministic template on any failure - a Gemini outage,
     quota limit, or auth issue must never break gap-finding itself, since
     the candidates themselves already come from graph topology, not the
-    model.
+    model. The actual Gemini call/response-parsing mechanics live in
+    agent.gemini_judge, shared with every other judge in this codebase.
     """
 
     def __init__(
         self,
         client: genai.Client | None = None,
-        model: str = "gemini-2.5-flash",
+        model: str = "gemini-3.5-flash",
         project: str | None = None,
         location: str | None = None,
-        timeout_ms: int = 15_000,
+        # gemini-3.5-flash's cold-start latency runs higher than
+        # gemini-2.5-flash's did - live-confirmed two real GeminiExplainer
+        # calls 504 on cold first invocation during a single test session,
+        # both caught cleanly by the existing fail-safe (no crash, just a
+        # missing candidate) but tight enough to bite during a live demo.
+        # 25s gives real headroom without masking a genuine outage.
+        timeout_ms: int = 25_000,
         max_output_tokens: int = 150,
         # 0 (default) preserves the original always-retry-next-call
         # behavior. A deployment that calls this repeatedly during a
@@ -143,38 +149,20 @@ class GeminiExplainer:
         # timeout_ms until the outage clears.
         backoff_seconds: float = 0.0,
     ):
+        super().__init__(client=client, project=project, location=location)
         self._model = model
         self._timeout_ms = timeout_ms
         self._max_output_tokens = max_output_tokens
-        self._project = project
-        self._location = location
         self._backoff_seconds = backoff_seconds
         self._retry_after: float = 0.0
         # GapFinder.find_candidates dispatches explain_fn calls through a
         # ThreadPoolExecutor, so the same GeminiExplainer instance is the
         # documented intended wiring for concurrent __call__s - this lock
-        # protects lazy client construction and backoff-state mutation, the
-        # two bits of mutable instance state __call__ touches. It is never
-        # held across the actual network call, so concurrent requests still
-        # run in parallel.
+        # protects backoff-state mutation (LazyVertexClient's own
+        # _client_lock separately protects lazy client construction). It
+        # is never held across the actual network call, so concurrent
+        # requests still run in parallel.
         self._lock = threading.Lock()
-        # Constructed lazily on first call, inside the same try/except that
-        # covers generate_content - a bad ADC/project config previously
-        # raised here in __init__, outside any fallback path, contradicting
-        # this class's own promise that auth/config issues never break
-        # gap-finding.
-        self._client = client
-
-    def _get_client(self) -> genai.Client:
-        with self._lock:
-            if self._client is None:
-                self._client = genai.Client(
-                    vertexai=True,
-                    project=self._project or os.environ.get("GOOGLE_CLOUD_PROJECT"),
-                    location=self._location
-                    or os.environ.get("GOOGLE_CLOUD_LOCATION", "global"),
-                )
-            return self._client
 
     def __call__(self, name_a: str, name_b: str, evidence: list[str]) -> str:
         with self._lock:
@@ -201,74 +189,25 @@ class GeminiExplainer:
             + json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
             + "</gap_candidate>"
         )
-        try:
-            response = self._get_client().models.generate_content(
-                model=self._model,
-                contents=contents,
-                config=genai_types.GenerateContentConfig(
-                    system_instruction=_GEMINI_SYSTEM_INSTRUCTION,
-                    # Every other Gemini call in this codebase already uses
-                    # temperature=0 - this was the one inconsistent spot,
-                    # meaning the same gap pair could get a different
-                    # explanation across requests with nothing else changed.
-                    temperature=0,
-                    max_output_tokens=self._max_output_tokens,
-                    http_options=genai_types.HttpOptions(timeout=self._timeout_ms),
-                    # gemini-2.5-flash's "thinking" tokens count against
-                    # max_output_tokens, and can silently consume nearly all
-                    # of it (verified live: 140/150 tokens went to internal
-                    # thinking, truncating the actual answer to a few
-                    # words). Disabled - this is a short explanation task,
-                    # not one that benefits from extended reasoning.
-                    thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
-                    # Structured output so the model's existing "or say if
-                    # it looks more like a coincidence" judgment (already
-                    # showing up in free text before this) becomes data
-                    # find_candidates can actually filter on, instead of a
-                    # sentence buried in the explanation.
-                    response_mime_type="application/json",
-                    response_schema=_ExplanationPayload,
-                ),
-            )
-            raw = (response.text or "").strip()
-            candidates = getattr(response, "candidates", None) or []
-            finish_reason = candidates[0].finish_reason if candidates else None
-            truncated = finish_reason == genai_types.FinishReason.MAX_TOKENS
-            payload: _ExplanationPayload | None = None
-            if raw and not truncated:
-                try:
-                    payload = _ExplanationPayload.model_validate_json(raw)
-                except ValueError:
-                    logger.warning(
-                        "GeminiExplainer response failed schema "
-                        "validation, falling back to template",
-                        exc_info=True,
-                    )
-            if payload is not None:
-                with self._lock:
-                    self._retry_after = 0.0
-                return Explanation(
-                    payload.explanation, cacheable=True, verdict=payload.verdict
-                )
-            if truncated:
-                logger.warning(
-                    "GeminiExplainer response was truncated by "
-                    "max_output_tokens, falling back to template instead "
-                    "of caching a cut-off fragment"
-                )
-            elif not raw:
-                logger.warning(
-                    "GeminiExplainer got an empty response, falling back "
-                    "to template"
-                )
-        except Exception:
-            # Never let a Gemini outage/quota/config issue break gap-finding
-            # itself (candidates already come from graph topology), but log
-            # it - a silently-swallowed wrong model name is exactly what
-            # slipped through here during development.
-            logger.warning(
-                "GeminiExplainer call failed, falling back to template",
-                exc_info=True,
+        # Structured output so the model's existing "or say if it looks
+        # more like a coincidence" judgment (already showing up in free
+        # text before this) becomes data find_candidates can actually
+        # filter on, instead of a sentence buried in the explanation.
+        result = call_structured_judge(
+            self._get_client,
+            model=self._model,
+            contents=contents,
+            system_instruction=_GEMINI_SYSTEM_INSTRUCTION,
+            response_schema=_ExplanationPayload,
+            max_output_tokens=self._max_output_tokens,
+            timeout_ms=self._timeout_ms,
+            caller_name="GeminiExplainer",
+        )
+        if result is not None:
+            with self._lock:
+                self._retry_after = 0.0
+            return Explanation(
+                result.explanation, cacheable=True, verdict=result.verdict
             )
         if self._backoff_seconds:
             with self._lock:
@@ -604,7 +543,23 @@ class GapFinder:
         self, node_a_id: str, node_b_id: str, interesting: bool
     ) -> None:
         """Applied immediately to future rankings — the concrete mechanism
-        behind "adapts to the user's thinking", not just a log entry."""
+        behind "adapts to the user's thinking", not just a log entry.
+
+        GapFinder's ranking is deliberately global/cross-session (unlike
+        the strictly per-session Feynman check or Contradiction Finder),
+        so there's no session-ownership boundary to check here the way
+        there is for those - but a node_a_id/node_b_id that doesn't
+        correspond to any real node at all is never anything but noise:
+        silently accepting it would let a stale or malformed client-side
+        id pollute _node_boost/_dismissed_pairs forever (no expiry, no
+        size cap, and find_candidates only ever looks up real candidate
+        pairs against it anyway, so a bogus entry is pure dead weight).
+        A real caller (the UI's thumbs up/down on an actually-displayed
+        gap) always passes ids it just received from a real
+        GapCandidate, so this never rejects legitimate feedback.
+        """
+        if node_a_id not in self._gm.graph or node_b_id not in self._gm.graph:
+            return
         delta = 1.0 if interesting else -1.0
         with self._boost_lock:
             self._node_boost[node_a_id] = (

@@ -116,7 +116,7 @@ extractor = ExtractionAgent(
 outcome = extractor.extract_one("paper-1", "paper.pdf")
 ```
 
-The default model is `gemini-2.5-flash-lite` with thinking disabled and a
+The default model is `gemini-3.5-flash-lite` with thinking disabled and a
 2,048-token output cap. Calls are bounded by source-window and per-paper limits.
 Only relations with source quotes found in the supplied source window and valid
 ontology endpoint signatures are retained.

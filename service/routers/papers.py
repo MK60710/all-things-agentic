@@ -270,7 +270,7 @@ def list_papers(
     return [PaperMetadata.model_validate(item) for item in papers]
 
 
-@router.get("/{paper_id}/status")
+@router.get("/{paper_id}/status", dependencies=[Depends(require_api_key)])
 def get_paper_status(paper_id: str, state: AppState = Depends(get_state)) -> dict[str, str]:
     """Lightweight poll target for ingest progress - deliberately just the
     status string, not the full PaperMetadata list_papers already returns,

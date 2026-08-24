@@ -749,7 +749,7 @@ export default function Home() {
     setQuery("");
     setLoading(true);
     try {
-      const response = await askAssistant(question, history, effectivePapers, currentSession?.goal, nodeId);
+      const response = await askAssistant(question, history, effectivePapers, currentSession?.goal, nodeId, currentSession?.id);
       setMessages((current) => [...current, {
         id: crypto.randomUUID(),
         role: "assistant",
@@ -1080,7 +1080,7 @@ export default function Home() {
                   </div>
                 </article>;
               })}
-              {loading && <article className="message assistant"><span className="assistant-avatar"><Icon name="atlas" size={16}/></span><div className="message-body"><small>Gemini</small><div className="typing"><i/><i/><i/></div></div></article>}
+              {loading && <article className="message assistant"><span className="assistant-avatar"><Icon name="atlas" size={16}/></span><div className="message-body"><small>Atlas</small><div className="typing"><i/><i/><i/></div></div></article>}
             </div>
           )}
           <div ref={chatEnd}/>

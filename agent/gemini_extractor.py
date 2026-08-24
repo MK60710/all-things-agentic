@@ -104,7 +104,7 @@ class GeminiStructuredExtractor:
         *,
         project: str,
         location: str = "global",
-        model: str = "gemini-2.5-flash-lite",
+        model: str = "gemini-3.5-flash-lite",
         client: Any | None = None,
         max_characters_per_call: int = 12000,
         max_calls_per_paper: int = 8,
