@@ -108,10 +108,13 @@ class GeminiFeynmanJudge(LazyVertexClient):
     def __init__(
         self,
         client: genai.Client | None = None,
-        model: str = "gemini-2.5-flash",
+        model: str = "gemini-3.5-flash",
         project: str | None = None,
         location: str | None = None,
-        timeout_ms: int = 15_000,
+        # Same cold-start latency headroom as GeminiContradictionJudge and
+        # GeminiExplainer - see their constructors for the live-confirmed
+        # reasoning (gemini-3.5-flash's cold first call can exceed 15s).
+        timeout_ms: int = 25_000,
         max_output_tokens: int = 250,
     ):
         super().__init__(client=client, project=project, location=location)

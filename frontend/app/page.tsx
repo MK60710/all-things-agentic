@@ -1080,7 +1080,7 @@ export default function Home() {
                   </div>
                 </article>;
               })}
-              {loading && <article className="message assistant"><span className="assistant-avatar"><Icon name="atlas" size={16}/></span><div className="message-body"><small>Gemini</small><div className="typing"><i/><i/><i/></div></div></article>}
+              {loading && <article className="message assistant"><span className="assistant-avatar"><Icon name="atlas" size={16}/></span><div className="message-body"><small>Atlas</small><div className="typing"><i/><i/><i/></div></div></article>}
             </div>
           )}
           <div ref={chatEnd}/>

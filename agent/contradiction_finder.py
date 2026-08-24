@@ -90,10 +90,16 @@ class GeminiContradictionJudge(LazyVertexClient):
     def __init__(
         self,
         client: genai.Client | None = None,
-        model: str = "gemini-2.5-flash",
+        model: str = "gemini-3.5-flash",
         project: str | None = None,
         location: str | None = None,
-        timeout_ms: int = 15_000,
+        # gemini-3.5-flash's cold-start latency runs higher than
+        # gemini-2.5-flash's did - live-confirmed a real call take >15s
+        # and 504 on a cold first invocation, then succeed in ~6s on a
+        # warm retry. 25s gives real headroom without masking a genuine
+        # outage (call_structured_judge still fails closed to None on
+        # any timeout, this just avoids the false-negative on a cold start).
+        timeout_ms: int = 25_000,
         max_output_tokens: int = 200,
     ):
         super().__init__(client=client, project=project, location=location)

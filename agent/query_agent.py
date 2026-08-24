@@ -94,7 +94,7 @@ class QueryAgent:
         *,
         project: str | None = None,
         location: str = "global",
-        model: str = "gemini-2.5-flash-lite",
+        model: str = "gemini-3.5-flash-lite",
         client: Any | None = None,
         max_graph_nodes: int = 8,
         max_citations: int = 8,
