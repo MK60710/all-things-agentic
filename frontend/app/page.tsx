@@ -861,7 +861,7 @@ export default function Home() {
     const updated = papers.filter((existing) => existing.id !== paperId);
     setPapers(updated);
     setMessages((current) => [...current, { id: crypto.randomUUID(), role: "assistant", text: `Removed${removed ? `: "${removed.title}"` : ""} from this conversation.${updated.length === 0 ? " We're back to searching everything." : ""}`, notice: true }]);
-    void detachPaper(paperId).catch((error) => {
+    void detachPaper(paperId, sessionIdRef.current).catch((error) => {
       setMessages((current) => [...current, {
         id: crypto.randomUUID(),
         role: "assistant",

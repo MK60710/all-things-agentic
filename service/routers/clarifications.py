@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
+from agent.graph_manager import _session_ids
 from service.deps import get_state, require_api_key
 from service.schemas import AnswerClarificationRequest, PendingQuestionOut
 from service.state import AppState
@@ -26,8 +27,8 @@ def list_pending(
             q
             for q in questions
             if getattr(q, "provisional_node_id", None) is None
-            or state.graph.graph.nodes.get(q.provisional_node_id, {}).get("session_id")
-            == session_id
+            or session_id
+            in _session_ids(state.graph.graph.nodes.get(q.provisional_node_id, {}))
         ]
     return [PendingQuestionOut.from_domain(q) for q in questions]
 

@@ -400,6 +400,47 @@ def test_find_sparse_pairs_requires_common_neighbor(fake_db):
     assert (a.id, b.id) in pairs or (b.id, a.id) in pairs
 
 
+def test_find_sparse_pairs_sees_a_node_shared_across_sessions_from_either_one(fake_db):
+    """Regression test for the live-confirmed bug: a node created by one
+    session and later reused by a second session's ingest (via
+    canonicalization) must be visible to session-scoped candidate
+    generation from BOTH sessions, not just the first."""
+    gm = _make_manager(fake_db)
+    a, b, shared = _node("A"), _node("B"), _node("Shared Neighbor")
+    a.session_id = "session-a"
+    b.session_id = "session-a"
+    gm.add_node(a)
+    gm.add_node(b)
+    gm.add_node(shared)
+    gm.add_node(Node(**{**shared.model_dump(), "session_id": "session-a"}))
+    gm.add_node(Node(**{**shared.model_dump(), "session_id": "session-b"}))
+    for target in (a, b):
+        gm.add_edge(
+            Edge(
+                id=str(uuid.uuid4()),
+                source_id=shared.id,
+                target_id=target.id,
+                type=EdgeType.SUPPORTS,
+                provenance=ProvenanceTag.EXTRACTED,
+                source_quote="quote",
+                session_id="session-a",
+            )
+        )
+
+    pairs_a = gm.find_sparse_pairs(session_id="session-a")
+    assert (a.id, b.id) in pairs_a or (b.id, a.id) in pairs_a
+
+    # session-b only owns the shared node itself (not a/b), so it has no
+    # sparse pairs of its own here - the real assertion is that the
+    # shared node's session filter doesn't silently exclude it either.
+    candidates_b = [
+        n
+        for n, data in gm.graph.nodes(data=True)
+        if "session-b" in data.get("session_ids", [])
+    ]
+    assert shared.id in candidates_b
+
+
 def test_rehydrate_loads_existing_data(fake_db):
     gm = _make_manager(fake_db)
     node = _node("Persisted Concept")
@@ -471,18 +512,22 @@ def test_apply_extraction_result_tags_new_nodes_and_edges_with_session_id(fake_d
         extraction, paper_name="Paper Title", session_id="session-a"
     )
 
-    assert gm.graph.nodes[report.paper_node_id]["session_id"] == "session-a"
+    assert gm.graph.nodes[report.paper_node_id]["session_ids"] == ["session-a"]
     for write in report.node_writes:
-        assert gm.graph.nodes[write.node_id]["session_id"] == "session-a"
+        assert gm.graph.nodes[write.node_id]["session_ids"] == ["session-a"]
     edge_write = report.edge_writes[0]
     edge_data = gm.graph.edges[edge_write.source_id, edge_write.target_id, edge_write.edge_id]
-    assert edge_data["session_id"] == "session-a"
+    assert edge_data["session_ids"] == ["session-a"]
 
 
-def test_apply_extraction_result_reused_node_keeps_its_original_session_id(fake_db):
+def test_apply_extraction_result_reused_node_adds_the_new_session_alongside_the_original(fake_db):
     """A node created by one session and later merged into by a different
-    session's ingest must not be reassigned to the later session - that's
-    what makes per-session cleanup (scripts/clear_session.py) safe."""
+    session's ingest must become visible to BOTH sessions, not just the
+    first - confirmed live as a real bug where a well-known entity reused
+    from an earlier session stayed invisible to whichever session reused
+    it, silently starving Gap Finder/Contradiction Finder/Feynman Check
+    of real data. scripts/clear_session.py's own cleanup now strips just
+    one session's membership rather than deleting a still-shared node."""
     gm = _make_manager(fake_db)
     first = ExtractionResult(
         paper_id="paper-one",
@@ -504,13 +549,15 @@ def test_apply_extraction_result_reused_node_keeps_its_original_session_id(fake_
 
     reused_node_id = report.node_writes[0].node_id
     assert report.node_writes[0].reused_existing_node is True
-    assert gm.graph.nodes[reused_node_id]["session_id"] == "session-a"
+    assert gm.graph.nodes[reused_node_id]["session_ids"] == ["session-a", "session-b"]
 
 
-def test_apply_extraction_result_paper_node_reingest_keeps_original_session_id(fake_db):
+def test_apply_extraction_result_paper_node_reingest_adds_the_new_session(fake_db):
     """A paper's node id is deterministic from paper_id alone - re-ingesting
     the same paper_id under a different session (e.g. the same arXiv id
-    added twice) must not reassign the paper node."""
+    added twice) must make it visible from BOTH sessions, not steal it
+    from the first or leave it invisible to the second - confirmed live
+    as a real bug where the second session got nothing."""
     gm = _make_manager(fake_db)
     extraction = ExtractionResult(paper_id="paper-reingest", entities=[], relations=[])
 
@@ -519,7 +566,7 @@ def test_apply_extraction_result_paper_node_reingest_keeps_original_session_id(f
     )
     gm.apply_extraction_result(extraction, paper_name="Paper Title", session_id="session-b")
 
-    assert gm.graph.nodes[first.paper_node_id]["session_id"] == "session-a"
+    assert gm.graph.nodes[first.paper_node_id]["session_ids"] == ["session-a", "session-b"]
 
 
 def test_relation_endpoint_uses_declared_entity_type(fake_db):
@@ -958,3 +1005,45 @@ def test_remove_by_session_removes_a_different_sessions_edge_to_a_dying_node(
     rehydrated = _make_manager(fake_db)
     assert survivor.id in rehydrated.graph
     assert dying.id not in rehydrated.graph
+
+
+def test_remove_by_session_strips_membership_but_keeps_a_node_shared_with_another_session(
+    fake_db,
+):
+    """A node genuinely shared across two sessions (e.g. an entity reused
+    via canonicalization from an earlier ingest) must survive one of
+    those sessions being deleted - only removed once its last owning
+    session goes away. Same for an edge shared the same way."""
+    gm = _make_manager(fake_db)
+    shared = _node("Shared Node")
+    gm.add_node(shared)
+    gm.add_node(Node(**{**shared.model_dump(), "session_id": "session-a"}))
+    gm.add_node(Node(**{**shared.model_dump(), "session_id": "session-b"}))
+    other = _node("Other Node")
+    other.session_id = "session-a"
+    gm.add_node(other)
+    edge = Edge(
+        id=str(uuid.uuid4()),
+        source_id=shared.id,
+        target_id=other.id,
+        type=EdgeType.USES,
+        provenance=ProvenanceTag.EXTRACTED,
+    )
+    gm.add_edge(edge)
+    gm.add_edge(Edge(**{**edge.model_dump(), "session_id": "session-a"}))
+    gm.add_edge(Edge(**{**edge.model_dump(), "session_id": "session-b"}))
+
+    removed_first = gm.remove_by_session("session-a")
+
+    # "other" was only ever session-a's, so it (and the now-endpoint-less
+    # edge) are gone - but the shared node survives, just with session-a
+    # stripped from its membership.
+    assert removed_first == {other.id}
+    assert shared.id in gm.graph
+    assert gm.graph.nodes[shared.id]["session_ids"] == ["session-b"]
+    assert other.id not in gm.graph
+
+    removed_second = gm.remove_by_session("session-b")
+
+    assert removed_second == {shared.id}
+    assert shared.id not in gm.graph

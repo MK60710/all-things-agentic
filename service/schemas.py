@@ -75,7 +75,7 @@ class PaperMetadata(BaseModel):
     abstract: str | None = None
     pdf_url: str | None = Field(default=None, alias="pdfUrl")
     status: str
-    session_id: str | None = None
+    session_ids: list[str] = Field(default_factory=list)
 
 
 class SessionCreateRequest(BaseModel):

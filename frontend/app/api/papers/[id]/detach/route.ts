@@ -1,13 +1,15 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 
 export const runtime = "nodejs";
 
-export async function POST(_request: Request, { params }: { params: Promise<{ id: string }> }) {
+export async function POST(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const apiUrl = process.env.BACKEND_API_URL ?? process.env.NEXT_PUBLIC_API_URL;
   if (!apiUrl) return NextResponse.json({ error: "Backend is not configured" }, { status: 503 });
   const { id } = await params;
+  const sessionId = request.nextUrl.searchParams.get("session_id");
+  if (!sessionId) return NextResponse.json({ error: "session_id is required" }, { status: 400 });
   try {
-    const response = await fetch(`${apiUrl.replace(/\/$/, "")}/papers/${encodeURIComponent(id)}/detach`, {
+    const response = await fetch(`${apiUrl.replace(/\/$/, "")}/papers/${encodeURIComponent(id)}/detach?session_id=${encodeURIComponent(sessionId)}`, {
       method: "POST",
       headers: process.env.API_SHARED_SECRET ? { "X-API-Key": process.env.API_SHARED_SECRET } : {},
       cache: "no-store",

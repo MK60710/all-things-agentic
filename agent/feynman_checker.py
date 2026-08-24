@@ -23,7 +23,7 @@ from google import genai
 from google.genai import types as genai_types
 from pydantic import BaseModel
 
-from agent.graph_manager import GraphManager
+from agent.graph_manager import GraphManager, _session_ids
 from agent.query_agent import QueryCitation
 from agent.schema import NodeType
 from agent.text_utils import escape_tag_delimiters
@@ -225,7 +225,7 @@ def pick_check_nodes(
     testable = []
     for node_id in degree:
         data = graph_manager.graph.nodes.get(node_id, {})
-        if data.get("session_id") != session_id:
+        if session_id not in _session_ids(data):
             continue
         if data.get("type") not in _TESTABLE_TYPES:
             continue
@@ -274,7 +274,7 @@ class FeynmanChecker:
         data = self._gm.graph.nodes.get(node_id)
         if data is None:
             return None
-        if data.get("session_id") != session_id:
+        if session_id not in _session_ids(data):
             return None
         if data.get("type") not in _TESTABLE_TYPES:
             # Same rule pick_check_nodes already applies when choosing what

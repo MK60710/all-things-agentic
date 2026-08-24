@@ -1,5 +1,5 @@
-"""Delete every paper/node/edge/chunk (and any now-dangling clarification
-question) tagged with a given session id.
+"""Delete a session's papers/nodes/edges/chunks (and any now-dangling
+clarification question) - but only what actually becomes ownerless.
 
 Usage:
     GOOGLE_CLOUD_PROJECT=my-project python scripts/clear_session.py <session_id>
@@ -11,14 +11,15 @@ testing this project has gone through so far - now parameterized by
 session_id instead of manually figuring out which nodes/papers a given
 round of testing touched.
 
-Known, accepted limitation: a node this session created can be reused by a
-*different* session's edge via canonicalization (see
-GraphManager.apply_extraction_result - a reused node is never re-tagged
-with the reusing session's id, so it stays owned by whoever created it).
-If that node gets deleted here, the other session's edge is left pointing
-at a node that no longer exists. This is a dev/test cleanup tool, not a
-referential-integrity system - acceptable until multiple people are
-concurrently using the same shared graph for real, which isn't true yet.
+Papers/nodes/edges are session-accumulating (see GraphManager.add_node/
+PaperStore.save): the same paper re-ingested into a second session
+belongs to both, not just whichever session touched it first or last.
+This script mirrors that - a doc still genuinely shared with another
+session survives, with just this session's membership stripped from it;
+only a doc that becomes ownerless is actually deleted. Older docs written
+before multi-session membership existed only ever had a single
+"session_id" field - _member_of below falls back to that, so this script
+still finds and correctly cleans up that legacy data too.
 """
 
 from __future__ import annotations
@@ -28,8 +29,38 @@ import os
 from typing import Any
 
 
-def _ids_with_session(collection: Any, session_id: str) -> list[str]:
-    return [doc.id for doc in collection.where("session_id", "==", session_id).stream()]
+def _member_of(data: dict, session_id: str) -> bool:
+    session_ids = data.get("session_ids")
+    if session_ids:
+        return session_id in session_ids
+    return data.get("session_id") == session_id
+
+
+def _remaining_sessions(data: dict, session_id: str) -> list[str]:
+    session_ids = data.get("session_ids")
+    if not session_ids:
+        session_ids = [data["session_id"]] if data.get("session_id") else []
+    return [s for s in session_ids if s != session_id]
+
+
+def _strip_or_delete(collection: Any, session_id: str) -> tuple[list[str], list[str]]:
+    """Returns (deleted_ids, survived_ids) for every doc in this
+    collection tagged with session_id - deleted if this was its only
+    session, updated in place (membership stripped) if another session
+    still legitimately has it."""
+    deleted: list[str] = []
+    survived: list[str] = []
+    for doc in collection.stream():
+        data = doc.to_dict()
+        if not _member_of(data, session_id):
+            continue
+        remaining = _remaining_sessions(data, session_id)
+        if remaining:
+            survived.append(doc.id)
+            collection.document(doc.id).set({**data, "session_ids": remaining}, merge=True)
+        else:
+            deleted.append(doc.id)
+    return deleted, survived
 
 
 def clear_session(db: Any, session_id: str, *, dry_run: bool = False) -> dict[str, int]:
@@ -39,20 +70,26 @@ def clear_session(db: Any, session_id: str, *, dry_run: bool = False) -> dict[st
     chunks = db.collection("chunks")
     clarifications = db.collection("clarifications")
 
-    paper_ids = _ids_with_session(papers, session_id)
-    node_ids = _ids_with_session(nodes, session_id)
-    edge_ids = _ids_with_session(edges, session_id)
+    if dry_run:
+        deleted_paper_ids, _ = _strip_or_delete_dry_run(papers, session_id)
+        deleted_node_ids, _ = _strip_or_delete_dry_run(nodes, session_id)
+        deleted_edge_ids, _ = _strip_or_delete_dry_run(edges, session_id)
+    else:
+        deleted_paper_ids, _ = _strip_or_delete(papers, session_id)
+        deleted_node_ids, _ = _strip_or_delete(nodes, session_id)
+        deleted_edge_ids, _ = _strip_or_delete(edges, session_id)
 
-    # Chunks carry no session_id of their own (they're already keyed by
-    # paper_id, and paper_id -> session_id is 1:1 via the papers
-    # collection) - derive membership transitively instead.
+    # Chunks carry no session tag of their own (they're keyed by
+    # paper_id) - only follow chunks for papers that were actually fully
+    # deleted, not ones that merely had this session's membership
+    # stripped and survive with another session still owning them.
     chunk_ids: list[str] = []
-    for paper_id in paper_ids:
+    for paper_id in deleted_paper_ids:
         chunk_ids.extend(
             doc.id for doc in chunks.where("paper_id", "==", paper_id).stream()
         )
 
-    node_id_set = set(node_ids)
+    node_id_set = set(deleted_node_ids)
     clarification_ids = [
         doc.id
         for doc in clarifications.stream()
@@ -61,26 +98,41 @@ def clear_session(db: Any, session_id: str, *, dry_run: bool = False) -> dict[st
     ]
 
     counts = {
-        "papers": len(paper_ids),
-        "nodes": len(node_ids),
-        "edges": len(edge_ids),
+        "papers": len(deleted_paper_ids),
+        "nodes": len(deleted_node_ids),
+        "edges": len(deleted_edge_ids),
         "chunks": len(chunk_ids),
         "clarifications": len(clarification_ids),
     }
     if dry_run:
         return counts
 
-    for collection, ids in (
-        (papers, paper_ids),
-        (nodes, node_ids),
-        (edges, edge_ids),
-        (chunks, chunk_ids),
-        (clarifications, clarification_ids),
-    ):
+    for doc_id in chunk_ids:
+        chunks.document(doc_id).delete()
+    for doc_id in clarification_ids:
+        clarifications.document(doc_id).delete()
+    for collection, ids in ((papers, deleted_paper_ids), (nodes, deleted_node_ids), (edges, deleted_edge_ids)):
         for doc_id in ids:
             collection.document(doc_id).delete()
 
     return counts
+
+
+def _strip_or_delete_dry_run(collection: Any, session_id: str) -> tuple[list[str], list[str]]:
+    """Same membership classification as _strip_or_delete, without
+    writing anything - dry-run must report accurate counts without
+    mutating a single doc."""
+    deleted: list[str] = []
+    survived: list[str] = []
+    for doc in collection.stream():
+        data = doc.to_dict()
+        if not _member_of(data, session_id):
+            continue
+        if _remaining_sessions(data, session_id):
+            survived.append(doc.id)
+        else:
+            deleted.append(doc.id)
+    return deleted, survived
 
 
 def _parse_args() -> argparse.Namespace:

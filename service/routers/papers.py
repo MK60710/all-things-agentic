@@ -22,6 +22,7 @@ from service.schemas import (
     UploadTokenResponse,
 )
 from service.state import AppState
+from service.storage import _paper_session_ids
 from agent.paper_guide import PaperGuide
 from agent.retrieval import ChunkRecord
 from agent.schema import ExtractionChunk
@@ -265,7 +266,7 @@ def list_papers(
 ) -> list[PaperMetadata]:
     papers = state.paper_store.list()
     if session_id is not None:
-        papers = [p for p in papers if p.get("session_id") == session_id]
+        papers = [p for p in papers if session_id in _paper_session_ids(p)]
     return [PaperMetadata.model_validate(item) for item in papers]
 
 
@@ -284,19 +285,19 @@ def get_paper_status(paper_id: str, state: AppState = Depends(get_state)) -> dic
     response_model=PaperMetadata,
     dependencies=[Depends(require_api_key)],
 )
-def detach_paper(paper_id: str, state: AppState = Depends(get_state)) -> PaperMetadata:
-    """Clears session_id on a paper record - the real, server-side version
-    of "remove this from my session," so it stays gone on the next
-    listPapersForSession(session_id) fetch instead of reappearing on a
-    later switch. Other fields are re-saved as-is: PaperStore.save always
-    re-passes the full record rather than relying on partial-field
-    Firestore merge (see every other call site in this router)."""
+def detach_paper(
+    paper_id: str, session_id: str = Query(...), state: AppState = Depends(get_state)
+) -> PaperMetadata:
+    """Removes this one session's membership - the real, server-side
+    version of "remove this from my session," so it stays gone on the
+    next listPapersForSession(session_id) fetch instead of reappearing
+    on a later switch. A paper genuinely shared with another session
+    (added there separately) survives; only detaching from every session
+    that has it makes it disappear entirely - see PaperStore.detach_session."""
     existing = next((p for p in state.paper_store.list() if p.get("id") == paper_id), None)
     if existing is None:
         raise HTTPException(status_code=404, detail=f"no paper {paper_id!r}")
-    values = {k: v for k, v in existing.items() if k not in ("id", "updated_at")}
-    values["session_id"] = None
-    updated = state.paper_store.save(paper_id, **values)
+    updated = state.paper_store.detach_session(paper_id, session_id)
     return PaperMetadata.model_validate(updated)
 
 
