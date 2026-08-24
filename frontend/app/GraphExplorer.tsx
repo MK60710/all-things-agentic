@@ -2,7 +2,8 @@
 
 import dynamic from "next/dynamic";
 import { useEffect, useMemo, useState } from "react";
-import { checkForContradictions, getSessionGraph } from "@/lib/api";
+import { checkForContradictions, getSessionBibliography, getSessionGraph } from "@/lib/api";
+import type { PaperContext } from "@/lib/api";
 import { TYPE_COLORS, DEFAULT_NODE_COLOR, typeLabel, relationPhrase } from "@/lib/graphColors";
 import type { SessionGraphEdge, SessionGraphNode } from "@/lib/types";
 
@@ -28,6 +29,7 @@ export default function GraphExplorer({
   onClose,
   onAskInChat,
   focusNodeId,
+  papers,
 }: {
   sessionId: string | null;
   active: boolean;
@@ -38,6 +40,10 @@ export default function GraphExplorer({
   // is pre-selected so the panel opens straight to it instead of leaving
   // the user to find one dot among dozens themselves.
   focusNodeId?: string | null;
+  // Used only to resolve a node citation's bare paper_id into a real
+  // title for display - same paper list page.tsx already holds for the
+  // header's paper chips, not a separate fetch.
+  papers: PaperContext[];
 }) {
   const [nodes, setNodes] = useState<SessionGraphNode[]>([]);
   const [edges, setEdges] = useState<SessionGraphEdge[]>([]);
@@ -53,6 +59,8 @@ export default function GraphExplorer({
   const [focusNotFound, setFocusNotFound] = useState(false);
   const [checkingContradictions, setCheckingContradictions] = useState(false);
   const [contradictionMessage, setContradictionMessage] = useState<string | null>(null);
+  const [exportingCitations, setExportingCitations] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
 
   useEffect(() => {
     function measure() {
@@ -151,6 +159,26 @@ export default function GraphExplorer({
     }
   }
 
+  async function handleExportCitations() {
+    if (!sessionId || exportingCitations) return;
+    setExportingCitations(true);
+    setExportError(null);
+    try {
+      const bibtex = await getSessionBibliography(sessionId);
+      const blob = new Blob([bibtex], { type: "application/x-bibtex" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = "session.bib";
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setExportError(err instanceof Error ? err.message : "Could not export citations.");
+    } finally {
+      setExportingCitations(false);
+    }
+  }
+
   function toggleType(type: string) {
     setVisibleTypes((current) => {
       const next = new Set(current);
@@ -194,6 +222,14 @@ export default function GraphExplorer({
           {checkingContradictions ? "Checking…" : "Check for contradictions"}
         </button>
         {contradictionMessage && <small className="graph-explorer-contradictions-result">{contradictionMessage}</small>}
+        <button
+          className="graph-explorer-export-citations"
+          onClick={() => void handleExportCitations()}
+          disabled={exportingCitations || nodes.length === 0}
+        >
+          {exportingCitations ? "Exporting…" : "Export citations"}
+        </button>
+        {exportError && <small className="graph-explorer-contradictions-result">{exportError}</small>}
       </div>
       <div className="graph-explorer-canvas">
         {focusNotFound && (
@@ -261,6 +297,20 @@ export default function GraphExplorer({
             </span>
             <h3>{selectedNode.name}</h3>
             {selectedNode.description && <p>{selectedNode.description}</p>}
+            {selectedNode.citations.length > 0 && (
+              <div className="graph-explorer-citations">
+                <small className="graph-explorer-connections-label">Where this came from</small>
+                {selectedNode.citations.map((cit) => {
+                  const paper = papers.find((p) => p.id === cit.paper_id);
+                  return (
+                    <p key={`${cit.paper_id}-${cit.section ?? ""}`} className="graph-explorer-citation">
+                      {paper?.title ?? cit.paper_id}
+                      {cit.section && <span> · {cit.section}</span>}
+                    </p>
+                  );
+                })}
+              </div>
+            )}
             <button
               className="graph-explorer-ask"
               onClick={() => onAskInChat(`What do you know about "${selectedNode.name}"?`)}

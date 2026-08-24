@@ -119,6 +119,9 @@ input[type="checkbox"] { accent-color:var(--violet); }
 .graph-explorer-contradictions-check:hover:not(:disabled) { background:var(--violet-pale); }
 .graph-explorer-contradictions-check:disabled { color:var(--soft); border-color:var(--line); cursor:default; }
 .graph-explorer-contradictions-result { color:var(--muted); font-size:10.5px; font-weight:650; }
+.graph-explorer-export-citations { padding:7px 13px; border:1px solid #d5cdf2; border-radius:999px; background:#fff; color:var(--violet-dark); font-size:10.5px; font-weight:650; }
+.graph-explorer-export-citations:hover:not(:disabled) { background:var(--violet-pale); }
+.graph-explorer-export-citations:disabled { color:var(--soft); border-color:var(--line); cursor:default; }
 .graph-explorer-filter { display:flex; align-items:center; gap:6px; padding:6px 11px 6px 8px; border:1px solid var(--line); border-radius:999px; background:#fff; font-size:10.5px; font-weight:650; text-transform:capitalize; cursor:pointer; opacity:.5; transition:opacity .15s ease,border-color .15s ease,background .15s ease; }
 .graph-explorer-filter:hover { opacity:.85; }
 .graph-explorer-filter:has(input:checked) { opacity:1; }
@@ -141,6 +144,9 @@ input[type="checkbox"] { accent-color:var(--violet); }
 .graph-explorer-connection:hover { background:#e6e1f8; }
 .graph-explorer-connection strong { color:var(--violet-dark); font-weight:650; }
 .graph-explorer-no-connections { color:var(--soft); font-size:11px; }
+.graph-explorer-citations { display:flex; flex-direction:column; gap:4px; margin-top:14px; }
+.graph-explorer-citation { margin:0; padding:8px 10px; border-radius:8px; background:#faf9fb; color:var(--muted); font-size:11px; line-height:1.5; }
+.graph-explorer-citation span { color:var(--soft); }
 
 .tour-help-button { display:grid; place-items:center; width:39px; height:39px; color:var(--muted); border:1px solid var(--line); border-radius:10px; background:#fff; }.tour-help-button:hover { color:var(--violet-dark); border-color:#c8c2e9; background:var(--violet-pale); }
 .welcome-tour-button { color:var(--violet-dark)!important; border-color:#d5cdf2!important; background:var(--violet-pale)!important; }

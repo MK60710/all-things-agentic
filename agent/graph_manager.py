@@ -151,11 +151,19 @@ class IncidentEdge:
 
 
 @dataclass
+class NodeCitation:
+    paper_id: str
+    section: str | None
+    source_quote: str
+
+
+@dataclass
 class SessionGraphNode:
     node_id: str
     name: str
     type: str
     description: str
+    citations: list[NodeCitation]
 
 
 @dataclass
@@ -559,21 +567,32 @@ class GraphManager:
         never reaches into the shared graph, unlike get_incident_edges
         which follows a single node's real edges regardless of who added
         them. Same session_id in _session_ids(data) membership check as
-        remove_by_session/find_sparse_pairs."""
+        remove_by_session/find_sparse_pairs.
+
+        Each node also carries its own citations - which paper/section it
+        was actually extracted from, so the panel can say where an idea
+        came from instead of just its name/description. Derived from the
+        same in-session edge set below (not a separate graph traversal),
+        so a citation only ever points at something the edges list itself
+        also shows as real - deduped by (paper_id, section) so a node
+        touched by several edges into the same paper/section doesn't
+        produce repeat entries. An INFERRED edge (SAME_AS, a Contradiction
+        Finder edge) has no source_paper_id and contributes nothing."""
         with self._lock:
-            nodes = [
-                SessionGraphNode(
-                    node_id=node_id,
-                    name=data.get("name", node_id),
-                    type=data.get("type", "UNKNOWN"),
-                    description=data.get("description", ""),
-                )
+            node_data = {
+                node_id: data
                 for node_id, data in self.graph.nodes(data=True)
                 if session_id in _session_ids(data)
-            ]
-            node_ids = {n.node_id for n in nodes}
+            }
+            node_ids = set(node_data)
             seen: set[str] = set()
             edges: list[SessionGraphEdge] = []
+            citation_keys: dict[str, set[tuple[str, str | None]]] = {
+                node_id: set() for node_id in node_ids
+            }
+            citations: dict[str, list[NodeCitation]] = {
+                node_id: [] for node_id in node_ids
+            }
             for source_id, target_id, edge_id, data in self.graph.edges(
                 keys=True, data=True
             ):
@@ -596,6 +615,33 @@ class GraphManager:
                         relation=data.get("type", "UNKNOWN"),
                     )
                 )
+                paper_id = data.get("source_paper_id")
+                if not paper_id:
+                    continue
+                section = data.get("source_section")
+                key = (paper_id, section)
+                for endpoint in (source_id, target_id):
+                    if key in citation_keys[endpoint]:
+                        continue
+                    citation_keys[endpoint].add(key)
+                    citations[endpoint].append(
+                        NodeCitation(
+                            paper_id=paper_id,
+                            section=section,
+                            source_quote=data.get("source_quote") or "",
+                        )
+                    )
+
+            nodes = [
+                SessionGraphNode(
+                    node_id=node_id,
+                    name=data.get("name", node_id),
+                    type=data.get("type", "UNKNOWN"),
+                    description=data.get("description", ""),
+                    citations=citations[node_id],
+                )
+                for node_id, data in node_data.items()
+            ]
             return SessionGraphExport(nodes=nodes, edges=edges)
 
     def _stable_node_id(

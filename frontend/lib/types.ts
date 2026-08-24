@@ -72,11 +72,18 @@ export interface GraphVizEdge {
   relation: string;
 }
 
+export interface NodeCitation {
+  paper_id: string;
+  section?: string | null;
+  source_quote: string;
+}
+
 export interface SessionGraphNode {
   node_id: string;
   name: string;
   type: string;
   description: string;
+  citations: NodeCitation[];
 }
 
 export interface SessionGraphEdge {

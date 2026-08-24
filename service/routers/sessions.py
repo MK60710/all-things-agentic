@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 
+from agent.bibliography import build_bibtex
 from service.deps import get_state, require_api_key
 from service.schemas import (
     SessionCreateRequest,
@@ -69,9 +70,30 @@ def get_session_graph(
         raise HTTPException(status_code=404, detail=f"no session {session_id!r}")
     export = state.graph.export_session_graph(session_id)
     return SessionGraphResponse(
-        nodes=[SessionGraphNode(**vars(n)) for n in export.nodes],
+        nodes=[
+            SessionGraphNode(
+                **{**vars(n), "citations": [vars(c) for c in n.citations]}
+            )
+            for n in export.nodes
+        ],
         edges=[SessionGraphEdge(**vars(e)) for e in export.edges],
     )
+
+
+@router.get("/{session_id}/bibliography")
+def get_session_bibliography(
+    session_id: str, state: AppState = Depends(get_state)
+) -> Response:
+    existing = next(
+        (s for s in state.session_store.list() if s.get("id") == session_id), None
+    )
+    if existing is None:
+        raise HTTPException(status_code=404, detail=f"no session {session_id!r}")
+    papers = [
+        p for p in state.paper_store.list() if session_id in _paper_session_ids(p)
+    ]
+    bibtex = build_bibtex(papers)
+    return Response(content=bibtex, media_type="application/x-bibtex")
 
 
 @router.delete("/{session_id}", status_code=204)
