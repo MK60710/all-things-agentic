@@ -292,7 +292,7 @@ def test_gemini_explainer_returns_model_text():
 
     assert result == "A genuinely interesting gap."
     call = fake_client.models.last_call
-    assert call["model"] == "gemini-2.5-flash"
+    assert call["model"] == "gemini-3.5-flash"
     assert "Chain of Thought" in call["contents"]
     assert "Reasoning" in call["contents"]
     assert "Prompting" in call["contents"]
@@ -301,7 +301,7 @@ def test_gemini_explainer_returns_model_text():
     assert "spot gaps in a knowledge graph" in call["config"].system_instruction
     assert "spot gaps in a knowledge graph" not in call["contents"]
     assert call["config"].max_output_tokens == 150
-    assert call["config"].http_options.timeout == 15_000
+    assert call["config"].http_options.timeout == 25_000
     # Thinking must be disabled - verified live that it silently eats the
     # output token budget otherwise (140/150 tokens on a real call).
     assert call["config"].thinking_config.thinking_budget == 0

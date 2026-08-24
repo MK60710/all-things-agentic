@@ -131,10 +131,16 @@ class GeminiExplainer(LazyVertexClient):
     def __init__(
         self,
         client: genai.Client | None = None,
-        model: str = "gemini-2.5-flash",
+        model: str = "gemini-3.5-flash",
         project: str | None = None,
         location: str | None = None,
-        timeout_ms: int = 15_000,
+        # gemini-3.5-flash's cold-start latency runs higher than
+        # gemini-2.5-flash's did - live-confirmed two real GeminiExplainer
+        # calls 504 on cold first invocation during a single test session,
+        # both caught cleanly by the existing fail-safe (no crash, just a
+        # missing candidate) but tight enough to bite during a live demo.
+        # 25s gives real headroom without masking a genuine outage.
+        timeout_ms: int = 25_000,
         max_output_tokens: int = 150,
         # 0 (default) preserves the original always-retry-next-call
         # behavior. A deployment that calls this repeatedly during a

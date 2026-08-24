@@ -79,12 +79,12 @@ def build_state() -> AppState:
     general_chat = GeneralChatAgent(
         project=project,
         location=location,
-        model=os.environ.get("GEMINI_CHAT_MODEL", "gemini-2.5-flash-lite"),
+        model=os.environ.get("GEMINI_CHAT_MODEL", "gemini-3.5-flash-lite"),
     )
     paper_guide = PaperGuideAgent(
         project=project,
         location=location,
-        model=os.environ.get("GEMINI_GUIDE_MODEL", "gemini-2.5-flash-lite"),
+        model=os.environ.get("GEMINI_GUIDE_MODEL", "gemini-3.5-flash-lite"),
     )
     gap_finder = GapFinder(
         graph,

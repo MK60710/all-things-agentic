@@ -26,7 +26,7 @@ class GeneralChatAgent:
         *,
         project: str | None = None,
         location: str = "global",
-        model: str = "gemini-2.5-flash-lite",
+        model: str = "gemini-3.5-flash-lite",
         client: Any | None = None,
         timeout_ms: int = 20_000,
         max_output_tokens: int = 2048,
