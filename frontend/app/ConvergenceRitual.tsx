@@ -5,7 +5,7 @@ import { useEffect, useRef, useState } from "react";
 export interface ConvergenceEntry {
   id: string;
   title: string;
-  stage?: string;
+  stageLabel?: string;
 }
 
 // A rough, honest midpoint of the real pipeline's typical wall-clock cost
@@ -86,6 +86,14 @@ export default function ConvergenceRitual({
   const remaining = ESTIMATED_SECONDS - elapsed;
   const timeLabel = phase === "active" ? (remaining > 0 ? `~${remaining}s left` : "Almost there…") : null;
   const statusWord = BUILD_WORDS[wordIndex];
+  // Real backend stage (e.g. "Extracting…"), not just the cosmetic word
+  // rotation above - confirmed live this was previously computed by the
+  // caller and passed in but never actually rendered anywhere, so the
+  // whole 60-90s+ extraction phase looked identical to a silent wait
+  // beyond the estimate/countdown. Only the first entry's stage is shown
+  // - concurrent ingests are rare and this is a shared overlay, not a
+  // per-paper progress list.
+  const stageLabel = entries[0]?.stageLabel;
 
   return (
     <div className={`convergence-stage${phase === "leaving" ? " leaving" : ""}`}>
@@ -106,7 +114,9 @@ export default function ConvergenceRitual({
           <>
             <p className="convergence-status">
               <span className="convergence-shimmer">{statusWord}…</span>
-              {timeLabel && <small>{timeLabel}</small>}
+              {(stageLabel || timeLabel) && (
+                <small>{[stageLabel, timeLabel].filter(Boolean).join(" · ")}</small>
+              )}
             </p>
           </>
         )}
