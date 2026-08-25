@@ -17,6 +17,17 @@ function truncateLabel(name: string): string {
   return name.length > MAX_LABEL_CHARS ? `${name.slice(0, MAX_LABEL_CHARS - 1)}…` : name;
 }
 
+// Every export used to download as the same literal "session.bib" -
+// confirmed live that's a real string in this file, not a stale artifact,
+// so repeated exports across different sessions collide by name in a
+// Downloads folder with nothing to tell them apart. Strips characters a
+// filesystem could choke on rather than just spaces, and caps length so a
+// long session name doesn't produce an unwieldy filename.
+function bibliographyFilename(sessionName: string | null | undefined): string {
+  const cleaned = (sessionName ?? "").trim().replace(/[\\/:*?"<>|]+/g, "").slice(0, 60).trim();
+  return cleaned ? `${cleaned} citations.bib` : "session.bib";
+}
+
 // Matches GraphBuildAnimation.tsx's window-based sizing convention - a
 // persistent full-screen panel here, so the offsets subtract this
 // component's own topbar + filter row instead of that component's modal
@@ -25,6 +36,7 @@ const TOPBAR_AND_FILTERS_HEIGHT = 116;
 
 export default function GraphExplorer({
   sessionId,
+  sessionName,
   active,
   onClose,
   onAskInChat,
@@ -32,6 +44,9 @@ export default function GraphExplorer({
   papers,
 }: {
   sessionId: string | null;
+  // Only used to name the exported .bib file - falls back to a generic
+  // name below if not given, same as before this existed.
+  sessionName?: string | null;
   active: boolean;
   onClose: () => void;
   onAskInChat: (question: string) => void;
@@ -155,23 +170,34 @@ export default function GraphExplorer({
 
   const connections = useMemo(() => {
     if (!selectedNode) return [];
-    return edges
-      .filter((e) => e.source_id === selectedNode.node_id || e.target_id === selectedNode.node_id)
-      .map((e) => {
-        // Direction matters for the sentence, not just cosmetics: "A
-        // outperforms B" and "B outperforms A" are opposite claims - the
-        // panel renders subject-verb-object in the edge's real stored
-        // order, never assumes the selected node is always the subject.
-        const isOutgoing = e.source_id === selectedNode.node_id;
-        const otherId = isOutgoing ? e.target_id : e.source_id;
-        const other = nodes.find((n) => n.node_id === otherId);
-        return {
-          edgeId: e.edge_id,
-          relation: e.relation,
-          name: other?.name ?? otherId,
-          direction: isOutgoing ? "outgoing" as const : "incoming" as const,
-        };
-      });
+    const seen = new Set<string>();
+    const deduped: { edgeId: string; relation: string; name: string; direction: "outgoing" | "incoming" }[] = [];
+    for (const e of edges) {
+      if (e.source_id !== selectedNode.node_id && e.target_id !== selectedNode.node_id) continue;
+      // Direction matters for the sentence, not just cosmetics: "A
+      // outperforms B" and "B outperforms A" are opposite claims - the
+      // panel renders subject-verb-object in the edge's real stored
+      // order, never assumes the selected node is always the subject.
+      const isOutgoing = e.source_id === selectedNode.node_id;
+      const otherId = isOutgoing ? e.target_id : e.source_id;
+      const other = nodes.find((n) => n.node_id === otherId);
+      const name = other?.name ?? otherId;
+      const direction = isOutgoing ? "outgoing" as const : "incoming" as const;
+      // Two distinct edge_ids can render the exact same sentence -
+      // confirmed live (19 such pairs in one real session's graph):
+      // extraction can independently emit the same relation twice, each
+      // with its own edge_id and possibly its own source quote, so
+      // add_edge's per-id idempotency doesn't catch it. Both edges stay
+      // real, separate graph data (their citations aren't lost - this
+      // only dedupes what renders in this one list), but showing the
+      // identical sentence twice here is never useful, so collapse by
+      // what the sentence would actually say.
+      const key = `${direction}:${relationPhrase(e.relation)}:${name}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      deduped.push({ edgeId: e.edge_id, relation: e.relation, name, direction });
+    }
+    return deduped;
   }, [selectedNode, edges, nodes]);
 
   async function handleCheckContradictions() {
@@ -210,7 +236,7 @@ export default function GraphExplorer({
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
-      link.download = "session.bib";
+      link.download = bibliographyFilename(sessionName);
       link.click();
       URL.revokeObjectURL(url);
     } catch (err) {
@@ -291,6 +317,19 @@ export default function GraphExplorer({
             linkColor={() => "#cdc6df"}
             linkWidth={1}
             cooldownTicks={400}
+            // A small graph (e.g. a single freshly-added paper, ~10 nodes)
+            // was confirmed live to render mostly or entirely above the
+            // visible viewport with no fixed initial camera position or
+            // fit-to-content - looks broken/empty on a first-time user's
+            // very first Graph Explorer visit, which is the single most
+            // common real case (one paper, not the 100+-node stress-test
+            // graph the force tuning above was validated against).
+            // onEngineStop fires once the simulation naturally settles -
+            // fitting to the real node bounding box there (not a fixed
+            // camera guess) works correctly at any graph size, and refires
+            // correctly if the user later changes the type filters, which
+            // reheats the simulation again.
+            onEngineStop={() => fgRef.current?.zoomToFit(400, 60)}
             nodeCanvasObject={(node, ctx, globalScale) => {
               const n = node as SessionGraphNode & { x?: number; y?: number };
               if (n.x == null || n.y == null) return;

@@ -955,7 +955,7 @@ export default function Home() {
   return (
     <main className="assistant-app">
       <ConvergenceRitual entries={convergenceEntries} active={ingestingIds.size > 0} onSkip={() => {}}/>
-      <GraphExplorer sessionId={currentSession?.id ?? null} active={graphExplorerOpen} onClose={() => setGraphExplorerOpen(false)} onAskInChat={askFromGraphExplorer} focusNodeId={graphFocusNodeId} papers={papers}/>
+      <GraphExplorer sessionId={currentSession?.id ?? null} sessionName={currentSession?.name} active={graphExplorerOpen} onClose={() => setGraphExplorerOpen(false)} onAskInChat={askFromGraphExplorer} focusNodeId={graphFocusNodeId} papers={papers}/>
       <Tour steps={ATLAS_TOUR_STEPS} active={tourOpen} onClose={() => { setTourOpen(false); setTourSeen(true); }}/>
       <header className="app-header">
         <div className="brand"><span><Icon name="atlas" size={21}/></span><strong>Atlas</strong></div>
