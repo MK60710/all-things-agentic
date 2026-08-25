@@ -6,7 +6,7 @@ from agent.clarification_orchestrator import ClarificationOrchestrator
 from agent.graph_manager import GraphManager
 from agent.query_agent import QueryAgent
 from agent.retrieval import ChunkIndex
-from agent.schema import Edge, EdgeType, Node, NodeType, ProvenanceTag
+from agent.schema import Edge, EdgeType, ExtractionChunk, Node, NodeType, ProvenanceTag
 
 
 def _graph(fake_db):
@@ -37,6 +37,42 @@ def test_graph_evidence_is_preferred_and_cited(fake_db):
     assert result.citations[0].paper_id == "paper-1"
     assert "improves recall" in result.answer
     assert agent.metrics == {"graph_hits": 1, "vector_fallbacks": 0}
+
+
+def test_graph_citation_recovers_a_real_page_number_from_the_matching_chunk(fake_db):
+    """IncidentEdge never stores a page number (only chunks do) - a graph
+    -mode citation used to always show a blank page, inconsistent with a
+    chunk-mode citation for the same paper. This is the fix: match the
+    edge's own quoted text against the paper's real chunks to recover the
+    page it actually came from."""
+    graph = _graph(fake_db)
+    index = ChunkIndex()
+    index.upsert_paper(
+        "paper-1",
+        [ExtractionChunk(text="The memory method improves recall.", ordinal=0, page_start=4, page_end=4)],
+    )
+    agent = QueryAgent(index, graph)
+
+    result = agent.answer("How does the memory method use recall?")
+
+    assert result.retrieval_mode == "graph"
+    assert result.citations[0].page_start == 4
+    assert result.citations[0].page_end == 4
+
+
+def test_graph_citation_leaves_page_blank_when_quote_matches_no_chunk(fake_db):
+    """A quote that was paraphrased during extraction (or whose paper was
+    never chunk-indexed at all) has no real page to recover - must stay
+    None rather than guessing a wrong page from an unrelated chunk."""
+    graph = _graph(fake_db)
+    index = ChunkIndex()
+    index.upsert_paper("paper-1", ["Completely unrelated chunk text."])
+    agent = QueryAgent(index, graph)
+
+    result = agent.answer("How does the memory method use recall?")
+
+    assert result.citations[0].page_start is None
+    assert result.citations[0].page_end is None
 
 
 def test_low_relevance_graph_match_falls_back_to_chunk(fake_db):

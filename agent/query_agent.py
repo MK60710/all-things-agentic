@@ -491,14 +491,40 @@ class QueryAgent:
         # truncated below max_citations.
         return context, selected[: self._max_citations], hits[0].score
 
-    @staticmethod
-    def _citation_from_edge(edge: IncidentEdge) -> QueryCitation:
+    def _resolve_page_from_quote(
+        self, paper_id: str | None, quote: str
+    ) -> tuple[int | None, int | None]:
+        """Graph edges never stored a page number (see IncidentEdge) - only
+        chunks do. Recovers a real page number for a graph-mode citation by
+        finding which chunk the edge's own quoted text actually came from,
+        instead of leaving it blank - confirmed live as a real, visible
+        inconsistency next to chunk-mode citations that do show a page for
+        the same paper. Best-effort: a quote that doesn't literally appear
+        in any chunk (paraphrased during extraction, or split across a
+        chunk boundary) correctly returns (None, None) rather than
+        guessing wrong."""
+        if not paper_id or not quote:
+            return None, None
+        normalized_quote = " ".join(quote.split())
+        if not normalized_quote:
+            return None, None
+        for chunk in self._chunks.paper_chunks(paper_id):
+            if normalized_quote in chunk.text:
+                return chunk.page_start, chunk.page_end
+        return None, None
+
+    def _citation_from_edge(self, edge: IncidentEdge) -> QueryCitation:
+        page_start, page_end = self._resolve_page_from_quote(
+            edge.source_paper_id, edge.source_quote or ""
+        )
         return QueryCitation(
             source_kind="graph",
             paper_id=edge.source_paper_id,
             text=edge.source_quote
             or f"{edge.source_name} {edge.relation} {edge.target_name}",
             section=edge.source_section,
+            page_start=page_start,
+            page_end=page_end,
             relation=edge.relation,
             node_ids=[edge.source_id, edge.target_id],
         )
