@@ -17,25 +17,40 @@ function field(entry: string, name: string) {
   return decodeXml(entry.match(new RegExp(`<${name}[^>]*>([\\s\\S]*?)<\\/${name}>`))?.[1] ?? "");
 }
 
+async function runArxivQuery(searchQuery: string) {
+  const response = await fetch(
+    `https://export.arxiv.org/api/query?search_query=${encodeURIComponent(searchQuery)}&start=0&max_results=6&sortBy=relevance`,
+    { headers: { "User-Agent": "AtlasResearchAssistant/0.1" }, next: { revalidate: 900 } },
+  );
+  if (response.status === 429) return { rateLimited: true as const, entries: [] as string[] };
+  if (!response.ok) throw new Error(`arXiv returned ${response.status}`);
+  const xml = await response.text();
+  return { rateLimited: false as const, entries: xml.match(/<entry>[\s\S]*?<\/entry>/g) ?? [] };
+}
+
 export async function GET(request: NextRequest) {
   const query = request.nextUrl.searchParams.get("q")?.trim();
   if (!query || query.length < 2) return NextResponse.json({ papers: [] });
 
   try {
-    const search = encodeURIComponent(`all:${query}`);
-    const response = await fetch(`https://export.arxiv.org/api/query?search_query=${search}&start=0&max_results=6&sortBy=relevance`, {
-      headers: { "User-Agent": "AtlasResearchAssistant/0.1" },
-      next: { revalidate: 900 },
-    });
-    if (response.status === 429) {
+    // arXiv's plain `all:<query>` search ranks across every field (abstract,
+    // author, etc. combined) - confirmed live it can bury or fully omit the
+    // exact paper a verbatim title search is obviously looking for (e.g.
+    // "attention is all you need" never surfaced the real paper). A quoted
+    // `ti:"<query>"` phrase search finds it as the top result instead -
+    // tried first, falling back to the original all-fields search only
+    // when title search finds nothing, so a general topic query ("attention
+    // mechanisms") still works as broadly as before.
+    let { rateLimited, entries } = await runArxivQuery(`ti:"${query}"`);
+    if (!rateLimited && entries.length === 0) {
+      ({ rateLimited, entries } = await runArxivQuery(`all:${query}`));
+    }
+    if (rateLimited) {
       return NextResponse.json(
         { papers: [], error: "arXiv is rate-limiting search requests right now - try again in a minute." },
         { status: 429 },
       );
     }
-    if (!response.ok) throw new Error(`arXiv returned ${response.status}`);
-    const xml = await response.text();
-    const entries = xml.match(/<entry>[\s\S]*?<\/entry>/g) ?? [];
     const papers = entries.map((entry) => {
       const idUrl = field(entry, "id");
       const id = idUrl.split("/").pop()?.replace(/v\d+$/, "") ?? idUrl;
