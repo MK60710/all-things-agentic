@@ -5,7 +5,7 @@ import "./globals.css";
 const geist = Geist({ subsets: ["latin"], variable: "--font-geist" });
 
 export const metadata: Metadata = {
-  title: "Atlas — Research Graph",
+  title: "Atlas · Research Graph",
   description: "Explore papers, evidence, and connections in one living research map.",
 };
 
