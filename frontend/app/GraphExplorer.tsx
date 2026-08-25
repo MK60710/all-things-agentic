@@ -1,7 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { checkForContradictions, getSessionBibliography, getSessionGraph } from "@/lib/api";
 import type { PaperContext } from "@/lib/api";
 import { TYPE_COLORS, DEFAULT_NODE_COLOR, typeLabel, relationPhrase } from "@/lib/graphColors";
@@ -61,6 +61,8 @@ export default function GraphExplorer({
   const [contradictionMessage, setContradictionMessage] = useState<string | null>(null);
   const [exportingCitations, setExportingCitations] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const fgRef = useRef<any>(null);
 
   useEffect(() => {
     function measure() {
@@ -111,6 +113,45 @@ export default function GraphExplorer({
       .filter((e) => filteredNodeIds.has(e.source_id) && filteredNodeIds.has(e.target_id))
       .map((e) => ({ source: e.source_id, target: e.target_id, relation: e.relation })),
   }), [nodes, edges, filteredNodeIds]);
+
+  // The default d3-force charge/link strengths are tuned for small,
+  // sparse graphs - confirmed live: with 100+ nodes and this session's
+  // real density, the default layout clumps into overlapping label
+  // clusters instead of spreading out. This mutates the two forces
+  // force-graph already wires up internally (accessed via the ref, not
+  // a new d3-force import) rather than sizing them once at prop level,
+  // since a fixed constant can't account for how much a given session's
+  // graph actually needs to spread - reheating after every graphData
+  // change lets it re-settle for the new node/edge count each time.
+  //
+  // Retries rather than a single fgRef.current check - confirmed live
+  // via instrumentation that a plain single check silently no-ops on
+  // first load: ForceGraph2D is a next/dynamic({ssr:false}) component,
+  // so its ref isn't attached yet the first time graphData populates
+  // (fgRef.current was null every time this fired on initial load,
+  // confirmed via console logging before this fix). react-force-graph
+  // -2d's own type declarations only accept a MutableRefObject for
+  // `ref`, not a callback ref, which would otherwise be the cleaner fix
+  // for "run exactly when the instance attaches" - polling a few times
+  // at a short interval is the workaround available within that
+  // constraint, and stops as soon as the ref is present.
+  useEffect(() => {
+    if (graphData.nodes.length === 0) return;
+    let attempts = 0;
+    const id = window.setInterval(() => {
+      attempts += 1;
+      const fg = fgRef.current;
+      if (fg) {
+        fg.d3Force("charge")?.strength(-340).distanceMax(800);
+        fg.d3Force("link")?.distance(90).strength(0.5);
+        fg.d3ReheatSimulation();
+        window.clearInterval(id);
+      } else if (attempts >= 20) {
+        window.clearInterval(id);
+      }
+    }, 100);
+    return () => window.clearInterval(id);
+  }, [graphData]);
 
   const connections = useMemo(() => {
     if (!selectedNode) return [];
@@ -242,13 +283,14 @@ export default function GraphExplorer({
         )}
         {!loading && !error && nodes.length > 0 && (
           <ForceGraph2D
+            ref={fgRef}
             graphData={graphData}
             width={size.width}
             height={size.height}
             nodeLabel="name"
             linkColor={() => "#cdc6df"}
             linkWidth={1}
-            cooldownTicks={80}
+            cooldownTicks={400}
             nodeCanvasObject={(node, ctx, globalScale) => {
               const n = node as SessionGraphNode & { x?: number; y?: number };
               if (n.x == null || n.y == null) return;
