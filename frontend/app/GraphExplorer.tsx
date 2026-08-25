@@ -17,6 +17,17 @@ function truncateLabel(name: string): string {
   return name.length > MAX_LABEL_CHARS ? `${name.slice(0, MAX_LABEL_CHARS - 1)}…` : name;
 }
 
+// Every export used to download as the same literal "session.bib" -
+// confirmed live that's a real string in this file, not a stale artifact,
+// so repeated exports across different sessions collide by name in a
+// Downloads folder with nothing to tell them apart. Strips characters a
+// filesystem could choke on rather than just spaces, and caps length so a
+// long session name doesn't produce an unwieldy filename.
+function bibliographyFilename(sessionName: string | null | undefined): string {
+  const cleaned = (sessionName ?? "").trim().replace(/[\\/:*?"<>|]+/g, "").slice(0, 60).trim();
+  return cleaned ? `${cleaned} citations.bib` : "session.bib";
+}
+
 // Matches GraphBuildAnimation.tsx's window-based sizing convention - a
 // persistent full-screen panel here, so the offsets subtract this
 // component's own topbar + filter row instead of that component's modal
@@ -25,6 +36,7 @@ const TOPBAR_AND_FILTERS_HEIGHT = 116;
 
 export default function GraphExplorer({
   sessionId,
+  sessionName,
   active,
   onClose,
   onAskInChat,
@@ -32,6 +44,9 @@ export default function GraphExplorer({
   papers,
 }: {
   sessionId: string | null;
+  // Only used to name the exported .bib file - falls back to a generic
+  // name below if not given, same as before this existed.
+  sessionName?: string | null;
   active: boolean;
   onClose: () => void;
   onAskInChat: (question: string) => void;
@@ -221,7 +236,7 @@ export default function GraphExplorer({
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
-      link.download = "session.bib";
+      link.download = bibliographyFilename(sessionName);
       link.click();
       URL.revokeObjectURL(url);
     } catch (err) {
