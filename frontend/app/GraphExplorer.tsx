@@ -233,7 +233,7 @@ export default function GraphExplorer({
       </div>
       <div className="graph-explorer-canvas">
         {focusNotFound && (
-          <p className="graph-explorer-focus-miss">That node isn&rsquo;t part of this session&rsquo;s graph — it came from a different session&rsquo;s papers.</p>
+          <p className="graph-explorer-focus-miss">That node isn&rsquo;t part of this session&rsquo;s graph. It came from a different session&rsquo;s papers.</p>
         )}
         {loading && <p className="graph-explorer-status">Loading your graph…</p>}
         {error && <p className="graph-explorer-status graph-explorer-error">{error}</p>}

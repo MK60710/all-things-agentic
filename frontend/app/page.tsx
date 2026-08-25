@@ -108,8 +108,9 @@ const ATLAS_TOUR_STEPS: TourStep[] = [
   {
     target: ".brand",
     title: "Welcome to Atlas",
-    body: "A quick tour of the essentials - five stops, feel free to skip anytime.",
+    body: "A quick tour of the essentials: five stops, skip anytime.",
     placement: "bottom",
+    clickable: false,
   },
   {
     target: ".add-paper-button",
@@ -126,7 +127,7 @@ const ATLAS_TOUR_STEPS: TourStep[] = [
   {
     target: ".graph-explorer-toggle",
     title: "Explore the graph",
-    body: "Once you've added a paper, open this to see every idea it extracted as a real, clickable graph - not just a summary.",
+    body: "Once you've added a paper, open this to see every idea it extracted as a real, clickable graph, not just a summary.",
     placement: "bottom",
   },
   {
@@ -1027,14 +1028,14 @@ export default function Home() {
                     {message.guideLoading && <div className="guide-building"><span/><div><strong>Building your guided reading</strong><small>Finding the paper's structure, simplifying each section, and drawing useful visual explanations…</small></div></div>}
                     {message.guide && <GuidedReading guide={message.guide} paperId={message.paperId} sessionId={currentSession?.id} onViewNodeInGraph={viewNodeInGraph}/>}
                     {message.guideError && <span className="guide-error">{message.guideError}</span>}
-                    {message.retrievalMode === "vector" && <span className="not-graph-note"><Icon name="globe" size={11}/>From the paper's text directly — not yet verified against the knowledge graph</span>}
-                    {message.confidence === "low" && <span className="confidence-note">Low-confidence match — check the sources below.</span>}
+                    {message.retrievalMode === "vector" && <span className="not-graph-note"><Icon name="globe" size={11}/>From the paper's text directly, not yet verified against the knowledge graph</span>}
+                    {message.confidence === "low" && <span className="confidence-note">Low-confidence match: check the sources below.</span>}
                     {message.candidates && message.candidates.length > 0 && <div className="candidate-list">{message.candidates.map((candidate) => <button key={candidate.node_id} onClick={() => selectCandidate(candidate, message.clarificationQuestionId)}><strong>{candidate.name}</strong><small>{candidate.type}</small>{candidate.description && <p>{candidate.description}</p>}</button>)}</div>}
                     {message.citations && message.citations.length > 0 && <div className="citations">{message.citations.map((citation, index) => {
                       const key = `${message.id}-${index}`;
                       const graphNodeId = citation.source_kind === "graph" ? citation.node_ids?.[0] : undefined;
                       return <div key={key}>
-                        <button onClick={() => setExpandedCitation(expandedCitation === key ? null : key)}><Icon name="quote" size={13}/>{citation.section ?? "Source"} · p. {citation.page_start ?? "—"}</button>
+                        <button onClick={() => setExpandedCitation(expandedCitation === key ? null : key)}><Icon name="quote" size={13}/>{citation.section ?? "Source"} · p. {citation.page_start ?? "-"}</button>
                         {graphNodeId && <button className="citation-view-graph" onClick={() => viewNodeInGraph(graphNodeId)} title="View this node in the graph"><Icon name="graph" size={12}/>View in graph</button>}
                         {expandedCitation === key && <blockquote>“{citation.text}”</blockquote>}
                       </div>;
