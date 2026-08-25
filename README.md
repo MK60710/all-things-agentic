@@ -1,6 +1,6 @@
 # Atlas
 
-All Things Agentic Hackathon (Google/Devpost) — Collaborative Partner track.
+All Things Agentic Hackathon (Google/Devpost). Collaborative Partner track.
 
 An interactive research assistant that reads academic papers and uses cheap
 chunk retrieval for the common question-answering path. High-confidence,
@@ -11,6 +11,11 @@ The default ingestion and retrieval path is local: `pdftotext`, deterministic
 chunking, and feature-hashed vectors. OCR, Gemini structured extraction,
 Firestore persistence, and hosted embeddings are optional upgrades rather
 than requirements for every paper or query.
+
+New to Atlas? See [`GUIDE.md`](GUIDE.md) for how to actually get the most
+out of it - Guided Reading, the Feynman Check, contradiction/gap
+detection, and why sessions with more than one related paper unlock most
+of what's interesting.
 
 ## Run the integrated app locally
 

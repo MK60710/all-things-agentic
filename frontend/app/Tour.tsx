@@ -7,6 +7,14 @@ export interface TourStep {
   title: string;
   body: string;
   placement?: "top" | "bottom" | "left" | "right";
+  // Defaults true. The pulsing cursor dot means "click this" - set false
+  // for a step whose target is purely a visual anchor (e.g. the "Welcome
+  // to Atlas" intro pinned near the logo) rather than something the step
+  // is actually telling the user to interact with. Confirmed live: the
+  // welcome step's own body never says to click anything, and its
+  // target (.brand) isn't even a button - showing the cursor there
+  // implied an action that doesn't exist.
+  clickable?: boolean;
 }
 
 const SPOTLIGHT_PAD = 8;
@@ -125,7 +133,9 @@ export default function Tour({ steps, active, onClose }: { steps: TourStep[]; ac
           height: rect.height + SPOTLIGHT_PAD * 2,
         }}
       />
-      <div className="tour-cursor" style={{ top: rect.top + rect.height / 2, left: rect.left + rect.width / 2 }} />
+      {step.clickable !== false && (
+        <div className="tour-cursor" style={{ top: rect.top + rect.height / 2, left: rect.left + rect.width / 2 }} />
+      )}
       <div
         className={`tour-callout tour-callout-${side}`}
         style={{ top, left, width: CALLOUT_WIDTH, "--arrow-left": `${arrowLeft}px` } as React.CSSProperties}
