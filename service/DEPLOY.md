@@ -26,8 +26,20 @@ gcloud run deploy all-things-agentic-api \
   --allow-unauthenticated \
   --min-instances=1 --max-instances=1 --concurrency=4 \
   --timeout=300 --memory=1Gi --cpu=1 \
-  --set-env-vars=GOOGLE_CLOUD_PROJECT=all-things-agentic-hack,GOOGLE_CLOUD_LOCATION=us-central1,API_SHARED_SECRET=<pick-a-value>
+  --set-env-vars=GOOGLE_CLOUD_PROJECT=all-things-agentic-hack,GOOGLE_CLOUD_LOCATION=global,API_SHARED_SECRET=<pick-a-value>
 ```
+
+`--region us-central1` is just where the Cloud Run *service itself* runs -
+that's unrelated to and doesn't need to change. `GOOGLE_CLOUD_LOCATION`
+is a separate setting: it's what the app passes to the Vertex AI client
+to pick which Gemini endpoint to call, and this project only has
+`gemini-3.5-*` entitlement on the "global" Vertex AI endpoint, not
+"us-central1" (confirmed live: a direct call to gemini-3.5-flash in
+us-central1 404s with "your project does not have access to it"; the
+identical call against "global" succeeds). Deploying with the old value
+would put a live, publicly reachable service on Cloud Run where every
+Gemini call - contradiction checks, gap-finding, Feynman checks, chat -
+fails.
 
 `--min-instances=1 --max-instances=1` is not a tuning choice - it's
 required. `GraphManager`, `ChunkIndex`, and `ClarificationOrchestrator` all
@@ -45,7 +57,7 @@ SERVICE_URL=$(gcloud run services describe all-things-agentic-api \
   --project all-things-agentic-hack --region us-central1 \
   --format='value(status.url)')
 
-curl "$SERVICE_URL/healthz"
+curl "$SERVICE_URL/health"
 
 curl -X POST "$SERVICE_URL/query" \
   -H "content-type: application/json" \
