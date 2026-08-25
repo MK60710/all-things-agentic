@@ -76,6 +76,12 @@ function gapKey(candidate: { node_a_id: string; node_b_id: string }) {
 // of just replacing the badge text.
 const INGEST_STAGE_LABELS: Record<string, string> = {
   downloading: "Fetching…",
+  // The real, long phase (60-90s+, see service/routers/papers.py's
+  // status="extracting" write) previously fell through to the generic
+  // "Reading…" fallback below with nothing distinguishing it from the
+  // few-second "downloading" phase - confirmed live as a real silent
+  // wait with no visible signal that anything was actually happening.
+  extracting: "Extracting…",
 };
 
 function ingestStageLabel(stage: string | undefined): string {
@@ -407,6 +413,14 @@ export default function Home() {
   const [papers, setPapers] = useState<PaperContext[]>([]);
   const [addOpen, setAddOpen] = useState(false);
   const [addMode, setAddMode] = useState<AddMode>("choose");
+  // Replaces two stacked native window.prompt() calls - confirmed live as
+  // the one moment in the whole app that looked like a different,
+  // unstyled product, and prompt() blocks the entire page/tab while open.
+  const [createSessionOpen, setCreateSessionOpen] = useState(false);
+  const [newSessionName, setNewSessionName] = useState("");
+  const [newSessionGoal, setNewSessionGoal] = useState("");
+  const [creatingSession, setCreatingSession] = useState(false);
+  const [createSessionError, setCreateSessionError] = useState("");
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
@@ -471,15 +485,21 @@ export default function Home() {
   }, []);
   const sessionSwitcherRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    if (!sessionMenuOpen && !addOpen) return;
+    // graphExplorerOpen was missing here - confirmed live that Escape did
+    // nothing while Graph Explorer was open, inconsistent with every other
+    // modal in the app (the Add Paper dialog, the session switcher) which
+    // this same handler already closes.
+    if (!sessionMenuOpen && !addOpen && !graphExplorerOpen && !createSessionOpen) return;
     function onKeyDown(event: KeyboardEvent) {
       if (event.key !== "Escape") return;
       setSessionMenuOpen(false);
       setAddOpen(false);
+      setGraphExplorerOpen(false);
+      setCreateSessionOpen(false);
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [sessionMenuOpen, addOpen]);
+  }, [sessionMenuOpen, addOpen, graphExplorerOpen, createSessionOpen]);
   useEffect(() => {
     if (!sessionMenuOpen) return;
     function onMouseDown(event: MouseEvent) {
@@ -562,22 +582,29 @@ export default function Home() {
     if (restoredMessages.length > 0) void checkGuidance();
   }
 
-  async function createAndSwitchToNewSession() {
-    const name = window.prompt("Name this session:", "")?.trim();
-    if (!name) return;
-    const goal = window.prompt("What are you working on? (optional - helps Atlas focus suggestions and answers)", "")?.trim();
+  function openCreateSession() {
     setSessionMenuOpen(false);
+    setNewSessionName("");
+    setNewSessionGoal("");
+    setCreateSessionError("");
+    setCreateSessionOpen(true);
+  }
+
+  async function submitCreateSession(event: FormEvent) {
+    event.preventDefault();
+    const name = newSessionName.trim();
+    if (!name || creatingSession) return;
+    setCreatingSession(true);
+    setCreateSessionError("");
     try {
-      const created = await createSession(name, goal);
+      const created = await createSession(name, newSessionGoal.trim() || undefined);
       setSessions((current) => [created, ...current]);
+      setCreateSessionOpen(false);
       await switchToSession(created);
     } catch (error) {
-      setMessages((current) => [...current, {
-        id: crypto.randomUUID(),
-        role: "assistant",
-        text: error instanceof Error ? error.message : "Could not create the session.",
-        notice: true,
-      }]);
+      setCreateSessionError(error instanceof Error ? error.message : "Could not create the session.");
+    } finally {
+      setCreatingSession(false);
     }
   }
 
@@ -949,7 +976,11 @@ export default function Home() {
   const convergenceEntries = Array.from(ingestingIds).map((id) => ({
     id,
     title: searchResults.find((result) => result.id === id)?.title ?? "your paper",
-    stage: ingestStage[id],
+    // The real backend stage, resolved to display text here (same helper
+    // the search-results ingest badge already uses) - ConvergenceRitual
+    // previously received a raw `stage` field and never actually used it,
+    // showing only its own cosmetic word rotation with no real signal.
+    stageLabel: ingestStageLabel(ingestStage[id]),
   }));
 
   return (
@@ -972,7 +1003,7 @@ export default function Home() {
               <span>{currentSession?.name ?? "Session"}</span>
             </button>
             {sessionMenuOpen && <div className="session-menu">
-              <button className="session-menu-new" onClick={() => void createAndSwitchToNewSession()}><Icon name="plus" size={13}/>New session</button>
+              <button className="session-menu-new" onClick={openCreateSession}><Icon name="plus" size={13}/>New session</button>
               {sessions.map((s) => <div key={s.id} className="session-menu-row">
                 <button
                   className={`session-menu-item${s.id === currentSession?.id ? " active" : ""}`}
@@ -1142,6 +1173,21 @@ export default function Home() {
             })}</div>
           </div>}
           </>}
+        </section>
+      </div>}
+      {createSessionOpen && <div className="add-modal" role="dialog" aria-modal="true" aria-label="New session">
+        <button className="modal-scrim" onClick={() => setCreateSessionOpen(false)} aria-label="Close"/>
+        <section className="modal-card">
+          <header><div><span><Icon name="graph" size={18}/></span><div><strong>New session</strong><small>Each session keeps its own papers and graph</small></div></div><button onClick={() => setCreateSessionOpen(false)} aria-label="Close"><Icon name="close" size={19}/></button></header>
+          <form className="create-session-form" onSubmit={submitCreateSession}>
+            <label>Name<input autoFocus value={newSessionName} onChange={(event) => setNewSessionName(event.target.value)} placeholder="e.g. Attention mechanisms" maxLength={200}/></label>
+            <label>What are you working on? <small>(optional - helps Atlas focus suggestions and answers)</small><textarea value={newSessionGoal} onChange={(event) => setNewSessionGoal(event.target.value)} placeholder="e.g. Comparing efficient-attention methods for my thesis" rows={2} maxLength={300}/></label>
+            {createSessionError && <p className="form-error">{createSessionError}</p>}
+            <div className="create-session-actions">
+              <button type="button" className="back-button" onClick={() => setCreateSessionOpen(false)}>Cancel</button>
+              <button type="submit" disabled={!newSessionName.trim() || creatingSession}>{creatingSession ? "Creating…" : "Create session"}</button>
+            </div>
+          </form>
         </section>
       </div>}
     </main>
