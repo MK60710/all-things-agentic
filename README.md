@@ -1,4 +1,4 @@
-# Hybrid Research Partner
+# Atlas
 
 All Things Agentic Hackathon (Google/Devpost) — Collaborative Partner track.
 
@@ -40,6 +40,13 @@ secret stays in the Next.js server process.
 - Local chunk index for retrieval
 - networkx graph engine + optional Firestore persistence
 - Cloud Run (deployment)
+
+## Deploy
+
+The backend deploys to Cloud Run as a single container - see
+[`service/DEPLOY.md`](service/DEPLOY.md) for the exact command, why
+`--min-instances=1 --max-instances=1` is required rather than tuned, and
+how to verify the deployed service afterward.
 
 ## Setup
 Install from `pyproject.toml` or `requirements.txt`. The local path does not

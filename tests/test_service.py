@@ -85,8 +85,8 @@ def client(app_state, monkeypatch):
     app.dependency_overrides.pop(get_state, None)
 
 
-def test_healthz(client):
-    response = client.get("/healthz")
+def test_health(client):
+    response = client.get("/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
 
