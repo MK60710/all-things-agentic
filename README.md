@@ -41,6 +41,12 @@ secret stays in the Next.js server process.
 - networkx graph engine + optional Firestore persistence
 - Cloud Run (deployment)
 
+## Architecture
+
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the system diagram, the two
+core request flows (paper ingestion, chat), and why the concurrency
+locks exist.
+
 ## Deploy
 
 The backend deploys to Cloud Run as a single container - see
