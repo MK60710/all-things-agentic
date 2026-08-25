@@ -12,6 +12,26 @@ export interface TourStep {
 const SPOTLIGHT_PAD = 8;
 const CALLOUT_WIDTH = 300;
 const CALLOUT_MARGIN = 16;
+const ARROW_SIZE = 14;
+// Keeps the diamond from visually clipping the callout's own 14px
+// border-radius corner - not just an arbitrary margin.
+const ARROW_EDGE_MARGIN = 20;
+
+// The callout's own left gets clamped to stay on-screen (see
+// calloutPosition below) independently of where the target actually is -
+// confirmed live: a target near a viewport edge (e.g. the topbar's
+// "+ Add another" button) clamps the callout ~80px away from the
+// position that would center it under the target, while the arrow used
+// to sit at a hardcoded left:26px regardless, pointing at empty space
+// instead of the target. This recomputes the arrow's own left so it
+// tracks the target's real horizontal center, clamped to stay within
+// the callout's own rounded-corner bounds rather than the callout's
+// clamped position.
+function arrowOffset(rect: DOMRect, calloutLeft: number) {
+  const targetCenterX = rect.left + rect.width / 2;
+  const raw = targetCenterX - calloutLeft - ARROW_SIZE / 2;
+  return Math.min(Math.max(ARROW_EDGE_MARGIN, raw), CALLOUT_WIDTH - ARROW_EDGE_MARGIN - ARROW_SIZE);
+}
 
 function calloutPosition(rect: DOMRect, placement?: TourStep["placement"]) {
   const vw = window.innerWidth;
@@ -92,6 +112,7 @@ export default function Tour({ steps, active, onClose }: { steps: TourStep[]; ac
 
   const isLast = stepIndex === steps.length - 1;
   const { top, left, side } = calloutPosition(rect, step.placement);
+  const arrowLeft = arrowOffset(rect, left);
 
   return (
     <div className="tour-overlay" role="dialog" aria-modal="true" aria-label="Atlas walkthrough">
@@ -105,7 +126,10 @@ export default function Tour({ steps, active, onClose }: { steps: TourStep[]; ac
         }}
       />
       <div className="tour-cursor" style={{ top: rect.top + rect.height / 2, left: rect.left + rect.width / 2 }} />
-      <div className={`tour-callout tour-callout-${side}`} style={{ top, left, width: CALLOUT_WIDTH }}>
+      <div
+        className={`tour-callout tour-callout-${side}`}
+        style={{ top, left, width: CALLOUT_WIDTH, "--arrow-left": `${arrowLeft}px` } as React.CSSProperties}
+      >
         <div className="tour-callout-progress">
           {steps.map((s, index) => <i key={s.target + index} className={index === stepIndex ? "active" : index < stepIndex ? "done" : ""} />)}
         </div>
