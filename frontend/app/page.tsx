@@ -444,6 +444,14 @@ export default function Home() {
   const [searchError, setSearchError] = useState("");
   const [expandedCitation, setExpandedCitation] = useState<string | null>(null);
   const [dismissedGapKeys, setDismissedGapKeys] = useState<Set<string>>(new Set());
+  // Clarifications and gap suggestions used to land as two separate full
+  // -content messages right alongside Guided Reading the moment a paper
+  // finished ingesting - confirmed as real cognitive overload on a first
+  // -time user's very first minute in the app (three simultaneous asks
+  // before they'd read a word). Collapsed by default behind one summary
+  // card instead - Guided Reading stays the prominent thing on screen,
+  // the rest is one click away whenever the user is ready for it.
+  const [expandedFindings, setExpandedFindings] = useState<Set<string>>(new Set());
   // A queue, not a single value - multiple ingests can finish close
   // together now that they're no longer serialized, and each one gets its
   // own full reveal in turn rather than the second silently clobbering the
@@ -649,39 +657,37 @@ export default function Home() {
   // toast for something the user didn't ask for is not - both halves fail
   // silently and independently.
   async function checkGuidance() {
+    let clarification: PendingQuestion | undefined;
+    let clarifications: PendingQuestion[] | undefined;
     try {
       const questions = await listClarifications(sessionIdRef.current || undefined);
       const fresh = questions.filter((q) => q.status === "open" && !shownClarificationIds.current.has(q.id));
       fresh.forEach((q) => shownClarificationIds.current.add(q.id));
-      if (fresh.length === 1) {
-        setMessages((current) => [
-          ...current,
-          { id: crypto.randomUUID(), role: "assistant" as const, text: "", notice: true, clarification: fresh[0] },
-        ]);
-      } else if (fresh.length > 1) {
-        // More than one at once reads as a wall of doubt-cards, not a
-        // partner asking a smart question - one compact batched card
-        // instead of N full message bubbles.
-        setMessages((current) => [
-          ...current,
-          { id: crypto.randomUUID(), role: "assistant" as const, text: "", notice: true, clarifications: fresh },
-        ]);
-      }
+      if (fresh.length === 1) clarification = fresh[0];
+      // More than one at once reads as a wall of doubt-cards, not a
+      // partner asking a smart question - one compact batched card
+      // instead of N full message bubbles.
+      else if (fresh.length > 1) clarifications = fresh;
     } catch {
       // silent
     }
+    let gaps: GapCandidate[] | undefined;
     try {
-      const gaps = await listGaps(3, sessionIdRef.current || undefined);
-      const fresh = gaps.filter((g) => !shownGapKeys.current.has(gapKey(g)));
+      const fresh = (await listGaps(3, sessionIdRef.current || undefined)).filter(
+        (g) => !shownGapKeys.current.has(gapKey(g)),
+      );
       fresh.forEach((g) => shownGapKeys.current.add(gapKey(g)));
-      if (fresh.length) {
-        setMessages((current) => [
-          ...current,
-          { id: crypto.randomUUID(), role: "assistant", text: "A few things worth exploring:", notice: true, gaps: fresh },
-        ]);
-      }
+      if (fresh.length) gaps = fresh;
     } catch {
       // silent
+    }
+    // One combined, collapsed-by-default card instead of up to two
+    // separate full-content messages - see expandedFindings above for why.
+    if (clarification || clarifications || gaps) {
+      setMessages((current) => [
+        ...current,
+        { id: crypto.randomUUID(), role: "assistant" as const, text: "", notice: true, clarification, clarifications, gaps },
+      ]);
     }
   }
 
@@ -1047,7 +1053,19 @@ export default function Home() {
             <div className="message-list">
               {messages.map((message) => {
                 const visibleGaps = message.gaps?.filter((g) => !dismissedGapKeys.has(gapKey(g)));
-                if (message.gaps && (!visibleGaps || visibleGaps.length === 0)) return null;
+                const hasClarificationContent = Boolean(message.clarification) || Boolean(message.clarifications?.length);
+                const hasVisibleGapContent = Boolean(visibleGaps?.length);
+                // A combined findings card can lose all its gaps to
+                // dismissal while its clarifications are still open - only
+                // hide the whole message once genuinely nothing is left,
+                // not just because the gaps half emptied out.
+                if (message.gaps && !hasVisibleGapContent && !hasClarificationContent) return null;
+                const isFindingsMessage = hasClarificationContent || hasVisibleGapContent;
+                const findingsExpanded = expandedFindings.has(message.id);
+                const findingsSummaryParts: string[] = [];
+                if (message.clarification) findingsSummaryParts.push("1 possible duplicate");
+                else if (message.clarifications?.length) findingsSummaryParts.push(`${message.clarifications.length} possible duplicates`);
+                if (hasVisibleGapContent) findingsSummaryParts.push(`${visibleGaps!.length} thing${visibleGaps!.length === 1 ? "" : "s"} worth exploring`);
                 const feedbackNodeId = message.citations?.[0]?.source_kind === "graph" ? message.citations[0].node_ids?.[0] : undefined;
                 const isGuideMessage = Boolean(message.guide || message.guideLoading);
 
@@ -1077,38 +1095,52 @@ export default function Home() {
                         <button onClick={() => submitQueryFeedback(message.id, feedbackNodeId, false)} aria-label="Not helpful"><Icon name="thumbDown" size={13}/></button>
                       </>}
                     </div>}
-                    {message.clarification && <div className="clarification-card">
-                      <p>{message.clarification.question}</p>
-                      {message.clarification.status === "answered" ? (
-                        <small>Answered: {message.clarification.options.find((opt) => opt.id === message.clarification!.answer_option_id)?.label ?? message.clarification.answer_option_id}</small>
-                      ) : (
-                        <div className="clarification-options">
-                          {message.clarification.options.map((option) => <button key={option.id} onClick={() => answerClarificationQuestion(message.id, message.clarification!, option.id)}>{option.label}</button>)}
-                        </div>
-                      )}
-                    </div>}
-                    {message.clarifications && message.clarifications.length > 0 && <div className="clarification-batch">
-                      <small>{message.clarifications.length} entities might be duplicates</small>
-                      {message.clarifications.map((question) => <div key={question.id} className="clarification-row">
-                        <p>{question.question}</p>
-                        {question.status === "answered" ? (
-                          <small>Answered: {question.options.find((opt) => opt.id === question.answer_option_id)?.label ?? question.answer_option_id}</small>
+                    {isFindingsMessage && <button
+                      type="button"
+                      className={`findings-toggle${findingsExpanded ? " expanded" : ""}`}
+                      onClick={() => setExpandedFindings((current) => {
+                        const next = new Set(current);
+                        if (next.has(message.id)) next.delete(message.id); else next.add(message.id);
+                        return next;
+                      })}
+                    >
+                      <span>I also found a few things while reading: {findingsSummaryParts.join(", ")}</span>
+                      <Icon name="plus" size={13}/>
+                    </button>}
+                    {findingsExpanded && <>
+                      {message.clarification && <div className="clarification-card">
+                        <p>{message.clarification.question}</p>
+                        {message.clarification.status === "answered" ? (
+                          <small>Answered: {message.clarification.options.find((opt) => opt.id === message.clarification!.answer_option_id)?.label ?? message.clarification.answer_option_id}</small>
                         ) : (
                           <div className="clarification-options">
-                            {question.options.map((option) => <button key={option.id} onClick={() => answerClarificationQuestion(message.id, question, option.id)}>{option.label}</button>)}
+                            {message.clarification.options.map((option) => <button key={option.id} onClick={() => answerClarificationQuestion(message.id, message.clarification!, option.id)}>{option.label}</button>)}
                           </div>
                         )}
-                      </div>)}
-                    </div>}
-                    {visibleGaps && visibleGaps.length > 0 && <div className="gap-suggestions">
-                      {visibleGaps.map((candidate) => <div key={gapKey(candidate)} className="gap-chip">
-                        <button onClick={() => askAboutGap(candidate)}>
-                          <strong>{candidate.node_a_name} ↔ {candidate.node_b_name}</strong>
-                          {candidate.explanation && <span>{candidate.explanation}</span>}
-                        </button>
-                        <button className="gap-dismiss" onClick={() => dismissGap(candidate)} aria-label="Not interesting"><Icon name="close" size={12}/></button>
-                      </div>)}
-                    </div>}
+                      </div>}
+                      {message.clarifications && message.clarifications.length > 0 && <div className="clarification-batch">
+                        <small>{message.clarifications.length} entities might be duplicates</small>
+                        {message.clarifications.map((question) => <div key={question.id} className="clarification-row">
+                          <p>{question.question}</p>
+                          {question.status === "answered" ? (
+                            <small>Answered: {question.options.find((opt) => opt.id === question.answer_option_id)?.label ?? question.answer_option_id}</small>
+                          ) : (
+                            <div className="clarification-options">
+                              {question.options.map((option) => <button key={option.id} onClick={() => answerClarificationQuestion(message.id, question, option.id)}>{option.label}</button>)}
+                            </div>
+                          )}
+                        </div>)}
+                      </div>}
+                      {visibleGaps && visibleGaps.length > 0 && <div className="gap-suggestions">
+                        {visibleGaps.map((candidate) => <div key={gapKey(candidate)} className="gap-chip">
+                          <button onClick={() => askAboutGap(candidate)}>
+                            <strong>{candidate.node_a_name} ↔ {candidate.node_b_name}</strong>
+                            {candidate.explanation && <span>{candidate.explanation}</span>}
+                          </button>
+                          <button className="gap-dismiss" onClick={() => dismissGap(candidate)} aria-label="Not interesting"><Icon name="close" size={12}/></button>
+                        </div>)}
+                      </div>}
+                    </>}
                   </div>
                 </article>;
               })}
