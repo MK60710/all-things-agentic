@@ -22,3 +22,11 @@ presented as verified recommendations when their metadata can be resolved.
 
 The existing arXiv search and ingestion flow should remain available as the
 default until this multi-source discovery layer is implemented.
+
+## Make PDF figures and tables source-aware
+
+PDF extraction currently flattens multi-column author blocks, figures, and
+tables into ordinary paragraphs. A future extraction pass should detect table
+and figure captions, preserve their layout, render them as distinct readable
+blocks, and keep their labels out of entity/relationship extraction. Raw
+extracted text should remain available behind an audit/details affordance.
