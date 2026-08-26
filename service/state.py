@@ -25,8 +25,9 @@ from agent.graph_manager import GraphManager
 from agent.query_agent import QueryAgent
 from agent.research_store import ResearchStore
 from agent.retrieval import ChunkIndex, LocalHashingEmbedder
+from agent.session_summarizer import GeminiSessionSummarizer, SummarizeFn
 from agent.text_utils import entity_embedding_text
-from service.storage import PaperStore, SessionStore, UploadTokenStore
+from service.storage import PaperStore, SessionMessagesStore, SessionStore, UploadTokenStore
 
 
 @dataclass
@@ -46,6 +47,8 @@ class AppState:
     paper_store: PaperStore
     upload_tokens: UploadTokenStore
     session_store: SessionStore
+    session_messages_store: SessionMessagesStore
+    session_summarizer: SummarizeFn
     _embedder: LocalHashingEmbedder | None = None
 
     def __post_init__(self) -> None:
@@ -110,6 +113,7 @@ def build_state() -> AppState:
         ),
     )
     research_store = ResearchStore(chunks, graph)
+    session_summarizer = GeminiSessionSummarizer(project=project, location=location)
 
     return AppState(
         graph=graph,
@@ -127,4 +131,6 @@ def build_state() -> AppState:
         paper_store=PaperStore(db),
         upload_tokens=UploadTokenStore(db),
         session_store=SessionStore(db),
+        session_messages_store=SessionMessagesStore(db),
+        session_summarizer=session_summarizer,
     )

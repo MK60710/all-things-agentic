@@ -68,6 +68,35 @@ export async function deleteSession(sessionId: string): Promise<void> {
   }
 }
 
+export interface SessionMessagesResult {
+  // Left as opaque records here - lib/api.ts doesn't know page.tsx's own
+  // Message shape, and re-declaring/importing it here just to round-trip
+  // it back out would be redundant; callers cast to Message[] themselves.
+  messages: Record<string, unknown>[];
+  compacted: boolean;
+}
+
+export async function getSessionMessages(sessionId: string): Promise<SessionMessagesResult> {
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/messages`);
+  const data = await response.json() as SessionMessagesResult & { error?: string };
+  if (!response.ok) throw new Error(data.error ?? "Could not load this session's messages");
+  return data;
+}
+
+export async function saveSessionMessages(
+  sessionId: string,
+  messages: Record<string, unknown>[],
+): Promise<SessionMessagesResult> {
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ messages }),
+  });
+  const data = await response.json() as SessionMessagesResult & { error?: string };
+  if (!response.ok) throw new Error(data.error ?? "Could not save this session's messages");
+  return data;
+}
+
 export async function listPapersForSession(sessionId: string): Promise<PaperContext[]> {
   const response = await fetch(`/api/papers?session_id=${encodeURIComponent(sessionId)}`);
   const data = await response.json() as Array<{
