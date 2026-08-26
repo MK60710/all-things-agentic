@@ -3,7 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from agent.clarification_orchestrator import ClarificationOrchestrator
-from agent.graph_manager import GraphManager
+from agent.graph_manager import GraphManager, NodeSearchHit
 from agent.query_agent import QueryAgent
 from agent.retrieval import ChunkIndex
 from agent.schema import Edge, EdgeType, ExtractionChunk, Node, NodeType, ProvenanceTag
@@ -73,6 +73,40 @@ def test_graph_citation_leaves_page_blank_when_quote_matches_no_chunk(fake_db):
 
     assert result.citations[0].page_start is None
     assert result.citations[0].page_end is None
+
+
+def test_node_fallback_citation_borrows_provenance_from_an_incident_edge(fake_db):
+    """_citation_from_node fires when a matched node's incident edges were
+    all already cited via an earlier hit in the same query (or it has
+    none) - NodeSearchHit itself has no paper_id/section/page, so before
+    this fix the citation rendered with nothing but a name/description
+    and no source to check, even for a node with a real incident edge.
+    This is the fix: borrow paper/section/page from the first incident
+    edge that has one, purely for display."""
+    graph = _graph(fake_db)
+    agent = QueryAgent(ChunkIndex(), graph)
+    hit = NodeSearchHit(node_id="metric", score=1.0, name="Recall Metric", type="METRIC", description="A metric.")
+
+    citation = agent._citation_from_node(hit)
+
+    assert citation.paper_id == "paper-1"
+    assert citation.section == "Evaluation"
+    assert citation.node_ids == ["metric"]
+
+
+def test_node_fallback_citation_stays_blank_for_a_node_with_no_incident_edges(fake_db):
+    """A genuinely isolated node (no incident edges at all) has nothing to
+    borrow provenance from - must stay blank rather than erroring."""
+    graph = _graph(fake_db)
+    graph.add_node(Node(id="isolated", type=NodeType.CONCEPT, name="Isolated Concept"))
+    agent = QueryAgent(ChunkIndex(), graph)
+    hit = NodeSearchHit(node_id="isolated", score=1.0, name="Isolated Concept", type="CONCEPT", description="Alone.")
+
+    citation = agent._citation_from_node(hit)
+
+    assert citation.paper_id is None
+    assert citation.section is None
+    assert citation.page_start is None
 
 
 def test_low_relevance_graph_match_falls_back_to_chunk(fake_db):
