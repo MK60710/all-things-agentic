@@ -1037,12 +1037,9 @@ export default function Home() {
             <div className="welcome">
               <span className="welcome-icon"><Icon name="atlas" size={27}/></span>
               <h1>How can I help?</h1>
-              <p>Chat normally with Gemini, or add a research paper whenever you want to go deeper.</p>
+              <p>Ask Atlas anything, or take the tour to see how paper-grounded research works.</p>
               <div className="welcome-actions">
-                <button onClick={() => ask(undefined, "Help me understand how AI agents use memory")}>Explain a research topic</button>
-                <button onClick={() => ask(undefined, "Help me brainstorm a research question")}>Brainstorm with me</button>
-                <button onClick={() => openAddPaper()}><Icon name="paper" size={15}/>Add a paper</button>
-                <button className="welcome-tour-button" onClick={() => setTourOpen(true)}><Icon name="help" size={15}/>{tourSeen ? "Retake the tour" : "Take the tour"}</button>
+                <button type="button" className="welcome-tour-button" onClick={() => setTourOpen(true)}><Icon name="help" size={15}/>{tourSeen ? "Retake the tour" : "Take the tour"}</button>
               </div>
             </div>
           ) : (
