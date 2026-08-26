@@ -12,6 +12,7 @@ from pathlib import Path
 
 import requests
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse
 
 from service.deps import get_state, require_api_key
 from service.schemas import (
@@ -316,6 +317,19 @@ def get_paper_status(paper_id: str, state: AppState = Depends(get_state)) -> dic
     card without pulling the whole papers list on each tick."""
     paper = state.paper_store.get(paper_id)
     return {"status": paper.get("status", "unknown") if paper else "unknown"}
+
+
+@router.get("/{paper_id}/source", dependencies=[Depends(require_api_key)])
+def get_paper_source(paper_id: str, state: AppState = Depends(get_state)) -> FileResponse:
+    """Serve the session's stored PDF so graph/map paper links work for uploads."""
+    paper = state.paper_store.get(paper_id)
+    if paper is None:
+        raise HTTPException(status_code=404, detail="paper not found")
+    root = Path(state.upload_root).resolve()
+    path = (root / f"{_sanitize_paper_id(paper_id)}.pdf").resolve()
+    if not path.is_relative_to(root) or not path.is_file():
+        raise HTTPException(status_code=404, detail="paper source is not available")
+    return FileResponse(path, media_type="application/pdf", filename=f"{paper_id}.pdf")
 
 
 @router.post(
