@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import secrets
+import time
 import uuid
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
@@ -131,6 +132,13 @@ def _ingest(
     pdf_url: str | None = None,
     session_id: str | None = None,
 ) -> PaperIngestResponse:
+    started = time.monotonic()
+    logger.info(
+        "ingest_started paper_id=%s session_id=%s title=%r",
+        paper_id,
+        session_id or "",
+        title,
+    )
     metadata = dict(title=title, authors=authors, abstract=abstract, pdf_url=pdf_url)
     # guide=None invalidates any previously generated walkthrough on a
     # re-ingest of the same paper_id - stale content shouldn't be served
@@ -156,6 +164,14 @@ def _ingest(
         # guide rather than caching a walkthrough for a paper that never
         # successfully ingested.
         message = outcome.issue.message if outcome.issue else "extraction failed"
+        logger.error(
+            "ingest_failed paper_id=%s session_id=%s stage=%s error=%s duration_ms=%d",
+            paper_id,
+            session_id or "",
+            outcome.issue.stage if outcome.issue else "unknown",
+            message,
+            round((time.monotonic() - started) * 1000),
+        )
         state.paper_store.save(paper_id, **metadata, status="failed", error=message, session_id=session_id)
         raise HTTPException(status_code=422, detail=message)
 
@@ -176,6 +192,15 @@ def _ingest(
     guide_payload = guide.model_dump(mode="json") if guide is not None else None
     state.paper_store.save(
         paper_id, **metadata, status="ready", session_id=session_id, guide=guide_payload
+    )
+    logger.info(
+        "ingest_ready paper_id=%s session_id=%s entities=%d relations=%d guide=%s duration_ms=%d",
+        paper_id,
+        session_id or "",
+        len(outcome.result.entities),
+        len(outcome.result.relations),
+        guide is not None,
+        round((time.monotonic() - started) * 1000),
     )
 
     new_nodes: list[GraphVizNode] = []
