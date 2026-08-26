@@ -144,3 +144,40 @@ export interface PaperGuide {
   reading_time_minutes: number;
   sections: GuideSection[];
 }
+
+export interface DeepDiveSource {
+  text: string;
+  section?: string | null;
+  page_start?: number | null;
+  page_end?: number | null;
+}
+
+export interface DeepDiveSection extends GuideSection {
+  section_id: string;
+  sources: DeepDiveSource[];
+}
+
+export interface DeepDiveResponse {
+  paper_id: string;
+  title: string;
+  big_picture: string;
+  reading_time_minutes: number;
+  sections: DeepDiveSection[];
+}
+
+export interface PaperConnectionEvidence {
+  topic: string;
+  paper_id: string;
+  section?: string | null;
+  quote: string;
+}
+
+export interface PaperConnection {
+  paper_a_id: string;
+  paper_a_title: string;
+  paper_b_id: string;
+  paper_b_title: string;
+  summary: string;
+  shared_topics: string[];
+  evidence: PaperConnectionEvidence[];
+}

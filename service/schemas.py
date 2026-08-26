@@ -9,7 +9,7 @@ a client to know about Python dataclasses.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -57,6 +57,9 @@ class ChatRequest(BaseModel):
     # result - so QueryAgent skips text search/ambiguity detection and
     # evaluates that node directly.
     node_id: str | None = None
+    # Optional deep-dive scope. When present, chat uses only chunks whose
+    # extracted section matches this value and skips graph-wide evidence.
+    section: str | None = Field(default=None, max_length=500)
 
 
 class UploadTokenResponse(BaseModel):
@@ -86,6 +89,55 @@ class PaperMetadata(BaseModel):
     pdf_url: str | None = Field(default=None, alias="pdfUrl")
     status: str
     session_ids: list[str] = Field(default_factory=list)
+
+
+class DeepDiveSource(BaseModel):
+    text: str
+    section: str | None = None
+    page_start: int | None = None
+    page_end: int | None = None
+
+
+class DeepDiveSection(BaseModel):
+    section_id: str
+    title: str
+    plain_language: str
+    key_points: list[str] = Field(default_factory=list)
+    why_it_matters: str
+    page_start: int | None = None
+    page_end: int | None = None
+    diagram: Any | None = None
+    sources: list[DeepDiveSource] = Field(default_factory=list)
+
+
+class DeepDiveResponse(BaseModel):
+    paper_id: str
+    title: str
+    big_picture: str
+    reading_time_minutes: int
+    sections: list[DeepDiveSection] = Field(default_factory=list)
+
+
+class PaperConnectionEvidence(BaseModel):
+    topic: str
+    paper_id: str
+    section: str | None = None
+    quote: str = ""
+
+
+class PaperConnection(BaseModel):
+    paper_a_id: str
+    paper_a_title: str
+    paper_b_id: str
+    paper_b_title: str
+    summary: str
+    shared_topics: list[str] = Field(default_factory=list)
+    evidence: list[PaperConnectionEvidence] = Field(default_factory=list)
+
+
+class SessionPaperMapResponse(BaseModel):
+    session_id: str
+    connections: list[PaperConnection] = Field(default_factory=list)
 
 
 class SessionCreateRequest(BaseModel):

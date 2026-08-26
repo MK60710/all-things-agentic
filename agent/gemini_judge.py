@@ -109,7 +109,7 @@ def call_structured_judge(
                 return response_schema.model_validate_json(raw)
             except ValueError:
                 logger.warning(
-                    "judge_failed caller=%s stage=response_schema error_type=ValidationError model=%s",
+                    "judge_failed caller=%s stage=response_schema error_type=ValidationError schema validation failed model=%s",
                     caller_name,
                     model,
                     exc_info=True,
@@ -123,7 +123,7 @@ def call_structured_judge(
             )
         else:
             logger.warning(
-                "judge_failed caller=%s stage=empty_response model=%s",
+                "judge_failed caller=%s stage=empty_response empty response model=%s",
                 caller_name,
                 model,
             )
