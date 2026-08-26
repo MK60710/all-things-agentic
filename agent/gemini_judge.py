@@ -109,17 +109,34 @@ def call_structured_judge(
                 return response_schema.model_validate_json(raw)
             except ValueError:
                 logger.warning(
-                    "%s response failed schema validation", caller_name, exc_info=True
+                    "judge_failed caller=%s stage=response_schema error_type=ValidationError model=%s",
+                    caller_name,
+                    model,
+                    exc_info=True,
                 )
         elif truncated:
             logger.warning(
-                "%s response was truncated by max_output_tokens", caller_name
+                "judge_failed caller=%s stage=response_truncated model=%s max_output_tokens=%s",
+                caller_name,
+                model,
+                max_output_tokens,
             )
         else:
-            logger.warning("%s got an empty response", caller_name)
-    except Exception:
+            logger.warning(
+                "judge_failed caller=%s stage=empty_response model=%s",
+                caller_name,
+                model,
+            )
+    except Exception as exc:
         # Never let a Gemini outage/quota/config issue raise out of the
         # caller - every judge's fallback (a template, or just None)
         # must always be reachable.
-        logger.warning("%s call failed", caller_name, exc_info=True)
+        logger.warning(
+            "judge_failed caller=%s stage=model_call model=%s error_type=%s error=%s",
+            caller_name,
+            model,
+            type(exc).__name__,
+            str(exc),
+            exc_info=True,
+        )
     return None

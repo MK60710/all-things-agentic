@@ -7,6 +7,7 @@ Gemini in production, while tests can supply a deterministic stub.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable
 from typing import Protocol
 
@@ -18,6 +19,8 @@ from agent.document_ingestion import (
     PdfTextExtractor,
 )
 from agent.schema import ExtractionResult
+
+logger = logging.getLogger(__name__)
 
 
 class StructuredExtractor(Protocol):
@@ -93,6 +96,13 @@ class ExtractionAgent:
         try:
             document = self._document_extractor.extract(paper_id, pdf_path)
         except DocumentExtractionError as exc:
+            logger.warning(
+                "extraction_failed paper_id=%s stage=document_ingestion error_type=%s error=%s",
+                paper_id,
+                type(exc).__name__,
+                str(exc),
+                exc_info=True,
+            )
             issue = ExtractionIssue(
                 paper_id=paper_id,
                 stage="document_ingestion",
@@ -100,6 +110,12 @@ class ExtractionAgent:
             )
             return ExtractionOutcome(paper_id=paper_id, issue=issue)
         except Exception as exc:  # pragma: no cover - safety net
+            logger.exception(
+                "extraction_failed paper_id=%s stage=document_ingestion error_type=%s error=%s",
+                paper_id,
+                type(exc).__name__,
+                str(exc),
+            )
             issue = ExtractionIssue(
                 paper_id=paper_id,
                 stage="document_ingestion",
@@ -128,11 +144,23 @@ class ExtractionAgent:
                         "window(s) failed and were skipped; result is partial"
                     ),
                 )
+                logger.warning(
+                    "extraction_partial paper_id=%s stage=structured_extraction skipped_windows=%s",
+                    paper_id,
+                    result.skipped_windows,
+                )
                 return ExtractionOutcome(
                     paper_id=paper_id, document=document, result=result, issue=issue
                 )
             return ExtractionOutcome(paper_id=paper_id, document=document, result=result)
         except Exception as exc:
+            logger.exception(
+                "extraction_failed paper_id=%s stage=structured_extraction error_type=%s error=%s fail_closed=%s",
+                paper_id,
+                type(exc).__name__,
+                str(exc),
+                fail_closed,
+            )
             issue = ExtractionIssue(
                 paper_id=paper_id,
                 stage="structured_extraction",
