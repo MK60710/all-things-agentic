@@ -534,11 +534,34 @@ class QueryAgent:
             node_ids=[edge.source_id, edge.target_id],
         )
 
-    @staticmethod
-    def _citation_from_node(hit: NodeSearchHit) -> QueryCitation:
+    def _citation_from_node(self, hit: NodeSearchHit) -> QueryCitation:
+        """Used when a matched node's incident edges were all already
+        cited via an earlier hit in this same query (or it has none) -
+        NodeSearchHit itself carries no paper_id/section/page (it's a pure
+        search-result shape), so without this the citation rendered with
+        nothing but a name/description and no source to check, even
+        though the node's own incident edges usually still have real
+        provenance. Borrows paper_id/section/page from the first edge
+        that has one, purely for display - doesn't add that edge as its
+        own separate citation (which would just recreate the
+        already-cited duplicate this path exists to avoid)."""
+        paper_id = section = None
+        page_start = page_end = None
+        for edge in self._graph.get_incident_edges(hit.node_id):
+            if edge.source_paper_id:
+                paper_id = edge.source_paper_id
+                section = edge.source_section
+                page_start, page_end = self._resolve_page_from_quote(
+                    edge.source_paper_id, edge.source_quote or ""
+                )
+                break
         return QueryCitation(
             source_kind="graph",
+            paper_id=paper_id,
             text=f"{hit.name}: {hit.description}",
+            section=section,
+            page_start=page_start,
+            page_end=page_end,
             node_ids=[hit.node_id],
         )
 
