@@ -29,7 +29,7 @@ import ConvergenceRitual from "./ConvergenceRitual";
 import GraphExplorer from "./GraphExplorer";
 import Tour, { TourStep } from "./Tour";
 
-type IconName = "atlas" | "plus" | "send" | "paper" | "search" | "upload" | "close" | "quote" | "check" | "globe" | "thumbUp" | "thumbDown" | "rename" | "graph" | "help";
+type IconName = "atlas" | "plus" | "send" | "paper" | "search" | "upload" | "close" | "quote" | "check" | "globe" | "thumbUp" | "thumbDown" | "rename" | "graph" | "help" | "quiz";
 type AddMode = "choose" | "upload" | "search";
 
 interface Message {
@@ -63,6 +63,15 @@ interface Message {
   clarifications?: PendingQuestion[];
   gaps?: GapCandidate[];
   feedbackGiven?: boolean;
+  // Set by the standalone "Test yourself" trigger (openFeynmanCheck) -
+  // previously Feynman Check only ever appeared as the forced last stop
+  // of Guided Reading, with no other entry point anywhere in the app
+  // (confirmed live via a fresh-user audit: a user who skims the guide
+  // and jumps straight to chat, a completely normal path, never sees it
+  // exists). feynmanPickPaper is set instead when the session has more
+  // than one paper and none has been chosen yet for this quiz message.
+  feynmanPaperId?: string;
+  feynmanPickPaper?: boolean;
 }
 
 function gapKey(candidate: { node_a_id: string; node_b_id: string }) {
@@ -84,6 +93,29 @@ const INGEST_STAGE_LABELS: Record<string, string> = {
   extracting: "Extracting…",
 };
 
+// Two distinct citations can render the same visible label - confirmed
+// live: "2. Background · p. 2" and "2 Background · p. 2" back to back,
+// same paper/page, section title differing only by a stray period that
+// extraction isn't consistent about. Both stay real, separate evidence in
+// message.citations (their own quotes aren't lost); this only collapses
+// what looks like the same source appearing twice in this one list, same
+// content-based approach as GraphExplorer's connections dedup.
+function citationDedupeKey(citation: Citation, index: number): string {
+  const normalizedSection = (citation.section ?? "").toLowerCase().trim().replace(/^(\d+)\.\s*/, "$1 ");
+  if (!citation.paper_id && !normalizedSection && citation.page_start == null) return `unkeyed-${index}`;
+  return `${citation.paper_id ?? ""}:${normalizedSection}:${citation.page_start ?? ""}:${citation.page_end ?? ""}`;
+}
+
+function dedupeCitations(citations: Citation[]): Citation[] {
+  const seen = new Set<string>();
+  return citations.filter((citation, index) => {
+    const key = citationDedupeKey(citation, index);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 function ingestStageLabel(stage: string | undefined): string {
   return (stage && INGEST_STAGE_LABELS[stage]) || "Reading…";
 }
@@ -104,6 +136,7 @@ const icons: Record<IconName, React.ReactNode> = {
   rename: <path d="M12 20h9M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/>,
   graph: <><circle cx="6" cy="6" r="2.6"/><circle cx="18" cy="6" r="2.6"/><circle cx="12" cy="18" r="2.6"/><path d="M8.3 6.7L15.7 6.7M7.4 8.2L10.6 15.8M16.6 8.2L13.4 15.8"/></>,
   help: <><circle cx="12" cy="12" r="9"/><path d="M9.1 9a3 3 0 1 1 4.6 2.6c-.9.5-1.7 1.1-1.7 2.4"/><path d="M12 17.5h.01"/></>,
+  quiz: <><path d="M9 21h6M10 18h4M8.5 12.5A5 5 0 1 1 15.5 12.5c-.7 1-1.5 1.6-1.5 3H10c0-1.4-.8-2-1.5-3Z"/></>,
 };
 
 function Icon({ name, size = 19 }: { name: IconName; size?: number }) {
@@ -509,6 +542,36 @@ export default function Home() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [sessionMenuOpen, addOpen, graphExplorerOpen, createSessionOpen]);
   useEffect(() => {
+    // Neither modal had a focus trap - confirmed live: tabbing past
+    // Cancel escaped the dialog entirely into background page elements
+    // (once landing on a "Remove paper" chip hidden behind the still-open
+    // modal), leaving a keyboard-only user acting on content they can't
+    // see is focused. Both modals share the same .add-modal/.modal-card
+    // markup and are never open at the same time, so one shared trap
+    // covers both rather than duplicating this per modal.
+    if (!addOpen && !createSessionOpen) return;
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key !== "Tab") return;
+      const modal = document.querySelector(".add-modal .modal-card");
+      if (!modal) return;
+      const focusable = modal.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+      );
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [addOpen, createSessionOpen]);
+  useEffect(() => {
     if (!sessionMenuOpen) return;
     function onMouseDown(event: MouseEvent) {
       if (sessionSwitcherRef.current?.contains(event.target as Node)) return;
@@ -807,6 +870,16 @@ export default function Home() {
     }
   }
 
+  function openFeynmanCheck() {
+    if (papers.length === 0) return;
+    const id = crypto.randomUUID();
+    if (papers.length === 1) {
+      setMessages((current) => [...current, { id, role: "assistant", text: "", feynmanPaperId: papers[0].id }]);
+    } else {
+      setMessages((current) => [...current, { id, role: "assistant", text: "Which paper do you want to be quizzed on?", feynmanPickPaper: true }]);
+    }
+  }
+
   function openAddPaper(mode: AddMode = "choose") {
     setSessionMenuOpen(false);
     setAddMode(mode);
@@ -1024,6 +1097,13 @@ export default function Home() {
             </div>}
           </div>
           <button
+            className="feynman-check-toggle"
+            onClick={openFeynmanCheck}
+            disabled={papers.length === 0}
+            title={papers.length === 0 ? "Add a paper to test your understanding of it" : "Explain a paper's idea back in your own words, graded against its real evidence"}
+            aria-label="Test yourself"
+          ><Icon name="quiz" size={17}/></button>
+          <button
             className="graph-explorer-toggle"
             onClick={() => setGraphExplorerOpen(true)}
             disabled={papers.length === 0}
@@ -1066,7 +1146,8 @@ export default function Home() {
                 if (message.clarification) findingsSummaryParts.push("1 possible duplicate");
                 else if (message.clarifications?.length) findingsSummaryParts.push(`${message.clarifications.length} possible duplicates`);
                 if (hasVisibleGapContent) findingsSummaryParts.push(`${visibleGaps!.length} thing${visibleGaps!.length === 1 ? "" : "s"} worth exploring`);
-                const feedbackNodeId = message.citations?.[0]?.source_kind === "graph" ? message.citations[0].node_ids?.[0] : undefined;
+                const dedupedCitations = message.citations ? dedupeCitations(message.citations) : undefined;
+                const feedbackNodeId = dedupedCitations?.[0]?.source_kind === "graph" ? dedupedCitations[0].node_ids?.[0] : undefined;
                 const isGuideMessage = Boolean(message.guide || message.guideLoading);
 
                 return <article key={message.id} className={`message ${message.role} ${message.notice ? "notice" : ""} ${isGuideMessage ? "guide-message" : ""}`}>
@@ -1077,14 +1158,16 @@ export default function Home() {
                     {message.guideLoading && <div className="guide-building"><span/><div><strong>Building your guided reading</strong><small>Finding the paper's structure, simplifying each section, and drawing useful visual explanations…</small></div></div>}
                     {message.guide && <GuidedReading guide={message.guide} paperId={message.paperId} sessionId={currentSession?.id} onViewNodeInGraph={viewNodeInGraph}/>}
                     {message.guideError && <span className="guide-error">{message.guideError}</span>}
+                    {message.feynmanPickPaper && <div className="candidate-list">{papers.map((p) => <button key={p.id} onClick={() => setMessages((current) => current.map((m) => m.id === message.id ? { ...m, feynmanPickPaper: false, feynmanPaperId: p.id } : m))}><strong>{p.title}</strong></button>)}</div>}
+                    {message.feynmanPaperId && currentSession?.id && <FeynmanCheck paperId={message.feynmanPaperId} sessionId={currentSession.id} onViewNodeInGraph={viewNodeInGraph}/>}
                     {message.retrievalMode === "vector" && <span className="not-graph-note"><Icon name="globe" size={11}/>From the paper's text directly, not yet verified against the knowledge graph</span>}
-                    {message.confidence === "low" && <span className="confidence-note">Low-confidence match: check the sources below.</span>}
+                    {message.confidence === "low" && <span className="confidence-note" title="The best matching source for this answer scored below Atlas's confidence threshold, so it's worth double-checking against the sources below.">Low-confidence match: check the sources below.</span>}
                     {message.candidates && message.candidates.length > 0 && <div className="candidate-list">{message.candidates.map((candidate) => <button key={candidate.node_id} onClick={() => selectCandidate(candidate, message.clarificationQuestionId)}><strong>{candidate.name}</strong><small>{candidate.type}</small>{candidate.description && <p>{candidate.description}</p>}</button>)}</div>}
-                    {message.citations && message.citations.length > 0 && <div className="citations">{message.citations.map((citation, index) => {
+                    {dedupedCitations && dedupedCitations.length > 0 && <div className="citations">{dedupedCitations.map((citation, index) => {
                       const key = `${message.id}-${index}`;
                       const graphNodeId = citation.source_kind === "graph" ? citation.node_ids?.[0] : undefined;
                       return <div key={key}>
-                        <button onClick={() => setExpandedCitation(expandedCitation === key ? null : key)}><Icon name="quote" size={13}/>{citation.section ?? "Source"} · p. {citation.page_start ?? "-"}</button>
+                        <button onClick={() => setExpandedCitation(expandedCitation === key ? null : key)}><Icon name="quote" size={13}/>{citation.section ?? "Source"}{citation.page_start != null && ` · p. ${citation.page_start}`}</button>
                         {graphNodeId && <button className="citation-view-graph" onClick={() => viewNodeInGraph(graphNodeId)} title="View this node in the graph"><Icon name="graph" size={12}/>View in graph</button>}
                         {expandedCitation === key && <blockquote>“{citation.text}”</blockquote>}
                       </div>;
@@ -1162,7 +1245,7 @@ export default function Home() {
       </footer>
 
       {addOpen && <div className="add-modal" role="dialog" aria-modal="true" aria-label="Add a research paper">
-        <button className="modal-scrim" onClick={() => setAddOpen(false)} aria-label="Close"/>
+        <div className="modal-scrim" onClick={() => setAddOpen(false)} aria-hidden="true"/>
         <section className={`modal-card ${buildingGraphQueue.length > 0 ? "modal-card-fullscreen" : ""}`}>
           <header><div><span><Icon name="paper" size={18}/></span><div><strong>Add a research paper</strong><small>Give Gemini a paper to read with you</small></div></div><button onClick={() => setAddOpen(false)} aria-label="Close"><Icon name="close" size={19}/></button></header>
 
@@ -1208,7 +1291,7 @@ export default function Home() {
         </section>
       </div>}
       {createSessionOpen && <div className="add-modal" role="dialog" aria-modal="true" aria-label="New session">
-        <button className="modal-scrim" onClick={() => setCreateSessionOpen(false)} aria-label="Close"/>
+        <div className="modal-scrim" onClick={() => setCreateSessionOpen(false)} aria-hidden="true"/>
         <section className="modal-card">
           <header><div><span><Icon name="graph" size={18}/></span><div><strong>New session</strong><small>Each session keeps its own papers and graph</small></div></div><button onClick={() => setCreateSessionOpen(false)} aria-label="Close"><Icon name="close" size={19}/></button></header>
           <form className="create-session-form" onSubmit={submitCreateSession}>
