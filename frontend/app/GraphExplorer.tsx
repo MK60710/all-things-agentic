@@ -172,7 +172,7 @@ export default function GraphExplorer({
   const connections = useMemo(() => {
     if (!selectedNode) return [];
     const seen = new Set<string>();
-    const deduped: { edgeId: string; relation: string; name: string; direction: "outgoing" | "incoming" }[] = [];
+    const deduped: { edgeId: string; relation: string; name: string; otherId: string; direction: "outgoing" | "incoming" }[] = [];
     for (const e of edges) {
       if (e.source_id !== selectedNode.node_id && e.target_id !== selectedNode.node_id) continue;
       // Direction matters for the sentence, not just cosmetics: "A
@@ -196,7 +196,7 @@ export default function GraphExplorer({
       const key = `${direction}:${relationPhrase(e.relation)}:${name}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      deduped.push({ edgeId: e.edge_id, relation: e.relation, name, direction });
+      deduped.push({ edgeId: e.edge_id, relation: e.relation, name, otherId, direction });
     }
     return deduped;
   }, [selectedNode, edges, nodes]);
@@ -270,6 +270,15 @@ export default function GraphExplorer({
     // the node's own x/y (only d3-force's live simulation state has that,
     // not the plain SessionGraphNode this component keeps in React state).
     fgRef.current?.zoomToFit(600, 140, (n: { id: string }) => n.id === node.node_id);
+  }
+
+  function verificationQuestion(node: SessionGraphNode, other?: SessionGraphNode, relation?: string) {
+    const evidence = [node, other]
+      .filter((item): item is SessionGraphNode => Boolean(item))
+      .flatMap((item) => item.citations.slice(0, 2).map((citation) => `${item.name} (${citation.section ?? "paper"}): “${citation.source_quote}”`))
+      .join("\n");
+    const relationship = other ? ` between "${node.name}" and "${other.name}"${relation ? ` (${relationPhrase(relation)})` : ""}` : ` about "${node.name}"`;
+    return `Verify the graph relationship${relationship} against the paper source. Treat graph links as hypotheses, not established facts. Explain whether the cited paper text directly supports the relationship, and say clearly if the evidence is insufficient.${evidence ? `\nGraph source evidence:\n${evidence}` : ""}`;
   }
 
   if (!active) return null;
@@ -442,7 +451,7 @@ export default function GraphExplorer({
             )}
             <button
               className="graph-explorer-ask"
-              onClick={() => onAskInChat(`What do you know about "${selectedNode.name}"?`)}
+              onClick={() => onAskInChat(verificationQuestion(selectedNode))}
             >
               Ask about this in chat
             </button>
@@ -454,9 +463,7 @@ export default function GraphExplorer({
                 <button
                   key={c.edgeId}
                   className="graph-explorer-connection"
-                  onClick={() => onAskInChat(
-                    `How does "${selectedNode.name}" relate to "${c.name}"? (${relationPhrase(c.relation)})`,
-                  )}
+                  onClick={() => onAskInChat(verificationQuestion(selectedNode, nodes.find((n) => n.node_id === c.otherId), c.relation))}
                 >
                   {c.direction === "outgoing"
                     ? <><strong>{selectedNode.name}</strong> {relationPhrase(c.relation)} <strong>{c.name}</strong></>
