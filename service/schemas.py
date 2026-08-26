@@ -11,7 +11,9 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+import json
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agent.clarification_orchestrator import (
     EntityMergeQuestion,
@@ -101,6 +103,52 @@ class SessionMetadata(BaseModel):
     name: str
     created_at: str
     goal: str | None = None
+
+
+# Every other request-body field in this file caps its size (query/text/
+# message at max_length=8000, goal at 300, etc.) - a plain dict has no
+# such per-field ceiling to lean on, so SessionMessagesRequest enforces
+# its own total-size cap explicitly instead of silently being the one
+# unbounded field in the whole schema.
+#
+# Kept just under Firestore's real ~1MiB per-document limit (not a much
+# larger "reject clearly-abusive payloads" number) on purpose: over the
+# 800KB compaction threshold (see save_session_messages), the ORIGINAL
+# array gets archived verbatim before being replaced - if this ceiling
+# were allowed to sit far above Firestore's real cap, an oversized-but
+# -under-this-limit payload could pass validation, trigger compaction,
+# and then have the archive write itself fail against Firestore's actual
+# limit (a different, larger failure than the one this ceiling exists to
+# prevent). Staying under Firestore's cap here means that can't happen -
+# anything this validator accepts is provably small enough to archive.
+_MAX_MESSAGES_REQUEST_BYTES = 950_000
+
+
+class SessionMessagesRequest(BaseModel):
+    # Deliberately list[dict], not a typed Message model - the frontend's
+    # own Message shape (frontend/app/page.tsx) has ~19 fields covering
+    # guide content, citations, clarification cards, comprehension-check
+    # state, etc., and this store's whole job is to persist that rich
+    # client shape opaquely, not re-validate/narrow it server-side.
+    # max_length is a sanity ceiling on item count, not the real per-byte
+    # guard - see the field_validator below for that.
+    messages: list[dict] = Field(default_factory=list, max_length=2000)
+
+    @field_validator("messages")
+    @classmethod
+    def messages_must_stay_under_size_ceiling(cls, value: list[dict]) -> list[dict]:
+        size = len(json.dumps(value).encode("utf-8"))
+        if size > _MAX_MESSAGES_REQUEST_BYTES:
+            raise ValueError(
+                f"messages payload is {size} bytes, over the "
+                f"{_MAX_MESSAGES_REQUEST_BYTES} byte limit"
+            )
+        return value
+
+
+class SessionMessagesResponse(BaseModel):
+    messages: list[dict] = Field(default_factory=list)
+    compacted: bool = False
 
 
 class FeedbackRequest(BaseModel):
