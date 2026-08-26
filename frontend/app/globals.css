@@ -183,6 +183,7 @@ input[type="checkbox"] { accent-color:var(--violet); }
 @media (prefers-reduced-motion:reduce) { *,*::before,*::after { animation-duration:.01ms!important; animation-iteration-count:1!important; transition-duration:.01ms!important; } }
 
 /* ---------- Dedicated deep-dive workspace ---------- */
+.beta-tag,.paper-map-toggle em,.deep-dive-launch em,.deep-dive-header em { display:inline-block; margin-left:5px; padding:2px 5px; color:#a76018; border:1px solid #e5a14f; border-radius:999px; background:#fff4e4; font-family:inherit; font-size:8px; font-style:normal; font-weight:800; letter-spacing:.06em; line-height:1.2; vertical-align:middle; }
 .deep-dive-app { height:100vh; overflow:hidden; }
 .deep-dive-layout { overflow:hidden; }
 .deep-dive-reading { min-height:0; overflow-y:auto; }
