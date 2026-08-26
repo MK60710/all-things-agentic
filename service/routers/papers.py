@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import re
-
 import logging
 import os
 import re
@@ -42,6 +40,16 @@ _UNSAFE_PAPER_ID_CHARS = re.compile(r"[^A-Za-z0-9._-]")
 _ARXIV_ID = re.compile(
     r"^(?:\d{4}\.\d{4,5}|[A-Za-z][A-Za-z0-9.-]*/\d{7})(?:v\d+)?$"
 )
+
+
+def _deep_dive_source_text(text: str, section_title: str, index: int) -> str:
+    """Make common PDF layout artifacts less confusing in the source view."""
+    if index == 0 and "introduction" in section_title.lower():
+        start = text.find("With language models now serving")
+        if start >= 0:
+            text = text[start:]
+    text = re.sub(r"(?:\s*[✅❌]){2,}", " [figure response markers]", text)
+    return text.strip()
 
 
 def _sanitize_paper_id(raw: str) -> str:
@@ -503,7 +511,7 @@ def get_paper_deep_dive(
                 diagram=section.diagram,
                 sources=[
                     DeepDiveSource(
-                        text=chunk.text,
+                        text=_deep_dive_source_text(chunk.text, section.title, index),
                         section=chunk.section,
                         page_start=chunk.page_start,
                         page_end=chunk.page_end,
