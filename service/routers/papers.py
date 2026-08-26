@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 import logging
 import os
 import re
@@ -467,6 +469,20 @@ def get_paper_deep_dive(
     sections: list[DeepDiveSection] = []
     for index, section in enumerate(guide.sections):
         section_chunks = [chunk for chunk in chunks if chunk.section == section.title]
+        if not section_chunks:
+            guide_words = {
+                word
+                for word in re.findall(r"[a-z0-9]+", section.title.lower())
+                if len(word) > 3 and word not in {"and", "the", "for", "with"}
+            }
+            section_chunks = [
+                chunk
+                for chunk in chunks
+                if chunk.section
+                and guide_words.intersection(
+                    re.findall(r"[a-z0-9]+", chunk.section.lower())
+                )
+            ]
         if not section_chunks and section.page_start is not None:
             section_chunks = [
                 chunk
