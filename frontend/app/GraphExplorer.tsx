@@ -76,6 +76,7 @@ export default function GraphExplorer({
   const [contradictionMessage, setContradictionMessage] = useState<string | null>(null);
   const [exportingCitations, setExportingCitations] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
+  const [nodeSearch, setNodeSearch] = useState("");
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const fgRef = useRef<any>(null);
 
@@ -254,6 +255,23 @@ export default function GraphExplorer({
     });
   }
 
+  const MAX_SEARCH_RESULTS = 8;
+  const searchResults = useMemo(() => {
+    const query = nodeSearch.trim().toLowerCase();
+    if (!query) return [];
+    return nodes.filter((n) => n.name.toLowerCase().includes(query)).slice(0, MAX_SEARCH_RESULTS);
+  }, [nodeSearch, nodes]);
+
+  function selectSearchResult(node: SessionGraphNode) {
+    setSelectedNode(node);
+    setNodeSearch("");
+    // Same zoomToFit already used for the initial-load camera fit, just
+    // scoped to this one node via its filter argument - no need to read
+    // the node's own x/y (only d3-force's live simulation state has that,
+    // not the plain SessionGraphNode this component keeps in React state).
+    fgRef.current?.zoomToFit(600, 140, (n: { id: string }) => n.id === node.node_id);
+  }
+
   if (!active) return null;
 
   return (
@@ -267,6 +285,36 @@ export default function GraphExplorer({
             )}
           </div>
           <p className="graph-explorer-subtitle">Every dot is something from your papers - a method, a result, an idea. Click one to read about it and see what it connects to.</p>
+        </div>
+        <div className="graph-explorer-search">
+          <input
+            type="text"
+            value={nodeSearch}
+            onChange={(event) => setNodeSearch(event.target.value)}
+            onKeyDown={(event) => {
+              // Only intercept Escape when there's actually a query to
+              // clear - otherwise let it bubble to page.tsx's own Escape
+              // handler so Graph Explorer still closes when focus happens
+              // to be sitting in this (already-empty) input.
+              if (event.key === "Escape" && nodeSearch) { event.stopPropagation(); setNodeSearch(""); }
+            }}
+            placeholder="Find a node by name…"
+            aria-label="Find a node by name"
+          />
+          {searchResults.length > 0 && (
+            <div className="graph-explorer-search-results">
+              {searchResults.map((n) => (
+                <button key={n.node_id} onClick={() => selectSearchResult(n)}>
+                  <span style={{ background: TYPE_COLORS[n.type] ?? DEFAULT_NODE_COLOR }} aria-hidden="true"/>
+                  <strong>{n.name}</strong>
+                  <small>{typeLabel(n.type)}</small>
+                </button>
+              ))}
+            </div>
+          )}
+          {nodeSearch.trim() && searchResults.length === 0 && (
+            <div className="graph-explorer-search-results graph-explorer-search-empty"><small>No matches.</small></div>
+          )}
         </div>
         <button className="graph-explorer-close" onClick={onClose} aria-label="Close graph explorer">×</button>
       </div>
