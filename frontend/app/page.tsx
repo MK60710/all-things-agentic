@@ -12,7 +12,6 @@ import {
   getFeynmanPrompts,
   getPaperStatus,
   ingestArxivPaper,
-  listClarifications,
   listGaps,
   listPapersForSession,
   listSessions,
@@ -561,7 +560,7 @@ export default function Home() {
     const freshGapKeys = new Set<string>();
     if (savedMessages) {
       try {
-        restoredMessages = JSON.parse(savedMessages) as Message[];
+        restoredMessages = (JSON.parse(savedMessages) as Message[]).map(({ clarification: _clarification, clarifications: _clarifications, ...message }) => message);
         // Seed the dedup trackers directly from restored history (not from
         // messages state, which won't have committed yet) so checkGuidance
         // below doesn't re-post a clarification/gap card that's already
@@ -666,20 +665,6 @@ export default function Home() {
   // toast for something the user didn't ask for is not - both halves fail
   // silently and independently.
   async function checkGuidance() {
-    let clarification: PendingQuestion | undefined;
-    let clarifications: PendingQuestion[] | undefined;
-    try {
-      const questions = await listClarifications(sessionIdRef.current || undefined);
-      const fresh = questions.filter((q) => q.status === "open" && !shownClarificationIds.current.has(q.id));
-      fresh.forEach((q) => shownClarificationIds.current.add(q.id));
-      if (fresh.length === 1) clarification = fresh[0];
-      // More than one at once reads as a wall of doubt-cards, not a
-      // partner asking a smart question - one compact batched card
-      // instead of N full message bubbles.
-      else if (fresh.length > 1) clarifications = fresh;
-    } catch {
-      // silent
-    }
     let gaps: GapCandidate[] | undefined;
     try {
       const fresh = (await listGaps(3, sessionIdRef.current || undefined)).filter(
@@ -692,10 +677,10 @@ export default function Home() {
     }
     // One combined, collapsed-by-default card instead of up to two
     // separate full-content messages - see expandedFindings above for why.
-    if (clarification || clarifications || gaps) {
+    if (gaps) {
       setMessages((current) => [
         ...current,
-        { id: crypto.randomUUID(), role: "assistant" as const, text: "", notice: true, clarification, clarifications, gaps },
+        { id: crypto.randomUUID(), role: "assistant" as const, text: "", notice: true, gaps },
       ]);
     }
   }
