@@ -25,7 +25,8 @@ export default function DeepDivePage({ params, searchParams }: { params: Promise
   }, [paperId]);
   useEffect(() => {
     if (!deepDive) return;
-    searchPapers(deepDive.title).then((papers) => setRelatedPapers(papers.filter((paper) => paper.id !== deepDive.paper_id).slice(0, 4))).catch(() => setRelatedPapers([]));
+    const canonicalId = deepDive.paper_id.replace(/^arxiv-/, "").toLowerCase();
+    searchPapers(deepDive.title).then((papers) => setRelatedPapers(papers.filter((paper) => paper.id.replace(/^arxiv:/, "").toLowerCase() !== canonicalId).slice(0, 4))).catch(() => setRelatedPapers([]));
   }, [deepDive]);
 
   const section = deepDive?.sections[sectionIndex];
