@@ -1,4 +1,4 @@
-import type { ContradictionCandidate, FeynmanCheckResult, FeynmanPrompt, GapCandidate, GraphVizEdge, GraphVizNode, PaperGuide, PendingQuestion, QueryResponse, SessionGraphEdge, SessionGraphNode } from "./types";
+import type { ContradictionCandidate, DeepDiveResponse, FeynmanCheckResult, FeynmanPrompt, GapCandidate, GraphVizEdge, GraphVizNode, PaperConnection, PaperGuide, PendingQuestion, QueryResponse, SessionGraphEdge, SessionGraphNode } from "./types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL;
 
@@ -102,12 +102,13 @@ export async function askAssistant(
   goal?: string | null,
   nodeId?: string,
   sessionId?: string,
+  section?: string,
 ): Promise<QueryResponse> {
   const paperIds = papers?.map((paper) => paper.id) ?? [];
   const response = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message, history, paper_ids: paperIds, goal: goal || undefined, node_id: nodeId, session_id: sessionId }),
+    body: JSON.stringify({ message, history, paper_ids: paperIds, goal: goal || undefined, node_id: nodeId, session_id: sessionId, section: section || undefined }),
   });
 
   const data = await response.json() as Partial<QueryResponse> & { error?: string };
@@ -203,6 +204,13 @@ export async function buildPaperGuide(paperId: string): Promise<PaperGuide> {
   return data;
 }
 
+export async function getPaperDeepDive(paperId: string): Promise<DeepDiveResponse> {
+  const response = await fetch(`/api/papers/${encodeURIComponent(paperId)}/deep-dive`, { cache: "no-store" });
+  const data = await response.json() as DeepDiveResponse & { error?: string };
+  if (!response.ok) throw new Error(data.error ?? "Could not open the deep dive");
+  return data;
+}
+
 export async function searchPapers(query: string): Promise<PaperSearchResult[]> {
   const response = await fetch(`/api/papers/search?q=${encodeURIComponent(query)}`);
   const data = await response.json() as { papers: PaperSearchResult[]; error?: string };
@@ -243,6 +251,13 @@ export async function getSessionGraph(
   const data = await response.json() as { nodes: SessionGraphNode[]; edges: SessionGraphEdge[]; error?: string };
   if (!response.ok) throw new Error(data.error ?? "Could not load the graph");
   return data;
+}
+
+export async function getSessionPaperMap(sessionId: string): Promise<PaperConnection[]> {
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/paper-map`, { cache: "no-store" });
+  const data = await response.json() as { connections: PaperConnection[]; error?: string };
+  if (!response.ok) throw new Error(data.error ?? "Could not map paper connections");
+  return data.connections;
 }
 
 export async function getSessionBibliography(sessionId: string): Promise<string> {

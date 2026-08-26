@@ -28,6 +28,7 @@ import GraphBuildAnimation from "./GraphBuildAnimation";
 import ConvergenceRitual from "./ConvergenceRitual";
 import GraphExplorer from "./GraphExplorer";
 import Tour, { TourStep } from "./Tour";
+import PaperMap from "./PaperMap";
 
 type IconName = "atlas" | "plus" | "send" | "paper" | "search" | "upload" | "close" | "quote" | "check" | "globe" | "thumbUp" | "thumbDown" | "rename" | "graph" | "help";
 type AddMode = "choose" | "upload" | "search";
@@ -207,6 +208,7 @@ function GuidedReading({ guide, paperId, sessionId, onViewNodeInGraph }: { guide
   // that matches the nav action (Next/a later dot slides in from the
   // right, Back/an earlier dot from the left) instead of a flat cut.
   const [direction, setDirection] = useState<1 | -1>(1);
+  const [quizOpen, setQuizOpen] = useState(false);
   const stop = stops[stopIndex];
   const isLastStop = stopIndex === stops.length - 1;
 
@@ -256,7 +258,13 @@ function GuidedReading({ guide, paperId, sessionId, onViewNodeInGraph }: { guide
       <button type="button" onClick={() => goTo(stopIndex - 1)} disabled={stopIndex === 0}>← Back</button>
       {isLastStop ? (
         paperId && sessionId ? (
-          <FeynmanCheck paperId={paperId} sessionId={sessionId} onViewNodeInGraph={onViewNodeInGraph}/>
+          quizOpen ? <FeynmanCheck paperId={paperId} sessionId={sessionId} onViewNodeInGraph={onViewNodeInGraph}/> : (
+            <div className="guide-complete">
+              <div className="guide-complete-bar"><i/></div>
+              <div className="guide-complete-copy"><span className="guide-complete-check"><Icon name="check" size={13}/></span><small>Walkthrough complete. Test your understanding if you’d like.</small></div>
+              <button type="button" className="optional-quiz-button" onClick={() => setQuizOpen(true)}>Take the optional quiz</button>
+            </div>
+          )
         ) : (
           <div className="guide-complete">
             <div className="guide-complete-bar"><i/></div>
@@ -431,6 +439,7 @@ export default function Home() {
   // one global flag blocking every other result while it's in progress.
   const [ingestingIds, setIngestingIds] = useState<Set<string>>(new Set());
   const [graphExplorerOpen, setGraphExplorerOpen] = useState(false);
+  const [paperMapOpen, setPaperMapOpen] = useState(false);
   const [tourOpen, setTourOpen] = useState(false);
   const [tourSeen, setTourSeen] = useState(false);
   const [graphFocusNodeId, setGraphFocusNodeId] = useState<string | null>(null);
@@ -993,6 +1002,7 @@ export default function Home() {
     <main className="assistant-app">
       <ConvergenceRitual entries={convergenceEntries} active={ingestingIds.size > 0} onSkip={() => {}}/>
       <GraphExplorer sessionId={currentSession?.id ?? null} sessionName={currentSession?.name} active={graphExplorerOpen} onClose={() => setGraphExplorerOpen(false)} onAskInChat={askFromGraphExplorer} focusNodeId={graphFocusNodeId} papers={papers}/>
+      <PaperMap sessionId={currentSession?.id ?? null} active={paperMapOpen} onClose={() => setPaperMapOpen(false)}/>
       <Tour steps={ATLAS_TOUR_STEPS} active={tourOpen} onClose={() => { setTourOpen(false); setTourSeen(true); }}/>
       <header className="app-header">
         <div className="brand"><span><Icon name="atlas" size={21}/></span><strong>Atlas</strong></div>
@@ -1030,6 +1040,7 @@ export default function Home() {
             title={papers.length === 0 ? "Add a paper to explore its graph" : "Explore this session's knowledge graph"}
             aria-label="Open graph explorer"
           ><Icon name="graph" size={17}/></button>
+          <button className="paper-map-toggle" onClick={() => setPaperMapOpen(true)} disabled={papers.length < 2} title={papers.length < 2 ? "Add at least two papers to map connections" : "Map connections between this session's papers"} aria-label="Map paper connections"><Icon name="graph" size={15}/><span>Map papers</span></button>
           <button className="tour-help-button" onClick={() => setTourOpen(true)} title="Replay the walkthrough" aria-label="Replay the walkthrough"><Icon name="help" size={17}/></button>
           <button className="add-paper-button" onClick={() => openAddPaper()}><Icon name="plus" size={17}/>{papers.length ? "Add another" : "Add paper"}</button>
         </div>
@@ -1076,6 +1087,7 @@ export default function Home() {
                     {message.text && <p>{message.text}</p>}
                     {message.guideLoading && <div className="guide-building"><span/><div><strong>Building your guided reading</strong><small>Finding the paper's structure, simplifying each section, and drawing useful visual explanations…</small></div></div>}
                     {message.guide && <GuidedReading guide={message.guide} paperId={message.paperId} sessionId={currentSession?.id} onViewNodeInGraph={viewNodeInGraph}/>}
+                    {message.guide && message.paperId && <button type="button" className="deep-dive-launch" onClick={() => window.location.assign(`/deep-dive/${encodeURIComponent(message.paperId!)}?session_id=${encodeURIComponent(currentSession?.id ?? "local")}`)}><strong>Open deeper dive</strong><small>Explore the full paper text with a section tutor.</small></button>}
                     {message.guideError && <span className="guide-error">{message.guideError}</span>}
                     {message.retrievalMode === "vector" && <span className="not-graph-note"><Icon name="globe" size={11}/>From the paper's text directly, not yet verified against the knowledge graph</span>}
                     {message.confidence === "low" && <span className="confidence-note">Low-confidence match: check the sources below.</span>}

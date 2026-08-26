@@ -284,6 +284,7 @@ class ChunkIndex:
         *,
         limit: int = 5,
         paper_ids: set[str] | None = None,
+        section: str | None = None,
         min_score: float = 0.0,
     ) -> list[SearchHit]:
         if limit < 1:
@@ -294,6 +295,8 @@ class ChunkIndex:
             hits = []
             for record in self._records.values():
                 if paper_ids is not None and record.paper_id not in paper_ids:
+                    continue
+                if section is not None and record.section != section:
                     continue
                 vector_score = max(
                     0.0, _cosine_similarity(query_embedding, record.embedding)
@@ -328,12 +331,13 @@ class ChunkIndex:
         limit: int = 5,
         neighbor_window: int = 1,
         paper_ids: set[str] | None = None,
+        section: str | None = None,
         max_characters: int = 14000,
     ) -> AssembledContext:
         """Retrieve, expand around hits, and restore paper reading order."""
 
         with self._lock:
-            seeds = self.search(query, limit=limit, paper_ids=paper_ids)
+            seeds = self.search(query, limit=limit, paper_ids=paper_ids, section=section)
             selected: dict[str, tuple[ChunkRecord, float]] = {}
             for seed in seeds:
                 record = self._records[seed.chunk_id]

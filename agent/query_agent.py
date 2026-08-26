@@ -201,6 +201,7 @@ class QueryAgent:
         # detection entirely and evaluates that node directly; falls back
         # to the normal text-search path if the id doesn't resolve.
         node_id: str | None = None,
+        section: str | None = None,
     ) -> QueryResult:
         """Retrieve evidence and answer ``query`` using Vertex Gemini.
 
@@ -233,6 +234,9 @@ class QueryAgent:
                 )
 
         graph_hits = (
+            []
+            if section is not None
+            else
             [forced_node]
             if forced_node is not None
             else self._graph.search_nodes(
@@ -304,6 +308,7 @@ class QueryAgent:
         assembled = self._chunks.assemble_context(
             cleaned_query,
             paper_ids=paper_ids,
+            section=section,
             max_characters=self._max_context_characters,
         )
         if not assembled.hits:
