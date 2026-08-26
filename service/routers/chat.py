@@ -38,6 +38,7 @@ def chat(body: ChatRequest, state: AppState = Depends(get_state)) -> QueryResult
             history=history,
             goal=body.goal,
             node_id=body.node_id,
+            section=body.section,
         )
     # An empty working set doesn't mean "skip the graph" - it means search
     # the whole graph instead of a specific session's papers. Previously
@@ -47,7 +48,7 @@ def chat(body: ChatRequest, state: AppState = Depends(get_state)) -> QueryResult
     # back to plain chat when the graph genuinely has nothing relevant, not
     # just when no papers were attached.
     graph_result = state.query_agent.answer(
-        body.message, paper_ids=None, history=history, goal=body.goal, node_id=body.node_id
+        body.message, paper_ids=None, history=history, goal=body.goal, node_id=body.node_id, section=body.section
     )
     if graph_result.retrieval_mode != "no_results":
         return graph_result

@@ -16,6 +16,9 @@ from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query
 from service.deps import get_state, require_api_key
 from service.schemas import (
     ArxivIngestRequest,
+    DeepDiveResponse,
+    DeepDiveSection,
+    DeepDiveSource,
     GraphVizEdge,
     GraphVizNode,
     PaperIngestResponse,
@@ -433,3 +436,70 @@ def create_paper_guide(
     guide = state.paper_guide.generate(title, chunks)
     state.paper_store.save(paper_id, guide=guide.model_dump(mode="json"))
     return guide
+
+
+@router.get(
+    "/{paper_id}/deep-dive",
+    response_model=DeepDiveResponse,
+    dependencies=[Depends(require_api_key)],
+)
+def get_paper_deep_dive(
+    paper_id: str, state: AppState = Depends(get_state)
+) -> DeepDiveResponse:
+    """Return the optional, source-expanded view of the existing guide.
+
+    The guide's teaching summary remains cached as before; long source text
+    is assembled deterministically from indexed chunks so it cannot be
+    hallucinated or altered by a second model response.
+    """
+    metadata = state.paper_store.get(paper_id)
+    if metadata is None:
+        raise HTTPException(status_code=404, detail=f"no paper {paper_id!r}")
+    chunks = state.chunks.paper_chunks(paper_id)
+    if not chunks:
+        raise HTTPException(status_code=404, detail="paper has no indexed content")
+    if isinstance(metadata.get("guide"), dict):
+        guide = PaperGuide.model_validate(metadata["guide"])
+    else:
+        guide = state.paper_guide.generate(str(metadata.get("title") or paper_id), chunks)
+        state.paper_store.save(paper_id, guide=guide.model_dump(mode="json"))
+
+    sections: list[DeepDiveSection] = []
+    for index, section in enumerate(guide.sections):
+        section_chunks = [chunk for chunk in chunks if chunk.section == section.title]
+        if not section_chunks and section.page_start is not None:
+            section_chunks = [
+                chunk
+                for chunk in chunks
+                if chunk.page_start is not None
+                and chunk.page_start <= (section.page_end or section.page_start)
+                and (chunk.page_end or chunk.page_start) >= section.page_start
+            ]
+        sections.append(
+            DeepDiveSection(
+                section_id=f"section-{index}",
+                title=section.title,
+                plain_language=section.plain_language,
+                key_points=section.key_points,
+                why_it_matters=section.why_it_matters,
+                page_start=section.page_start,
+                page_end=section.page_end,
+                diagram=section.diagram,
+                sources=[
+                    DeepDiveSource(
+                        text=chunk.text,
+                        section=chunk.section,
+                        page_start=chunk.page_start,
+                        page_end=chunk.page_end,
+                    )
+                    for chunk in section_chunks
+                ],
+            )
+        )
+    return DeepDiveResponse(
+        paper_id=paper_id,
+        title=guide.title,
+        big_picture=guide.big_picture,
+        reading_time_minutes=guide.reading_time_minutes,
+        sections=sections,
+    )
