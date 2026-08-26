@@ -857,7 +857,7 @@ export default function Home() {
       setMessages((current) => [...current, {
         id: crypto.randomUUID(),
         role: "assistant",
-        text: error instanceof Error ? `I couldn't reach Gemini: ${error.message}` : "I couldn't reach Gemini.",
+        text: error instanceof Error ? `I couldn't reach Atlas: ${error.message}` : "I couldn't reach Atlas.",
         notice: true,
       }]);
     } finally {
@@ -1071,7 +1071,7 @@ export default function Home() {
             <div className="paper-chip-row">
               {papers.map((p) => <span key={p.id} className="paper-chip"><Icon name="paper" size={12}/><strong>{p.title}</strong><button onClick={() => removePaperFromSet(p.id)} aria-label={`Remove ${p.title}`}><Icon name="close" size={11}/></button></span>)}
             </div>
-          ) : <><span className="online-dot"/><strong>General chat</strong><small>Gemini</small></>}
+          ) : <><span className="online-dot"/><strong>General chat</strong><small>Atlas</small></>}
         </div>
         <div className="header-actions">
           <div className="session-switcher" ref={sessionSwitcherRef}>
@@ -1148,7 +1148,7 @@ export default function Home() {
                 return <article key={message.id} className={`message ${message.role} ${message.notice ? "notice" : ""} ${isGuideMessage ? "guide-message" : ""}`}>
                   {message.role === "assistant" && <span className="assistant-avatar"><Icon name={message.notice ? "check" : "atlas"} size={16}/></span>}
                   <div className="message-body">
-                    {message.role === "assistant" && <small>{isGuideMessage ? "Atlas guide" : message.notice ? "Atlas" : "Gemini"}</small>}
+                    {message.role === "assistant" && <small>{isGuideMessage ? "Atlas guide" : "Atlas"}</small>}
                     {message.text && <p>{message.text}</p>}
                     {message.guideLoading && <div className="guide-building"><span/><div><strong>Building your guided reading</strong><small>Finding the paper's structure, simplifying each section, and drawing useful visual explanations…</small></div></div>}
                     {message.guide && <GuidedReading guide={message.guide} paperId={message.paperId} sessionId={currentSession?.id} onViewNodeInGraph={viewNodeInGraph}/>}
@@ -1234,16 +1234,16 @@ export default function Home() {
         {papers.length > 0 && <div className="paper-context-chip"><Icon name="paper" size={14}/><span>Using <strong>{papers.length === 1 ? papers[0].title : `${papers.length} papers`}</strong></span></div>}
         <form className="composer" onSubmit={(event) => ask(event)}>
           <button type="button" className="composer-add" onClick={() => openAddPaper()} aria-label="Add a paper"><Icon name="plus" size={19}/></button>
-          <textarea ref={composerInput} value={query} maxLength={8000} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void ask(); } }} rows={1} placeholder={papers.length ? "Ask anything about these papers…" : "Message Gemini…"}/>
+          <textarea ref={composerInput} value={query} maxLength={8000} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void ask(); } }} rows={1} placeholder={papers.length ? "Ask anything about these papers…" : "Message Atlas…"}/>
           <button type="submit" className="send-button" disabled={!query.trim() || loading} aria-label="Send"><Icon name="send" size={18}/></button>
         </form>
-        <small className="composer-hint">Gemini can make mistakes. Paper answers include sources when available.</small>
+        <small className="composer-hint">Atlas can make mistakes. Paper answers include sources when available.</small>
       </footer>
 
       {addOpen && <div className="add-modal" role="dialog" aria-modal="true" aria-label="Add a research paper">
         <div className="modal-scrim" onClick={() => setAddOpen(false)} aria-hidden="true"/>
         <section className={`modal-card ${buildingGraphQueue.length > 0 ? "modal-card-fullscreen" : ""}`}>
-          <header><div><span><Icon name="paper" size={18}/></span><div><strong>Add a research paper</strong><small>Give Gemini a paper to read with you</small></div></div><button onClick={() => setAddOpen(false)} aria-label="Close"><Icon name="close" size={19}/></button></header>
+          <header><div><span><Icon name="paper" size={18}/></span><div><strong>Add a research paper</strong><small>Give Atlas a paper to read with you</small></div></div><button onClick={() => setAddOpen(false)} aria-label="Close"><Icon name="close" size={19}/></button></header>
 
           {buildingGraphQueue.length > 0 ? (
             <GraphBuildAnimation
