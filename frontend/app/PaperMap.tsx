@@ -2,9 +2,10 @@
 
 import { useEffect, useState } from "react";
 import { getSessionPaperMap } from "@/lib/api";
+import type { PaperContext } from "@/lib/api";
 import type { PaperConnection } from "@/lib/types";
 
-export default function PaperMap({ sessionId, active, onClose }: { sessionId: string | null; active: boolean; onClose: () => void }) {
+export default function PaperMap({ sessionId, active, onClose, papers }: { sessionId: string | null; active: boolean; onClose: () => void; papers: PaperContext[] }) {
   const [connections, setConnections] = useState<PaperConnection[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -14,5 +15,15 @@ export default function PaperMap({ sessionId, active, onClose }: { sessionId: st
     getSessionPaperMap(sessionId).then(setConnections).catch((err) => setError(err instanceof Error ? err.message : "Could not map paper connections.")).finally(() => setLoading(false));
   }, [active, sessionId]);
   if (!active) return null;
-  return <div className="paper-map-overlay"><button className="modal-scrim" onClick={onClose} aria-label="Close paper map"/><section className="paper-map-card" role="dialog" aria-modal="true" aria-label="Paper connections"><header><div><small>Session research map</small><h2>How your papers connect</h2><p>Connections are based on shared extracted concepts and evidence.</p></div><button onClick={onClose} aria-label="Close">×</button></header>{loading && <p className="paper-map-state">Mapping the papers…</p>}{error && <p className="paper-map-state paper-map-error">{error}</p>}{!loading && !error && connections.length === 0 && <p className="paper-map-state">No evidence-backed connections found yet.</p>}{!loading && connections.length > 0 && <div className="paper-map-list">{connections.map((connection) => <article key={`${connection.paper_a_id}-${connection.paper_b_id}`}><div className="paper-map-papers"><strong>{connection.paper_a_title}</strong><span>↔</span><strong>{connection.paper_b_title}</strong></div><p>{connection.summary}</p>{connection.shared_topics.map((topic) => <span key={topic} className="paper-map-topic">{topic}</span>)}<details><summary>View evidence</summary>{connection.evidence.map((item, index) => <blockquote key={`${item.paper_id}-${index}`}><small>{item.topic} · {item.section ?? "Paper"}</small>{item.quote && <p>“{item.quote}”</p>}</blockquote>)}</details></article>)}</div>}</section></div>;
+  function paperHref(paperId: string) {
+    const paper = papers.find((candidate) => candidate.id === paperId);
+    if (paper?.pdfUrl) return paper.pdfUrl;
+    if (paperId.startsWith("arxiv-")) return `https://arxiv.org/abs/${paperId.slice("arxiv-".length)}`;
+    return null;
+  }
+  function paperLink(paperId: string, title: string) {
+    const href = paperHref(paperId);
+    return href ? <a href={href} target="_blank" rel="noreferrer">{title}<span aria-hidden="true"> ↗</span></a> : <strong>{title}</strong>;
+  }
+  return <div className="paper-map-overlay"><button className="modal-scrim" onClick={onClose} aria-label="Close paper map"/><section className="paper-map-card" role="dialog" aria-modal="true" aria-label="Paper connections"><header><div><small>Session research map</small><h2>How your papers connect</h2><p>Connections are based on shared extracted concepts and evidence.</p></div><button onClick={onClose} aria-label="Close">×</button></header>{loading && <p className="paper-map-state">Mapping the papers…</p>}{error && <p className="paper-map-state paper-map-error">{error}</p>}{!loading && !error && connections.length === 0 && <p className="paper-map-state">No evidence-backed connections found yet.</p>}{!loading && connections.length > 0 && <div className="paper-map-list">{connections.map((connection) => <article key={`${connection.paper_a_id}-${connection.paper_b_id}`}><div className="paper-map-papers">{paperLink(connection.paper_a_id, connection.paper_a_title)}<span>↔</span>{paperLink(connection.paper_b_id, connection.paper_b_title)}</div><p>{connection.summary}</p>{connection.shared_topics.map((topic) => <span key={topic} className="paper-map-topic">{topic}</span>)}<details><summary>View evidence</summary>{connection.evidence.map((item, index) => <blockquote key={`${item.paper_id}-${index}`}><small>{item.topic} · {item.section ?? "Paper"}</small>{item.quote && <p>“{item.quote}”</p>}</blockquote>)}</details></article>)}</div>}</section></div>;
 }

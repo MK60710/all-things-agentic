@@ -711,14 +711,16 @@ export default function Home() {
   }
 
   function askAboutGap(candidate: GapCandidate) {
-    const question = `How does ${candidate.node_a_name} relate to ${candidate.node_b_name}?${candidate.explanation ? ` (${candidate.explanation})` : ""}`;
+    const evidence = candidate.citations
+      .slice(0, 4)
+      .map((citation) => `${citation.shared_node_name} (${citation.source_section ?? "unknown section"}): “${citation.source_quote}”`)
+      .join("\n");
+    const question = `Verify this possible graph connection between ${candidate.node_a_name} and ${candidate.node_b_name}. Treat it as a hypothesis, not an established fact. Does the paper text actually support the relationship? Distinguish graph evidence from direct paper evidence.${candidate.explanation ? `\nGraph hypothesis: ${candidate.explanation}` : ""}${evidence ? `\nUnderlying graph evidence:\n${evidence}` : ""}`;
     void recordGapFeedback(candidate.node_a_id, candidate.node_b_id, true).catch(() => {});
-    // Gaps come from GapFinder, which reasons over the whole graph, not the
-    // session's working set - explicitly ignore whatever papers are
-    // currently added, or this silently re-scopes the question to them and
-    // can wrongly report "no information" for evidence that's real but
-    // lives in a paper outside the working set.
-    void ask(undefined, question, []);
+    // Gap suggestions are hypotheses from this session's graph. Keep the
+    // current papers attached so the tutor can verify the graph claim
+    // against their source text instead of answering from graph labels alone.
+    void ask(undefined, question, papers);
   }
 
   function viewNodeInGraph(nodeId: string) {
@@ -987,7 +989,7 @@ export default function Home() {
     <main className="assistant-app">
       <ConvergenceRitual entries={convergenceEntries} active={ingestingIds.size > 0} onSkip={() => {}}/>
       <GraphExplorer sessionId={currentSession?.id ?? null} sessionName={currentSession?.name} active={graphExplorerOpen} onClose={() => setGraphExplorerOpen(false)} onAskInChat={askFromGraphExplorer} focusNodeId={graphFocusNodeId} papers={papers}/>
-      <PaperMap sessionId={currentSession?.id ?? null} active={paperMapOpen} onClose={() => setPaperMapOpen(false)}/>
+      <PaperMap sessionId={currentSession?.id ?? null} active={paperMapOpen} onClose={() => setPaperMapOpen(false)} papers={papers}/>
       <Tour steps={ATLAS_TOUR_STEPS} active={tourOpen} onClose={() => { setTourOpen(false); setTourSeen(true); }}/>
       <header className="app-header">
         <div className="brand"><span><Icon name="atlas" size={21}/></span><strong>Atlas</strong></div>
@@ -1128,7 +1130,7 @@ export default function Home() {
                       {visibleGaps && visibleGaps.length > 0 && <div className="gap-suggestions">
                         {visibleGaps.map((candidate) => <div key={gapKey(candidate)} className="gap-chip">
                           <button onClick={() => askAboutGap(candidate)}>
-                            <strong>{candidate.node_a_name} ↔ {candidate.node_b_name}</strong>
+                            <strong>Possible connection to verify: {candidate.node_a_name} ↔ {candidate.node_b_name}</strong>
                             {candidate.explanation && <span>{candidate.explanation}</span>}
                           </button>
                           <button className="gap-dismiss" onClick={() => dismissGap(candidate)} aria-label="Not interesting"><Icon name="close" size={12}/></button>
