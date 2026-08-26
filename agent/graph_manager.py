@@ -914,6 +914,13 @@ class GraphManager:
                         candidate_description=matched_data.get("description", ""),
                         score=canonical.score,
                     )
+                elif canonical.decision == "needs_clarification" and canonical.matched_node_id:
+                    logger.info(
+                        "entity_alias_review_deferred entity=%s candidate=%s score=%.4f",
+                        entity.name,
+                        canonical.matched_node_id,
+                        canonical.score or 0.0,
+                    )
             entity_to_node_id[(_normalize_name(entity.name), entity.type)] = node_id
             node_writes.append(
                 NodeWriteResult(

@@ -180,15 +180,15 @@ def _ingest(
         state.paper_store.save(paper_id, **metadata, status="failed", error=message, session_id=session_id)
         raise HTTPException(status_code=422, detail=message)
 
-    pending_before = len(state.clarification.pending())
+    # Extraction is a background operation. It must not interrupt the user
+    # with alias-review questions; ambiguous matches remain separate and are
+    # recorded in the logs for later automated canonicalization.
     report = state.research_store.ingest(
         outcome.result,
         paper_name=title,
         entity_embedding_fn=state.entity_embedding_fn,
-        clarification=state.clarification,
         session_id=session_id,
     )
-    pending_added = len(state.clarification.pending()) - pending_before
     # Caches the concurrently pre-generated guide (None if that worker
     # failed) so the frontend's separate POST /papers/{id}/guide call -
     # unchanged, still fires after this response - finds it already
@@ -271,7 +271,7 @@ def _ingest(
         chunk_ids=report.chunk_ids,
         entities_added=len(outcome.result.entities),
         relations_added=len(outcome.result.relations),
-        pending_clarification_count=pending_added,
+        pending_clarification_count=0,
         new_nodes=new_nodes,
         new_edges=new_edges,
     )
