@@ -462,6 +462,7 @@ export default function Home() {
   const [creatingSession, setCreatingSession] = useState(false);
   const [createSessionError, setCreateSessionError] = useState("");
   const [uploading, setUploading] = useState(false);
+  const uploadBatchCancelled = useRef(false);
   const [uploadError, setUploadError] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<PaperSearchResult[]>([]);
@@ -884,10 +885,12 @@ export default function Home() {
     setAddOpen(true);
   }
 
-  async function handleFile(file?: File) {
-    if (!file) return;
-    if (file.type !== "application/pdf" && !file.name.toLowerCase().endsWith(".pdf")) {
-      setUploadError("Please choose a PDF file.");
+  async function handleFiles(files: File[]) {
+    if (!files.length) return;
+    const validFiles = files.filter((file) => file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf"));
+    if (validFiles.length !== files.length) setUploadError("Only PDF files were included; other files were skipped.");
+    if (validFiles.length === 0) {
+      setUploadError("Please choose PDF files.");
       return;
     }
     // Same synchronous-ref guard as addArxivPaper, and for the same
@@ -897,16 +900,28 @@ export default function Home() {
     // change event is still in flight) can start two uploads before that
     // commit lands.
     if (uploadController.current) return;
-    const controller = new AbortController();
-    uploadController.current = controller;
+    uploadBatchCancelled.current = false;
     setUploading(true);
-    setUploadError("");
+    if (validFiles.length === files.length) setUploadError("");
+    const failures: string[] = [];
     try {
-      const uploaded = await uploadPaper(file, controller.signal, sessionIdRef.current);
-      setBuildingGraphQueue((current) => [...current, uploaded]);
-    } catch (error) {
-      if (error instanceof DOMException && error.name === "AbortError") return;
-      setUploadError(error instanceof Error ? error.message : "Upload failed.");
+      for (const file of validFiles) {
+        if (uploadBatchCancelled.current) break;
+        const controller = new AbortController();
+        uploadController.current = controller;
+        try {
+          const uploaded = await uploadPaper(file, controller.signal, sessionIdRef.current);
+          setBuildingGraphQueue((current) => [...current, uploaded]);
+        } catch (error) {
+          if (error instanceof DOMException && error.name === "AbortError") break;
+          failures.push(`${file.name}: ${error instanceof Error ? error.message : "upload failed"}`);
+        } finally {
+          uploadController.current = null;
+        }
+      }
+      if (failures.length > 0) {
+        setUploadError(`Could not add ${failures.length} file${failures.length === 1 ? "" : "s"}: ${failures.join("; ")}`);
+      }
     } finally {
       setUploading(false);
       uploadController.current = null;
@@ -915,6 +930,7 @@ export default function Home() {
   }
 
   function cancelUpload() {
+    uploadBatchCancelled.current = true;
     uploadController.current?.abort();
   }
 
@@ -938,13 +954,13 @@ export default function Home() {
     }
   }
 
-  function addPaper(nextPaper: PaperContext) {
+  function addPaper(nextPaper: PaperContext, closeModal = true) {
     // Papers are sourced from the backend per session (listPapersForSession)
     // now, not localStorage - this is just the optimistic local update for
     // the paper the backend just confirmed ingesting into sessionIdRef.current.
     setPapers((current) => (current.some((existing) => existing.id === nextPaper.id) ? current : [...current, nextPaper]));
     setMessages((current) => [...current, { id: crypto.randomUUID(), role: "assistant", text: `I've added "${nextPaper.title}" to this conversation. Ask me to summarize it, explain a section, or examine its evidence.`, notice: true }]);
-    setAddOpen(false);
+    if (closeModal) setAddOpen(false);
     setAddMode("choose");
     void beginGuidedReading(nextPaper);
     window.setTimeout(() => composerInput.current?.focus(), 50);
@@ -1045,7 +1061,7 @@ export default function Home() {
 
   function onDrop(event: DragEvent<HTMLButtonElement>) {
     event.preventDefault();
-    void handleFile(event.dataTransfer.files?.[0]);
+    void handleFiles(Array.from(event.dataTransfer.files ?? []));
   }
 
   const convergenceEntries = Array.from(ingestingIds).map((id) => ({
@@ -1251,7 +1267,8 @@ export default function Home() {
               newNodes={buildingGraphQueue[0].new_nodes}
               newEdges={buildingGraphQueue[0].new_edges}
               onComplete={() => {
-                addPaper(buildingGraphQueue[0]);
+                const keepModalOpen = buildingGraphQueue.length > 1 || uploading;
+                addPaper(buildingGraphQueue[0], !keepModalOpen);
                 setBuildingGraphQueue((current) => current.slice(1));
               }}
             />
@@ -1264,10 +1281,10 @@ export default function Home() {
           {addMode === "upload" && <div className="upload-panel">
             <button className="back-button" onClick={() => setAddMode("choose")}>← Back</button>
             <button className="drop-zone" onClick={() => fileInput.current?.click()} onDragOver={(event) => event.preventDefault()} onDrop={onDrop} disabled={uploading}>
-              <span><Icon name="upload" size={25}/></span><strong>{uploading ? "Uploading and reading…" : "Choose a PDF or drag it here"}</strong><small>PDF files up to the backend’s configured limit</small>
+              <span><Icon name="upload" size={25}/></span><strong>{uploading ? "Uploading and reading papers one at a time…" : "Choose PDFs or drag them here"}</strong><small>Each PDF follows Atlas’s normal reading and graph-building process.</small>
             </button>
             {uploading && <button className="cancel-ingest" onClick={cancelUpload}>Cancel</button>}
-            <input ref={fileInput} className="hidden-input" type="file" accept="application/pdf,.pdf" onChange={(event: ChangeEvent<HTMLInputElement>) => void handleFile(event.target.files?.[0])}/>
+            <input ref={fileInput} className="hidden-input" type="file" accept="application/pdf,.pdf" multiple onChange={(event: ChangeEvent<HTMLInputElement>) => void handleFiles(Array.from(event.target.files ?? []))}/>
             {uploadError && <p className="form-error">{uploadError}</p>}
           </div>}
 
