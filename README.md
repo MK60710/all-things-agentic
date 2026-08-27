@@ -52,6 +52,11 @@ See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the system diagram, the two
 core request flows (paper ingestion, chat), and why the concurrency
 locks exist.
 
+## Future adjustments
+
+See [`adjustments.md`](adjustments.md) for planned improvements, including
+future academic-paper discovery beyond the current arXiv search.
+
 ## Deploy
 
 The backend deploys to Cloud Run as a single container - see
