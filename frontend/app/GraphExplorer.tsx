@@ -77,6 +77,11 @@ export default function GraphExplorer({
   const [exportingCitations, setExportingCitations] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
   const [nodeSearch, setNodeSearch] = useState("");
+  // A session map must show every uploaded paper, even when no verified
+  // cross-paper edge exists. The graph then naturally renders separate
+  // components for unrelated papers and one component when an edge links
+  // them. Isolated extracted entities are hidden by default because they
+  // otherwise make a second paper look surrounded by unrelated dots.
   const [showUnconnected, setShowUnconnected] = useState(false);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const fgRef = useRef<any>(null);
@@ -123,7 +128,7 @@ export default function GraphExplorer({
   const filteredNodeIds = useMemo(
     () => new Set(nodes
       .filter((n) => visibleTypes.has(n.type))
-      .filter((n) => showUnconnected || connectedNodeIds.has(n.node_id))
+      .filter((n) => showUnconnected || connectedNodeIds.has(n.node_id) || n.type === "PAPER")
       .map((n) => n.node_id)),
     [nodes, visibleTypes, showUnconnected, connectedNodeIds],
   );
@@ -314,7 +319,7 @@ export default function GraphExplorer({
               <small>{filteredNodeIds.size} shown · {edges.length} connections · {unconnectedCount} unconnected</small>
             )}
           </div>
-          <p className="graph-explorer-subtitle">Every dot is something from your papers - a method, a result, an idea. Click one to read about it and see what it connects to.</p>
+          <p className="graph-explorer-subtitle">Each connected cluster represents a paper or papers linked by an evidence-backed edge. Unrelated papers remain as separate maps; isolated extracted items are hidden by default.</p>
         </div>
         <div className="graph-explorer-search">
           <input
@@ -361,7 +366,7 @@ export default function GraphExplorer({
         ))}
         <label className="graph-explorer-unconnected-toggle">
           <input type="checkbox" checked={showUnconnected} onChange={(event) => setShowUnconnected(event.target.checked)} />
-          Show unconnected items
+          {showUnconnected ? "Hide unconnected items" : "Show unconnected items"}
         </label>
         <button
           className="graph-explorer-contradictions-check"
@@ -390,7 +395,7 @@ export default function GraphExplorer({
           <p className="graph-explorer-status">Nothing in this session's graph yet.</p>
         )}
         {!loading && !error && nodes.length > 0 && (
-          graphData.nodes.length === 0 ? <p className="graph-explorer-status">No connected items match the current filters. Turn on “Show unconnected items” to inspect the rest.</p> : <ForceGraph2D
+          graphData.nodes.length === 0 ? <p className="graph-explorer-status">No items match the current filters. Turn on “Show unconnected items” to inspect the rest.</p> : <ForceGraph2D
             ref={fgRef}
             graphData={graphData}
             width={size.width}
