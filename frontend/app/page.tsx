@@ -11,6 +11,7 @@ import {
   detachPaper,
   getFeynmanPrompts,
   getPaperStatus,
+  getSessionMessages,
   ingestArxivPaper,
   listGaps,
   listPapersForSession,
@@ -18,6 +19,7 @@ import {
   recordGapFeedback,
   recordQueryFeedback,
   renameSession,
+  saveSessionMessages,
   searchPapers,
   uploadPaper,
 } from "@/lib/api";
@@ -29,7 +31,7 @@ import GraphExplorer from "./GraphExplorer";
 import Tour, { TourStep } from "./Tour";
 import PaperMap from "./PaperMap";
 
-type IconName = "atlas" | "plus" | "send" | "paper" | "search" | "upload" | "close" | "quote" | "check" | "globe" | "thumbUp" | "thumbDown" | "rename" | "graph" | "help" | "quiz";
+type IconName = "atlas" | "plus" | "send" | "paper" | "search" | "upload" | "close" | "quote" | "check" | "globe" | "thumbUp" | "thumbDown" | "rename" | "graph" | "help" | "quiz" | "book";
 type AddMode = "choose" | "upload" | "search";
 
 interface Message {
@@ -116,6 +118,18 @@ function dedupeCitations(citations: Citation[]): Citation[] {
   });
 }
 
+// A bare heading number ("1", "3.") with no real title reads as a broken
+// label, not a source - confirmed live: the extraction prompt never told
+// Gemini what source_section should contain, so it sometimes returned
+// just the leading digit off a numbered heading instead of the full
+// title. Fixed at the prompt itself (agent/gemini_extractor.py) for new
+// extractions, but a defensive display-level fallback still matters for
+// already-stored edges and for the rare case a model ignores the prompt.
+function citationSectionLabel(section: string | null | undefined): string {
+  const trimmed = (section ?? "").trim();
+  return /^\d+(\.\d+)*\.?$/.test(trimmed) ? "" : trimmed;
+}
+
 function ingestStageLabel(stage: string | undefined): string {
   return (stage && INGEST_STAGE_LABELS[stage]) || "Reading…";
 }
@@ -137,6 +151,7 @@ const icons: Record<IconName, React.ReactNode> = {
   graph: <><circle cx="6" cy="6" r="2.6"/><circle cx="18" cy="6" r="2.6"/><circle cx="12" cy="18" r="2.6"/><path d="M8.3 6.7L15.7 6.7M7.4 8.2L10.6 15.8M16.6 8.2L13.4 15.8"/></>,
   help: <><circle cx="12" cy="12" r="9"/><path d="M9.1 9a3 3 0 1 1 4.6 2.6c-.9.5-1.7 1.1-1.7 2.4"/><path d="M12 17.5h.01"/></>,
   quiz: <><path d="M9 21h6M10 18h4M8.5 12.5A5 5 0 1 1 15.5 12.5c-.7 1-1.5 1.6-1.5 3H10c0-1.4-.8-2-1.5-3Z"/></>,
+  book: <><path d="M4 19.5V5a2 2 0 0 1 2-2h13v15H6a2 2 0 0 0 0 4h13"/></>,
 };
 
 function Icon({ name, size = 19 }: { name: IconName; size?: number }) {
@@ -513,15 +528,42 @@ export default function Home() {
   const [sessionMenuOpen, setSessionMenuOpen] = useState(false);
 
   useEffect(() => { chatEnd.current?.scrollIntoView({ behavior: "smooth" }); }, [messages, loading]);
-  // Conversation history is otherwise plain React state - a refresh meant
-  // literally starting over, the opposite of "persistent memory... instead
-  // of starting over each time".
+  // Conversation history is persisted server-side (Firestore) so it
+  // survives a different browser/device, not just this one's localStorage
+  // - initSession/switchToSession below are what actually load a
+  // session's messages.
+  const saveMessagesTimer = useRef<number | null>(null);
   useEffect(() => {
-    // Guard against the pre-init render (sessionIdRef not set yet) writing
-    // an empty array under a bogus key - initSession/switchToSession below
-    // are what actually load a session's messages.
+    // Guard against the pre-init render (sessionIdRef not set yet) saving
+    // an empty array under a bogus id.
     if (!sessionIdRef.current) return;
-    window.localStorage.setItem(`atlas-messages-${sessionIdRef.current}`, JSON.stringify(messages));
+    const sessionId = sessionIdRef.current;
+    if (saveMessagesTimer.current) window.clearTimeout(saveMessagesTimer.current);
+    // Debounced, not synchronous like the localStorage write this
+    // replaced - this is now a real network round trip, and a fast
+    // back-and-forth shouldn't fire one PUT per message.
+    saveMessagesTimer.current = window.setTimeout(() => {
+      void saveSessionMessages(sessionId, messages as unknown as Record<string, unknown>[])
+        .then((result) => {
+          // sessionId is captured at the time this save was queued, not
+          // re-read from the ref here - guards against a save queued for
+          // session A landing after the user has already switched to
+          // session B inside this debounce window. Only the compacted
+          // case needs to reach back into state; the normal case already
+          // matches what was just sent.
+          if (result.compacted && sessionIdRef.current === sessionId) {
+            setMessages(result.messages as unknown as Message[]);
+          }
+        })
+        .catch(() => {
+          // Persistence failure shouldn't be disruptive - the in-memory
+          // conversation still works for the rest of this tab session;
+          // the next debounced save (or next message) simply retries.
+        });
+    }, 1000);
+    return () => {
+      if (saveMessagesTimer.current) window.clearTimeout(saveMessagesTimer.current);
+    };
   }, [messages]);
   const initRan = useRef(false);
   useEffect(() => {
@@ -612,6 +654,19 @@ export default function Home() {
   }
 
   async function switchToSession(session: SessionMetadata) {
+    // Flush any pending debounced save for the session being left, right
+    // now, synchronously with the old session id and its current messages
+    // - confirmed live via code review that without this, a message sent
+    // right before a fast switch gets silently lost: the save effect's
+    // own cleanup (see saveMessagesTimer below) clears the pending timer
+    // the moment `messages` next changes (which switching to a new
+    // session's restored messages always does), and the timer callback
+    // that would have sent it never runs.
+    if (saveMessagesTimer.current && sessionIdRef.current && sessionIdRef.current !== session.id) {
+      window.clearTimeout(saveMessagesTimer.current);
+      saveMessagesTimer.current = null;
+      void saveSessionMessages(sessionIdRef.current, messages as unknown as Record<string, unknown>[]).catch(() => {});
+    }
     sessionIdRef.current = session.id;
     window.localStorage.setItem("atlas-session-id", session.id);
     setCurrentSession(session);
@@ -619,23 +674,30 @@ export default function Home() {
     setBuildingGraphQueue([]);
     setDismissedGapKeys(new Set());
 
-    const savedMessages = window.localStorage.getItem(`atlas-messages-${session.id}`);
     let restoredMessages: Message[] = [];
     const freshClarificationIds = new Set<string>();
     const freshGapKeys = new Set<string>();
-    if (savedMessages) {
-      try {
-        restoredMessages = (JSON.parse(savedMessages) as Message[]).map(({ clarification: _clarification, clarifications: _clarifications, ...message }) => message);
-        // Seed the dedup trackers directly from restored history (not from
-        // messages state, which won't have committed yet) so checkGuidance
-        // below doesn't re-post a clarification/gap card that's already
-        // sitting in the restored conversation.
-        restoredMessages.forEach((message) => {
-          if (message.clarification) freshClarificationIds.add(message.clarification.id);
-          message.clarifications?.forEach((q) => freshClarificationIds.add(q.id));
-          message.gaps?.forEach((candidate) => freshGapKeys.add(gapKey(candidate)));
-        });
-      } catch { window.localStorage.removeItem(`atlas-messages-${session.id}`); }
+    try {
+      const result = await getSessionMessages(session.id);
+      const raw = result.messages as unknown as Message[];
+      // Seed the dedup trackers directly from restored history (not from
+      // messages state, which won't have committed yet) so checkGuidance
+      // below doesn't re-post a clarification/gap card that's already
+      // sitting in the restored conversation.
+      raw.forEach((message) => {
+        if (message.clarification) freshClarificationIds.add(message.clarification.id);
+        message.clarifications?.forEach((q) => freshClarificationIds.add(q.id));
+        message.gaps?.forEach((candidate) => freshGapKeys.add(gapKey(candidate)));
+      });
+      // clarification/clarifications are stripped from what actually
+      // renders (not just tracked above) so an old, already-resolved
+      // question doesn't come back looking like it's still open on
+      // reload - gaps are left as-is, only clarification cards had this
+      // problem.
+      restoredMessages = raw.map(({ clarification: _clarification, clarifications: _clarifications, ...message }) => message);
+    } catch {
+      // Backend unreachable - degrade to an empty conversation for this
+      // switch rather than blocking session switching entirely.
     }
     shownClarificationIds.current = freshClarificationIds;
     shownGapKeys.current = freshGapKeys;
@@ -710,7 +772,8 @@ export default function Home() {
     if (!window.confirm(`Delete "${session.name}"? This removes its papers and can't be undone.`)) return;
     try {
       await deleteSession(session.id);
-      window.localStorage.removeItem(`atlas-messages-${session.id}`);
+      // No localStorage cleanup needed anymore - the backend's own
+      // delete_session cascade removes this session's stored messages.
       setSessions((current) => current.filter((s) => s.id !== session.id));
       // Reuses initSession's own fallback (pick another session, or
       // create a fresh default one if none remain) instead of
@@ -963,10 +1026,25 @@ export default function Home() {
     ]);
     try {
       const guide = await buildPaperGuide(nextPaper.id);
-      setMessages((current) => current.map((message) => message.id === guideMessageId ? { ...message, guideLoading: false, guide } : message));
+      setMessages((current) =>
+        current.some((message) => message.id === guideMessageId)
+          ? current.map((message) => message.id === guideMessageId ? { ...message, guideLoading: false, guide } : message)
+          // The placeholder can be gone by the time this resolves - a
+          // compaction (see save_session_messages) replaces the whole
+          // array with a summary + a short tail while this request was
+          // still in flight. Append the finished guide as a fresh
+          // message instead of silently losing it to a .map() that finds
+          // no match.
+          : [...current, { id: guideMessageId, role: "assistant", text: "", guideLoading: false, guide, paperId: nextPaper.id }]
+      );
     } catch (error) {
       const detail = error instanceof Error ? error.message : "Could not build the walkthrough.";
-      setMessages((current) => current.map((message) => message.id === guideMessageId ? { ...message, guideLoading: false, guideError: detail, text: "The paper was added and is ready for questions, but I couldn't generate its guided walkthrough." } : message));
+      const errorUpdate = { guideLoading: false, guideError: detail, text: "The paper was added and is ready for questions, but I couldn't generate its guided walkthrough." };
+      setMessages((current) =>
+        current.some((message) => message.id === guideMessageId)
+          ? current.map((message) => message.id === guideMessageId ? { ...message, ...errorUpdate } : message)
+          : [...current, { id: guideMessageId, role: "assistant" as const, paperId: nextPaper.id, ...errorUpdate }]
+      );
     }
   }
 
@@ -1101,7 +1179,7 @@ export default function Home() {
         <div className={`mode-label ${papers.length ? "paper-mode" : ""}`}>
           {papers.length > 0 ? (
             <div className="paper-chip-row">
-              {papers.map((p) => <span key={p.id} className="paper-chip"><Icon name="paper" size={12}/><strong>{p.title}</strong><button onClick={() => removePaperFromSet(p.id)} aria-label={`Remove ${p.title}`}><Icon name="close" size={11}/></button></span>)}
+              {papers.map((p) => <span key={p.id} className="paper-chip"><Icon name="paper" size={12}/><strong>{p.title}</strong><button className="paper-chip-deep-dive" onClick={() => window.location.assign(`/deep-dive/${encodeURIComponent(p.id)}?session_id=${encodeURIComponent(currentSession?.id ?? "local")}`)} aria-label={`Open deeper dive for ${p.title}`} title="Open deeper dive"><Icon name="book" size={11}/></button><button onClick={() => removePaperFromSet(p.id)} aria-label={`Remove ${p.title}`}><Icon name="close" size={11}/></button></span>)}
             </div>
           ) : <><span className="online-dot"/><strong>General chat</strong><small>Atlas</small></>}
         </div>
@@ -1195,7 +1273,7 @@ export default function Home() {
                       const key = `${message.id}-${index}`;
                       const graphNodeId = citation.source_kind === "graph" ? citation.node_ids?.[0] : undefined;
                       return <div key={key}>
-                        <button onClick={() => setExpandedCitation(expandedCitation === key ? null : key)}><Icon name="quote" size={13}/>{citation.section ?? "Source"}{citation.page_start != null && ` · p. ${citation.page_start}`}</button>
+                        <button onClick={() => setExpandedCitation(expandedCitation === key ? null : key)}><Icon name="quote" size={13}/>{citationSectionLabel(citation.section) || "Source"}{citation.page_start != null && ` · p. ${citation.page_start}`}</button>
                         {graphNodeId && <button className="citation-view-graph" onClick={() => viewNodeInGraph(graphNodeId)} title="View this node in the graph"><Icon name="graph" size={12}/>View in graph</button>}
                         {expandedCitation === key && <blockquote>“{citation.text}”</blockquote>}
                       </div>;
@@ -1290,7 +1368,7 @@ export default function Home() {
             />
           ) : <>
           {addMode === "choose" && <div className="add-choices">
-            <button onClick={() => setAddMode("upload")}><span className="choice-icon violet"><Icon name="upload" size={22}/></span><div><strong>Upload a PDF</strong><p>Choose a paper saved on your computer.</p></div></button>
+            <button autoFocus onClick={() => setAddMode("upload")}><span className="choice-icon violet"><Icon name="upload" size={22}/></span><div><strong>Upload a PDF</strong><p>Choose a paper saved on your computer.</p></div></button>
             <button onClick={() => setAddMode("search")}><span className="choice-icon blue"><Icon name="globe" size={22}/></span><div><strong>Search online</strong><p>Find papers on arXiv by title, author, or topic.</p></div></button>
           </div>}
 

@@ -141,3 +141,41 @@ class SessionStore:
 
     def delete(self, session_id: str) -> None:
         self._collection.document(session_id).delete()
+
+
+class SessionMessagesStore:
+    """Chat message history, kept in its own collection rather than on the
+    session document SessionStore writes - list_sessions() streams every
+    session doc in full for the session switcher, and putting messages
+    there would mean that read pulls down every session's entire chat
+    history just to show session names (SessionMetadata.model_validate
+    would silently drop the field before it reaches the client, but the
+    Firestore read cost is already paid by then). This collection is never
+    enumerated in bulk, only fetched by exact session id."""
+
+    def __init__(self, db_client: Any) -> None:
+        self._collection = db_client.collection("session_messages")
+        # Latest pre-compaction snapshot only, overwritten on each new
+        # compaction - not a full history of every compaction event. Exists
+        # so a long conversation's earlier citation-precision detail isn't
+        # silently gone forever just because it got summarized out of the
+        # live view; nothing reads this yet, it's a safety net.
+        self._archive_collection = db_client.collection("session_messages_archive")
+
+    def get(self, session_id: str) -> list[dict[str, Any]]:
+        snapshot = self._collection.document(session_id).get()
+        if not snapshot.exists:
+            return []
+        return snapshot.to_dict().get("messages", [])
+
+    def save(self, session_id: str, messages: list[dict[str, Any]]) -> None:
+        data = {"messages": messages, "updated_at": datetime.now(timezone.utc).isoformat()}
+        self._collection.document(session_id).set(data, merge=True)
+
+    def archive(self, session_id: str, messages: list[dict[str, Any]]) -> None:
+        data = {"messages": messages, "archived_at": datetime.now(timezone.utc).isoformat()}
+        self._archive_collection.document(session_id).set(data, merge=True)
+
+    def delete(self, session_id: str) -> None:
+        self._collection.document(session_id).delete()
+        self._archive_collection.document(session_id).delete()
