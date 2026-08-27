@@ -31,7 +31,7 @@ import GraphExplorer from "./GraphExplorer";
 import Tour, { TourStep } from "./Tour";
 import PaperMap from "./PaperMap";
 
-type IconName = "atlas" | "plus" | "send" | "paper" | "search" | "upload" | "close" | "quote" | "check" | "globe" | "thumbUp" | "thumbDown" | "rename" | "graph" | "help" | "quiz";
+type IconName = "atlas" | "plus" | "send" | "paper" | "search" | "upload" | "close" | "quote" | "check" | "globe" | "thumbUp" | "thumbDown" | "rename" | "graph" | "help" | "quiz" | "book";
 type AddMode = "choose" | "upload" | "search";
 
 interface Message {
@@ -151,6 +151,7 @@ const icons: Record<IconName, React.ReactNode> = {
   graph: <><circle cx="6" cy="6" r="2.6"/><circle cx="18" cy="6" r="2.6"/><circle cx="12" cy="18" r="2.6"/><path d="M8.3 6.7L15.7 6.7M7.4 8.2L10.6 15.8M16.6 8.2L13.4 15.8"/></>,
   help: <><circle cx="12" cy="12" r="9"/><path d="M9.1 9a3 3 0 1 1 4.6 2.6c-.9.5-1.7 1.1-1.7 2.4"/><path d="M12 17.5h.01"/></>,
   quiz: <><path d="M9 21h6M10 18h4M8.5 12.5A5 5 0 1 1 15.5 12.5c-.7 1-1.5 1.6-1.5 3H10c0-1.4-.8-2-1.5-3Z"/></>,
+  book: <><path d="M4 19.5V5a2 2 0 0 1 2-2h13v15H6a2 2 0 0 0 0 4h13"/></>,
 };
 
 function Icon({ name, size = 19 }: { name: IconName; size?: number }) {
@@ -1178,7 +1179,7 @@ export default function Home() {
         <div className={`mode-label ${papers.length ? "paper-mode" : ""}`}>
           {papers.length > 0 ? (
             <div className="paper-chip-row">
-              {papers.map((p) => <span key={p.id} className="paper-chip"><Icon name="paper" size={12}/><strong>{p.title}</strong><button onClick={() => removePaperFromSet(p.id)} aria-label={`Remove ${p.title}`}><Icon name="close" size={11}/></button></span>)}
+              {papers.map((p) => <span key={p.id} className="paper-chip"><Icon name="paper" size={12}/><strong>{p.title}</strong><button className="paper-chip-deep-dive" onClick={() => window.location.assign(`/deep-dive/${encodeURIComponent(p.id)}?session_id=${encodeURIComponent(currentSession?.id ?? "local")}`)} aria-label={`Open deeper dive for ${p.title}`} title="Open deeper dive"><Icon name="book" size={11}/></button><button onClick={() => removePaperFromSet(p.id)} aria-label={`Remove ${p.title}`}><Icon name="close" size={11}/></button></span>)}
             </div>
           ) : <><span className="online-dot"/><strong>General chat</strong><small>Atlas</small></>}
         </div>
