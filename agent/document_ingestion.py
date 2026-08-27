@@ -105,6 +105,9 @@ _SECTION_HEADING = re.compile(
     r"conclusion|references|appendix)\b.*$",
     re.IGNORECASE,
 )
+_NUMBERED_SECTION_HEADING = re.compile(
+    r"^\d+(?:\.\d+)*[.)]?\s+[A-Z][^\n]{1,96}$"
+)
 
 
 def chunk_pages(
@@ -148,7 +151,10 @@ def chunk_pages(
                 and len(lines) > 1
             ):
                 heading = f"{first_line} {lines[1]}"
-            if len(heading) <= 100 and _SECTION_HEADING.fullmatch(heading):
+            if len(heading) <= 100 and (
+                _SECTION_HEADING.fullmatch(heading)
+                or _NUMBERED_SECTION_HEADING.fullmatch(heading)
+            ):
                 flush()
                 current_section = heading
             section_parts.append(paragraph)

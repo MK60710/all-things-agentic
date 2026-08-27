@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections import defaultdict
+from itertools import combinations
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Response
@@ -16,6 +18,9 @@ from service.schemas import (
     SessionMessagesRequest,
     SessionMessagesResponse,
     SessionMetadata,
+    PaperConnection,
+    PaperConnectionEvidence,
+    SessionPaperMapResponse,
 )
 from service.state import AppState
 from service.storage import _paper_session_ids
@@ -89,6 +94,59 @@ def get_session_graph(
         ],
         edges=[SessionGraphEdge(**vars(e)) for e in export.edges],
     )
+
+
+@router.get("/{session_id}/paper-map", response_model=SessionPaperMapResponse)
+def get_session_paper_map(
+    session_id: str, state: AppState = Depends(get_state)
+) -> SessionPaperMapResponse:
+    """Return an optional paper-level projection of the session graph.
+
+    It is deliberately deterministic: papers connect only when their
+    extracted graph evidence shares a canonical topic, and every summary
+    points back to that topic's paper/section evidence.
+    """
+    existing = next((s for s in state.session_store.list() if s.get("id") == session_id), None)
+    if existing is None:
+        raise HTTPException(status_code=404, detail=f"no session {session_id!r}")
+    paper_titles = {
+        p["id"]: p.get("title", p["id"])
+        for p in state.paper_store.list()
+        if session_id in _paper_session_ids(p)
+    }
+    export = state.graph.export_session_graph(session_id)
+    pair_topics: defaultdict[tuple[str, str], list[tuple[str, dict[str, list[dict]]]]] = defaultdict(list)
+    for node in export.nodes:
+        if node.type == "PAPER":
+            continue
+        by_paper: defaultdict[str, list[dict]] = defaultdict(list)
+        for citation in node.citations:
+            if citation.paper_id in paper_titles:
+                by_paper[citation.paper_id].append({"section": citation.section, "quote": citation.source_quote})
+        for paper_a, paper_b in combinations(sorted(by_paper), 2):
+            pair_topics[(paper_a, paper_b)].append((node.name, dict(by_paper)))
+
+    connections = []
+    for (paper_a, paper_b), topics in sorted(pair_topics.items()):
+        topic_names = sorted({topic for topic, _ in topics})
+        evidence = []
+        for topic, citations_by_paper in topics[:6]:
+            for paper_id in (paper_a, paper_b):
+                citation = citations_by_paper[paper_id][0]
+                evidence.append(PaperConnectionEvidence(topic=topic, paper_id=paper_id, section=citation["section"], quote=citation["quote"]))
+        joined = ", ".join(topic_names[:3])
+        if len(topic_names) > 3:
+            joined += f" and {len(topic_names) - 3} more topics"
+        connections.append(PaperConnection(
+            paper_a_id=paper_a,
+            paper_a_title=paper_titles[paper_a],
+            paper_b_id=paper_b,
+            paper_b_title=paper_titles[paper_b],
+            summary=f"These papers are connected through shared extracted topics: {joined}.",
+            shared_topics=topic_names,
+            evidence=evidence,
+        ))
+    return SessionPaperMapResponse(session_id=session_id, connections=connections)
 
 
 @router.get("/{session_id}/bibliography")

@@ -10,13 +10,18 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
+import logging
 import os
+import time
+import uuid
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from service.routers import chat, clarifications, contradictions, feynman, gaps, health, papers, query, sessions
 from service.state import build_state
+
+logger = logging.getLogger("atlas.request")
 
 
 @asynccontextmanager
@@ -29,6 +34,40 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="all-things-agentic API", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def request_logging(request: Request, call_next):
+    """Attach a correlation ID and log every request's outcome and latency.
+
+    The ID is also returned to the browser so a user can report one value
+    and operators can find the matching backend logs without logging request
+    bodies, prompts, PDFs, or explanations.
+    """
+    request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
+    request.state.request_id = request_id
+    started = time.monotonic()
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception(
+            "request_failed request_id=%s method=%s path=%s duration_ms=%d",
+            request_id,
+            request.method,
+            request.url.path,
+            round((time.monotonic() - started) * 1000),
+        )
+        raise
+    response.headers["X-Request-ID"] = request_id
+    logger.info(
+        "request_complete request_id=%s method=%s path=%s status=%d duration_ms=%d",
+        request_id,
+        request.method,
+        request.url.path,
+        response.status_code,
+        round((time.monotonic() - started) * 1000),
+    )
+    return response
 
 origins = [
     value.strip()

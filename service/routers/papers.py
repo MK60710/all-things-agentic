@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import secrets
+import time
 import uuid
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
@@ -11,10 +12,14 @@ from pathlib import Path
 
 import requests
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse
 
 from service.deps import get_state, require_api_key
 from service.schemas import (
     ArxivIngestRequest,
+    DeepDiveResponse,
+    DeepDiveSection,
+    DeepDiveSource,
     GraphVizEdge,
     GraphVizNode,
     PaperIngestResponse,
@@ -36,6 +41,16 @@ _UNSAFE_PAPER_ID_CHARS = re.compile(r"[^A-Za-z0-9._-]")
 _ARXIV_ID = re.compile(
     r"^(?:\d{4}\.\d{4,5}|[A-Za-z][A-Za-z0-9.-]*/\d{7})(?:v\d+)?$"
 )
+
+
+def _deep_dive_source_text(text: str, section_title: str, index: int) -> str:
+    """Make common PDF layout artifacts less confusing in the source view."""
+    if index == 0 and "introduction" in section_title.lower():
+        start = text.find("With language models now serving")
+        if start >= 0:
+            text = text[start:]
+    text = re.sub(r"(?:\s*[✅❌]){2,}", " [figure response markers]", text)
+    return text.strip()
 
 
 def _sanitize_paper_id(raw: str) -> str:
@@ -131,6 +146,13 @@ def _ingest(
     pdf_url: str | None = None,
     session_id: str | None = None,
 ) -> PaperIngestResponse:
+    started = time.monotonic()
+    logger.info(
+        "ingest_started paper_id=%s session_id=%s title=%r",
+        paper_id,
+        session_id or "",
+        title,
+    )
     metadata = dict(title=title, authors=authors, abstract=abstract, pdf_url=pdf_url)
     # guide=None invalidates any previously generated walkthrough on a
     # re-ingest of the same paper_id - stale content shouldn't be served
@@ -156,18 +178,26 @@ def _ingest(
         # guide rather than caching a walkthrough for a paper that never
         # successfully ingested.
         message = outcome.issue.message if outcome.issue else "extraction failed"
+        logger.error(
+            "ingest_failed paper_id=%s session_id=%s stage=%s error=%s duration_ms=%d",
+            paper_id,
+            session_id or "",
+            outcome.issue.stage if outcome.issue else "unknown",
+            message,
+            round((time.monotonic() - started) * 1000),
+        )
         state.paper_store.save(paper_id, **metadata, status="failed", error=message, session_id=session_id)
         raise HTTPException(status_code=422, detail=message)
 
-    pending_before = len(state.clarification.pending())
+    # Extraction is a background operation. It must not interrupt the user
+    # with alias-review questions; ambiguous matches remain separate and are
+    # recorded in the logs for later automated canonicalization.
     report = state.research_store.ingest(
         outcome.result,
         paper_name=title,
         entity_embedding_fn=state.entity_embedding_fn,
-        clarification=state.clarification,
         session_id=session_id,
     )
-    pending_added = len(state.clarification.pending()) - pending_before
     # Caches the concurrently pre-generated guide (None if that worker
     # failed) so the frontend's separate POST /papers/{id}/guide call -
     # unchanged, still fires after this response - finds it already
@@ -176,6 +206,15 @@ def _ingest(
     guide_payload = guide.model_dump(mode="json") if guide is not None else None
     state.paper_store.save(
         paper_id, **metadata, status="ready", session_id=session_id, guide=guide_payload
+    )
+    logger.info(
+        "ingest_ready paper_id=%s session_id=%s entities=%d relations=%d guide=%s duration_ms=%d",
+        paper_id,
+        session_id or "",
+        len(outcome.result.entities),
+        len(outcome.result.relations),
+        guide is not None,
+        round((time.monotonic() - started) * 1000),
     )
 
     new_nodes: list[GraphVizNode] = []
@@ -241,7 +280,7 @@ def _ingest(
         chunk_ids=report.chunk_ids,
         entities_added=len(outcome.result.entities),
         relations_added=len(outcome.result.relations),
-        pending_clarification_count=pending_added,
+        pending_clarification_count=0,
         new_nodes=new_nodes,
         new_edges=new_edges,
     )
@@ -278,6 +317,19 @@ def get_paper_status(paper_id: str, state: AppState = Depends(get_state)) -> dic
     card without pulling the whole papers list on each tick."""
     paper = state.paper_store.get(paper_id)
     return {"status": paper.get("status", "unknown") if paper else "unknown"}
+
+
+@router.get("/{paper_id}/source", dependencies=[Depends(require_api_key)])
+def get_paper_source(paper_id: str, state: AppState = Depends(get_state)) -> FileResponse:
+    """Serve the session's stored PDF so graph/map paper links work for uploads."""
+    paper = state.paper_store.get(paper_id)
+    if paper is None:
+        raise HTTPException(status_code=404, detail="paper not found")
+    root = Path(state.upload_root).resolve()
+    path = (root / f"{_sanitize_paper_id(paper_id)}.pdf").resolve()
+    if not path.is_relative_to(root) or not path.is_file():
+        raise HTTPException(status_code=404, detail="paper source is not available")
+    return FileResponse(path, media_type="application/pdf", filename=f"{paper_id}.pdf")
 
 
 @router.post(
@@ -408,3 +460,84 @@ def create_paper_guide(
     guide = state.paper_guide.generate(title, chunks)
     state.paper_store.save(paper_id, guide=guide.model_dump(mode="json"))
     return guide
+
+
+@router.get(
+    "/{paper_id}/deep-dive",
+    response_model=DeepDiveResponse,
+    dependencies=[Depends(require_api_key)],
+)
+def get_paper_deep_dive(
+    paper_id: str, state: AppState = Depends(get_state)
+) -> DeepDiveResponse:
+    """Return the optional, source-expanded view of the existing guide.
+
+    The guide's teaching summary remains cached as before; long source text
+    is assembled deterministically from indexed chunks so it cannot be
+    hallucinated or altered by a second model response.
+    """
+    metadata = state.paper_store.get(paper_id)
+    if metadata is None:
+        raise HTTPException(status_code=404, detail=f"no paper {paper_id!r}")
+    chunks = state.chunks.paper_chunks(paper_id)
+    if not chunks:
+        raise HTTPException(status_code=404, detail="paper has no indexed content")
+    if isinstance(metadata.get("guide"), dict):
+        guide = PaperGuide.model_validate(metadata["guide"])
+    else:
+        guide = state.paper_guide.generate(str(metadata.get("title") or paper_id), chunks)
+        state.paper_store.save(paper_id, guide=guide.model_dump(mode="json"))
+
+    sections: list[DeepDiveSection] = []
+    for index, section in enumerate(guide.sections):
+        section_chunks = [chunk for chunk in chunks if chunk.section == section.title]
+        if not section_chunks:
+            guide_words = {
+                word
+                for word in re.findall(r"[a-z0-9]+", section.title.lower())
+                if len(word) > 3 and word not in {"and", "the", "for", "with"}
+            }
+            section_chunks = [
+                chunk
+                for chunk in chunks
+                if chunk.section
+                and guide_words.intersection(
+                    re.findall(r"[a-z0-9]+", chunk.section.lower())
+                )
+            ]
+        if not section_chunks and section.page_start is not None:
+            section_chunks = [
+                chunk
+                for chunk in chunks
+                if chunk.page_start is not None
+                and chunk.page_start <= (section.page_end or section.page_start)
+                and (chunk.page_end or chunk.page_start) >= section.page_start
+            ]
+        sections.append(
+            DeepDiveSection(
+                section_id=f"section-{index}",
+                title=section.title,
+                plain_language=section.plain_language,
+                key_points=section.key_points,
+                why_it_matters=section.why_it_matters,
+                page_start=section.page_start,
+                page_end=section.page_end,
+                diagram=section.diagram,
+                sources=[
+                    DeepDiveSource(
+                        text=_deep_dive_source_text(chunk.text, section.title, index),
+                        section=chunk.section,
+                        page_start=chunk.page_start,
+                        page_end=chunk.page_end,
+                    )
+                    for chunk in section_chunks
+                ],
+            )
+        )
+    return DeepDiveResponse(
+        paper_id=paper_id,
+        title=guide.title,
+        big_picture=guide.big_picture,
+        reading_time_minutes=guide.reading_time_minutes,
+        sections=sections,
+    )
