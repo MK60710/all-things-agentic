@@ -178,6 +178,7 @@ const ATLAS_TOUR_STEPS: TourStep[] = [
 ];
 
 const FLOW_REVEAL_INTERVAL_MS = 200;
+const MAX_SESSION_PAPERS = 3;
 
 function FlowDiagram({ guide }: { guide: NonNullable<PaperGuide["sections"][number]["diagram"]> }) {
   // Builds itself in on a timer (same idea as GraphBuildAnimation's
@@ -482,7 +483,7 @@ export default function Home() {
   // missed poll just leaves that card's label one step stale for a beat.
   const [ingestStage, setIngestStage] = useState<Record<string, string>>({});
   const ingestControllers = useRef<Map<string, AbortController>>(new Map());
-  const uploadController = useRef<AbortController | null>(null);
+  const uploadControllers = useRef<Map<string, AbortController>>(new Map());
   const [searchError, setSearchError] = useState("");
   const [expandedCitation, setExpandedCitation] = useState<string | null>(null);
   const [dismissedGapKeys, setDismissedGapKeys] = useState<Set<string>>(new Set());
@@ -887,10 +888,18 @@ export default function Home() {
 
   async function handleFiles(files: File[]) {
     if (!files.length) return;
-    const validFiles = files.filter((file) => file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf"));
-    if (validFiles.length !== files.length) setUploadError("Only PDF files were included; other files were skipped.");
+    const slots = MAX_SESSION_PAPERS - papers.length;
+    if (slots <= 0) {
+      setUploadError(`This session is limited to ${MAX_SESSION_PAPERS} papers.`);
+      return;
+    }
+    const pdfFiles = files.filter((file) => file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf"));
+    const validFiles = pdfFiles.slice(0, slots);
+    const notices: string[] = [];
+    if (files.length > slots) notices.push(`You can add up to ${MAX_SESSION_PAPERS} papers per session; only the first ${slots} file${slots === 1 ? "" : "s"} will be processed.`);
+    if (validFiles.length !== files.length && files.length <= slots) notices.push("Only PDF files were included; other files were skipped.");
     if (validFiles.length === 0) {
-      setUploadError("Please choose PDF files.");
+      setUploadError(notices.join(" ") || "Please choose PDF files.");
       return;
     }
     // Same synchronous-ref guard as addArxivPaper, and for the same
@@ -899,39 +908,46 @@ export default function Home() {
     // double-drop (or a drop landing while the native file-picker's own
     // change event is still in flight) can start two uploads before that
     // commit lands.
-    if (uploadController.current) return;
+    if (uploadControllers.current.size > 0) return;
     uploadBatchCancelled.current = false;
     setUploading(true);
-    if (validFiles.length === files.length) setUploadError("");
+    setUploadError(notices.join(" "));
     const failures: string[] = [];
     try {
-      for (const file of validFiles) {
-        if (uploadBatchCancelled.current) break;
+      // Upload all selected papers at once. Each request still runs through
+      // the exact existing single-paper backend pipeline; concurrency here
+      // only prevents the second paper waiting for the first upload to
+      // finish. The graph reveals remain queued so walkthroughs appear as
+      // separate messages, one below the other, in the conversation.
+      await Promise.all(validFiles.map(async (file) => {
+        if (uploadBatchCancelled.current) return;
         const controller = new AbortController();
-        uploadController.current = controller;
+        const controllerKey = `${file.name}:${file.lastModified}:${file.size}`;
+        uploadControllers.current.set(controllerKey, controller);
         try {
           const uploaded = await uploadPaper(file, controller.signal, sessionIdRef.current);
           setBuildingGraphQueue((current) => [...current, uploaded]);
         } catch (error) {
-          if (error instanceof DOMException && error.name === "AbortError") break;
-          failures.push(`${file.name}: ${error instanceof Error ? error.message : "upload failed"}`);
+          if (!(error instanceof DOMException && error.name === "AbortError")) {
+            failures.push(`${file.name}: ${error instanceof Error ? error.message : "upload failed"}`);
+          }
         } finally {
-          uploadController.current = null;
+          uploadControllers.current.delete(controllerKey);
         }
-      }
+      }));
       if (failures.length > 0) {
-        setUploadError(`Could not add ${failures.length} file${failures.length === 1 ? "" : "s"}: ${failures.join("; ")}`);
+        setUploadError([...notices, `Could not add ${failures.length} file${failures.length === 1 ? "" : "s"}: ${failures.join("; ")}`].join(" "));
       }
     } finally {
       setUploading(false);
-      uploadController.current = null;
+      uploadControllers.current.clear();
       if (fileInput.current) fileInput.current.value = "";
     }
   }
 
   function cancelUpload() {
     uploadBatchCancelled.current = true;
-    uploadController.current?.abort();
+    uploadControllers.current.forEach((controller) => controller.abort());
   }
 
   // announce=false is for the one caller that already sent its own "I've
@@ -1018,7 +1034,7 @@ export default function Home() {
     // ingestingIds-only guard lets both through - confirmed live: it
     // double-ingested the same paper, extracting it twice and duplicating
     // its entity-merge clarifications.
-    if (ingestControllers.current.has(result.id)) return;
+    if (papers.length >= MAX_SESSION_PAPERS || ingestControllers.current.has(result.id)) return;
     const controller = new AbortController();
     ingestControllers.current.set(result.id, controller);
     setIngestingIds((current) => new Set(current).add(result.id));
@@ -1280,11 +1296,11 @@ export default function Home() {
 
           {addMode === "upload" && <div className="upload-panel">
             <button className="back-button" onClick={() => setAddMode("choose")}>← Back</button>
-            <button className="drop-zone" onClick={() => fileInput.current?.click()} onDragOver={(event) => event.preventDefault()} onDrop={onDrop} disabled={uploading}>
-              <span><Icon name="upload" size={25}/></span><strong>{uploading ? "Uploading and reading papers one at a time…" : "Choose PDFs or drag them here"}</strong><small>Each PDF follows Atlas’s normal reading and graph-building process.</small>
+            <button className="drop-zone" onClick={() => fileInput.current?.click()} onDragOver={(event) => event.preventDefault()} onDrop={onDrop} disabled={uploading || papers.length >= MAX_SESSION_PAPERS}>
+              <span><Icon name="upload" size={25}/></span><strong>{uploading ? "Uploading and reading papers simultaneously…" : papers.length >= MAX_SESSION_PAPERS ? "Three-paper limit reached" : "Choose up to 3 PDFs or drag them here"}</strong><small>Selected papers are processed together, then their walkthroughs appear one below another.</small>
             </button>
             {uploading && <button className="cancel-ingest" onClick={cancelUpload}>Cancel</button>}
-            <input ref={fileInput} className="hidden-input" type="file" accept="application/pdf,.pdf" multiple onChange={(event: ChangeEvent<HTMLInputElement>) => void handleFiles(Array.from(event.target.files ?? []))}/>
+            <input ref={fileInput} className="hidden-input" type="file" accept="application/pdf,.pdf" multiple disabled={papers.length >= MAX_SESSION_PAPERS} onChange={(event: ChangeEvent<HTMLInputElement>) => void handleFiles(Array.from(event.target.files ?? []))}/>
             {uploadError && <p className="form-error">{uploadError}</p>}
           </div>}
 
