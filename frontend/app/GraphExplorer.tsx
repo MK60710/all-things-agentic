@@ -80,9 +80,9 @@ export default function GraphExplorer({
   // A session map must show every uploaded paper, even when no verified
   // cross-paper edge exists. The graph then naturally renders separate
   // components for unrelated papers and one component when an edge links
-  // them. The toggle remains available to reduce clutter from isolated
-  // extracted entities, but is opt-in rather than the default.
-  const [showUnconnected, setShowUnconnected] = useState(true);
+  // them. Isolated extracted entities are hidden by default because they
+  // otherwise make a second paper look surrounded by unrelated dots.
+  const [showUnconnected, setShowUnconnected] = useState(false);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const fgRef = useRef<any>(null);
 
@@ -128,7 +128,7 @@ export default function GraphExplorer({
   const filteredNodeIds = useMemo(
     () => new Set(nodes
       .filter((n) => visibleTypes.has(n.type))
-      .filter((n) => showUnconnected || connectedNodeIds.has(n.node_id))
+      .filter((n) => showUnconnected || connectedNodeIds.has(n.node_id) || n.type === "PAPER")
       .map((n) => n.node_id)),
     [nodes, visibleTypes, showUnconnected, connectedNodeIds],
   );
@@ -319,7 +319,7 @@ export default function GraphExplorer({
               <small>{filteredNodeIds.size} shown · {edges.length} connections · {unconnectedCount} unconnected</small>
             )}
           </div>
-          <p className="graph-explorer-subtitle">Each connected cluster represents a paper or papers linked by an evidence-backed edge. Unrelated papers remain as separate maps.</p>
+          <p className="graph-explorer-subtitle">Each connected cluster represents a paper or papers linked by an evidence-backed edge. Unrelated papers remain as separate maps; isolated extracted items are hidden by default.</p>
         </div>
         <div className="graph-explorer-search">
           <input
