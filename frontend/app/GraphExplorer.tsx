@@ -77,6 +77,7 @@ export default function GraphExplorer({
   const [exportingCitations, setExportingCitations] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
   const [nodeSearch, setNodeSearch] = useState("");
+  const [showUnconnected, setShowUnconnected] = useState(false);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const fgRef = useRef<any>(null);
 
@@ -117,9 +118,14 @@ export default function GraphExplorer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active, sessionId]);
 
+  const connectedNodeIds = useMemo(() => new Set(edges.flatMap((edge) => [edge.source_id, edge.target_id])), [edges]);
+  const unconnectedCount = useMemo(() => nodes.filter((node) => !connectedNodeIds.has(node.node_id)).length, [nodes, connectedNodeIds]);
   const filteredNodeIds = useMemo(
-    () => new Set(nodes.filter((n) => visibleTypes.has(n.type)).map((n) => n.node_id)),
-    [nodes, visibleTypes],
+    () => new Set(nodes
+      .filter((n) => visibleTypes.has(n.type))
+      .filter((n) => showUnconnected || connectedNodeIds.has(n.node_id))
+      .map((n) => n.node_id)),
+    [nodes, visibleTypes, showUnconnected, connectedNodeIds],
   );
   const graphData = useMemo(() => ({
     nodes: nodes
@@ -129,6 +135,10 @@ export default function GraphExplorer({
       .filter((e) => filteredNodeIds.has(e.source_id) && filteredNodeIds.has(e.target_id))
       .map((e) => ({ source: e.source_id, target: e.target_id, relation: e.relation })),
   }), [nodes, edges, filteredNodeIds]);
+
+  useEffect(() => {
+    if (selectedNode && !filteredNodeIds.has(selectedNode.node_id)) setSelectedNode(null);
+  }, [selectedNode, filteredNodeIds]);
 
   // The default d3-force charge/link strengths are tuned for small,
   // sparse graphs - confirmed live: with 100+ nodes and this session's
@@ -172,7 +182,7 @@ export default function GraphExplorer({
   const connections = useMemo(() => {
     if (!selectedNode) return [];
     const seen = new Set<string>();
-    const deduped: { edgeId: string; relation: string; name: string; direction: "outgoing" | "incoming" }[] = [];
+    const deduped: { edgeId: string; relation: string; name: string; otherId: string; direction: "outgoing" | "incoming" }[] = [];
     for (const e of edges) {
       if (e.source_id !== selectedNode.node_id && e.target_id !== selectedNode.node_id) continue;
       // Direction matters for the sentence, not just cosmetics: "A
@@ -196,7 +206,7 @@ export default function GraphExplorer({
       const key = `${direction}:${relationPhrase(e.relation)}:${name}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      deduped.push({ edgeId: e.edge_id, relation: e.relation, name, direction });
+      deduped.push({ edgeId: e.edge_id, relation: e.relation, name, otherId, direction });
     }
     return deduped;
   }, [selectedNode, edges, nodes]);
@@ -255,6 +265,17 @@ export default function GraphExplorer({
     });
   }
 
+  function paperHref(paperId: string): string | null {
+    const paper = papers.find((candidate) => candidate.id === paperId)
+      ?? papers.find((candidate) => candidate.id === `arxiv-${paperId}`)
+      ?? papers.find((candidate) => candidate.id.replace(/^arxiv-/, "") === paperId);
+    const resolvedId = paper?.id ?? paperId;
+    if (paper?.pdfUrl) return paper.pdfUrl;
+    if (resolvedId.startsWith("arxiv-")) return `https://arxiv.org/abs/${resolvedId.slice("arxiv-".length)}`;
+    if (paper) return `/api/papers/${encodeURIComponent(resolvedId)}/source`;
+    return null;
+  }
+
   const MAX_SEARCH_RESULTS = 8;
   const searchResults = useMemo(() => {
     const query = nodeSearch.trim().toLowerCase();
@@ -272,6 +293,15 @@ export default function GraphExplorer({
     fgRef.current?.zoomToFit(600, 140, (n: { id: string }) => n.id === node.node_id);
   }
 
+  function verificationQuestion(node: SessionGraphNode, other?: SessionGraphNode, relation?: string) {
+    const evidence = [node, other]
+      .filter((item): item is SessionGraphNode => Boolean(item))
+      .flatMap((item) => item.citations.slice(0, 2).map((citation) => `${item.name} (${citation.section ?? "paper"}): “${citation.source_quote}”`))
+      .join("\n");
+    const relationship = other ? ` between "${node.name}" and "${other.name}"${relation ? ` (${relationPhrase(relation)})` : ""}` : ` about "${node.name}"`;
+    return `Verify the graph relationship${relationship} against the paper source. Treat graph links as hypotheses, not established facts. Explain whether the cited paper text directly supports the relationship, and say clearly if the evidence is insufficient.${evidence ? `\nGraph source evidence:\n${evidence}` : ""}`;
+  }
+
   if (!active) return null;
 
   return (
@@ -281,7 +311,7 @@ export default function GraphExplorer({
           <div className="graph-explorer-title-row">
             <strong>Graph Explorer</strong>
             {!loading && !error && nodes.length > 0 && (
-              <small>{nodes.length} things · {edges.length} connections</small>
+              <small>{filteredNodeIds.size} shown · {edges.length} connections · {unconnectedCount} unconnected</small>
             )}
           </div>
           <p className="graph-explorer-subtitle">Every dot is something from your papers - a method, a result, an idea. Click one to read about it and see what it connects to.</p>
@@ -329,6 +359,10 @@ export default function GraphExplorer({
             <span style={{ color: TYPE_COLORS[type] ?? DEFAULT_NODE_COLOR }}>{typeLabel(type)}</span>
           </label>
         ))}
+        <label className="graph-explorer-unconnected-toggle">
+          <input type="checkbox" checked={showUnconnected} onChange={(event) => setShowUnconnected(event.target.checked)} />
+          Show unconnected items
+        </label>
         <button
           className="graph-explorer-contradictions-check"
           onClick={() => void handleCheckContradictions()}
@@ -356,7 +390,7 @@ export default function GraphExplorer({
           <p className="graph-explorer-status">Nothing in this session's graph yet.</p>
         )}
         {!loading && !error && nodes.length > 0 && (
-          <ForceGraph2D
+          graphData.nodes.length === 0 ? <p className="graph-explorer-status">No connected items match the current filters. Turn on “Show unconnected items” to inspect the rest.</p> : <ForceGraph2D
             ref={fgRef}
             graphData={graphData}
             width={size.width}
@@ -426,6 +460,11 @@ export default function GraphExplorer({
             </span>
             <h3>{selectedNode.name}</h3>
             {selectedNode.description && <p>{selectedNode.description}</p>}
+            {(() => {
+              const paperId = selectedNode.citations[0]?.paper_id;
+              const href = paperId ? paperHref(paperId) : null;
+              return href ? <a className="graph-explorer-open-paper" href={href} target="_blank" rel="noreferrer">Open paper <span aria-hidden="true">↗</span></a> : null;
+            })()}
             {selectedNode.citations.length > 0 && (
               <div className="graph-explorer-citations">
                 <small className="graph-explorer-connections-label">Where this came from</small>
@@ -433,7 +472,7 @@ export default function GraphExplorer({
                   const paper = papers.find((p) => p.id === cit.paper_id);
                   return (
                     <p key={`${cit.paper_id}-${cit.section ?? ""}`} className="graph-explorer-citation">
-                      {paper?.title ?? cit.paper_id}
+                      {paperHref(cit.paper_id) ? <a href={paperHref(cit.paper_id) ?? "#"} target="_blank" rel="noreferrer">{paper?.title ?? cit.paper_id} ↗</a> : (paper?.title ?? cit.paper_id)}
                       {cit.section && <span> · {cit.section}</span>}
                     </p>
                   );
@@ -442,7 +481,7 @@ export default function GraphExplorer({
             )}
             <button
               className="graph-explorer-ask"
-              onClick={() => onAskInChat(`What do you know about "${selectedNode.name}"?`)}
+              onClick={() => onAskInChat(verificationQuestion(selectedNode))}
             >
               Ask about this in chat
             </button>
@@ -454,9 +493,7 @@ export default function GraphExplorer({
                 <button
                   key={c.edgeId}
                   className="graph-explorer-connection"
-                  onClick={() => onAskInChat(
-                    `How does "${selectedNode.name}" relate to "${c.name}"? (${relationPhrase(c.relation)})`,
-                  )}
+                  onClick={() => onAskInChat(verificationQuestion(selectedNode, nodes.find((n) => n.node_id === c.otherId), c.relation))}
                 >
                   {c.direction === "outgoing"
                     ? <><strong>{selectedNode.name}</strong> {relationPhrase(c.relation)} <strong>{c.name}</strong></>
