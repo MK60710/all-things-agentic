@@ -23,7 +23,7 @@ from agent.schema import Node, NodeType
 from service.app import app
 from service.deps import get_state
 from service.state import AppState
-from service.storage import PaperStore, SessionStore, UploadTokenStore
+from service.storage import PaperStore, SessionMessagesStore, SessionStore, UploadTokenStore
 
 
 def _no_op_judge(claim_a: str, claim_b: str):
@@ -38,6 +38,13 @@ def _no_op_judge(claim_a: str, claim_b: str):
 def _no_op_feynman_judge(node_name: str, node_description: str, explanation: str):
     """Same reasoning as _no_op_judge, for GeminiFeynmanJudge."""
     return None
+
+
+def _stub_summarizer(messages: list[dict]) -> str | None:
+    """Same reasoning as _no_op_judge, for GeminiSessionSummarizer - a
+    deterministic stand-in so compaction tests don't attempt a live
+    Vertex AI call."""
+    return "Stub summary of the conversation."
 
 
 @pytest.fixture
@@ -67,6 +74,8 @@ def app_state(fake_db, tmp_path) -> AppState:
         paper_store=PaperStore(fake_db),
         upload_tokens=UploadTokenStore(fake_db),
         session_store=SessionStore(fake_db),
+        session_messages_store=SessionMessagesStore(fake_db),
+        session_summarizer=_stub_summarizer,
     )
 
 
@@ -1252,3 +1261,95 @@ def test_paper_guide_covers_indexed_paper_and_is_cached(client, app_state, monke
 def test_paper_guide_returns_404_when_paper_has_no_chunks(client):
     response = client.post("/papers/missing/guide")
     assert response.status_code == 404
+
+
+def test_get_session_messages_returns_empty_list_for_unknown_session(client):
+    """Deliberately no 404 here - unlike every other single-session route,
+    a brand-new session's first load has nothing stored yet, which is a
+    normal empty-list state, not an error."""
+    response = client.get("/sessions/does-not-exist/messages")
+
+    assert response.status_code == 200
+    assert response.json() == {"messages": [], "compacted": False}
+
+
+def test_put_session_messages_round_trips_below_threshold(client):
+    messages = [{"id": "1", "role": "user", "text": "What is attention?"}]
+
+    put_response = client.put("/sessions/session-a/messages", json={"messages": messages})
+    get_response = client.get("/sessions/session-a/messages")
+
+    assert put_response.status_code == 200
+    assert put_response.json() == {"messages": messages, "compacted": False}
+    assert get_response.json() == {"messages": messages, "compacted": False}
+
+
+def _oversized_messages(count: int = 850) -> list[dict]:
+    # Deliberately between the 800KB compaction threshold and the
+    # SessionMessagesRequest 950KB reject ceiling, with real margin on
+    # both sides (~888KB) - a count picked to comfortably trigger
+    # compaction without ever risking a 422 from the reject ceiling.
+    return [
+        {"id": str(i), "role": "user" if i % 2 == 0 else "assistant", "text": "x" * 1000}
+        for i in range(count)
+    ]
+
+
+def test_put_session_messages_triggers_compaction_over_threshold(client):
+    response = client.put(
+        "/sessions/session-a/messages", json={"messages": _oversized_messages()}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["compacted"] is True
+    # One synthetic summary notice + the tail of recent real messages.
+    assert len(body["messages"]) == 4
+    assert body["messages"][0]["notice"] is True
+    assert body["messages"][0]["role"] == "assistant"
+    assert "Stub summary of the conversation." in body["messages"][0]["text"]
+    assert body["messages"][1:] == _oversized_messages()[-3:]
+
+    # The compacted (not raw) array is what's actually stored.
+    stored = client.get("/sessions/session-a/messages").json()
+    assert stored["messages"] == body["messages"]
+
+
+def test_put_session_messages_falls_back_to_raw_storage_when_summarizer_fails(
+    client, app_state
+):
+    app_state.session_summarizer = lambda messages: None
+    oversized = _oversized_messages()
+
+    response = client.put("/sessions/session-a/messages", json={"messages": oversized})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["compacted"] is False
+    assert body["messages"] == oversized
+
+
+def test_delete_session_also_deletes_its_messages_doc(client):
+    created = client.post("/sessions", json={"name": "To delete"}).json()
+    session_id = created["id"]
+    client.put(f"/sessions/{session_id}/messages", json={"messages": [{"id": "1", "role": "user", "text": "hi"}]})
+
+    delete_response = client.delete(f"/sessions/{session_id}")
+    get_response = client.get(f"/sessions/{session_id}/messages")
+
+    assert delete_response.status_code == 204
+    assert get_response.json() == {"messages": [], "compacted": False}
+
+
+def test_put_session_messages_rejects_a_payload_over_the_size_ceiling(client):
+    """Every other request-body field in service/schemas.py caps its size
+    - messages (a plain list[dict], with no per-field ceiling to lean on)
+    needs its own explicit guard so it isn't the one unbounded field in
+    the whole schema. Must 422 before ever reaching Firestore or the
+    summarizer, matching the same reasoning already applied to the
+    Feynman Check endpoint's MAX_EXPLANATION_CHARS."""
+    oversized = [{"id": str(i), "role": "user", "text": "x" * 10_000} for i in range(600)]
+
+    response = client.put("/sessions/session-a/messages", json={"messages": oversized})
+
+    assert response.status_code == 422
