@@ -12,7 +12,6 @@ import {
   getFeynmanPrompts,
   getPaperStatus,
   ingestArxivPaper,
-  listClarifications,
   listGaps,
   listPapersForSession,
   listSessions,
@@ -28,6 +27,7 @@ import GraphBuildAnimation from "./GraphBuildAnimation";
 import ConvergenceRitual from "./ConvergenceRitual";
 import GraphExplorer from "./GraphExplorer";
 import Tour, { TourStep } from "./Tour";
+import PaperMap from "./PaperMap";
 
 type IconName = "atlas" | "plus" | "send" | "paper" | "search" | "upload" | "close" | "quote" | "check" | "globe" | "thumbUp" | "thumbDown" | "rename" | "graph" | "help" | "quiz";
 type AddMode = "choose" | "upload" | "search";
@@ -240,6 +240,7 @@ function GuidedReading({ guide, paperId, sessionId, onViewNodeInGraph }: { guide
   // that matches the nav action (Next/a later dot slides in from the
   // right, Back/an earlier dot from the left) instead of a flat cut.
   const [direction, setDirection] = useState<1 | -1>(1);
+  const [quizOpen, setQuizOpen] = useState(false);
   const stop = stops[stopIndex];
   const isLastStop = stopIndex === stops.length - 1;
 
@@ -289,7 +290,13 @@ function GuidedReading({ guide, paperId, sessionId, onViewNodeInGraph }: { guide
       <button type="button" onClick={() => goTo(stopIndex - 1)} disabled={stopIndex === 0}>← Back</button>
       {isLastStop ? (
         paperId && sessionId ? (
-          <FeynmanCheck paperId={paperId} sessionId={sessionId} onViewNodeInGraph={onViewNodeInGraph}/>
+          quizOpen ? <FeynmanCheck paperId={paperId} sessionId={sessionId} onViewNodeInGraph={onViewNodeInGraph}/> : (
+            <div className="guide-complete">
+              <div className="guide-complete-bar"><i/></div>
+              <div className="guide-complete-copy"><span className="guide-complete-check"><Icon name="check" size={13}/></span><small>Walkthrough complete. Test your understanding if you’d like.</small></div>
+              <button type="button" className="optional-quiz-button" onClick={() => setQuizOpen(true)}>Take the optional quiz</button>
+            </div>
+          )
         ) : (
           <div className="guide-complete">
             <div className="guide-complete-bar"><i/></div>
@@ -464,6 +471,7 @@ export default function Home() {
   // one global flag blocking every other result while it's in progress.
   const [ingestingIds, setIngestingIds] = useState<Set<string>>(new Set());
   const [graphExplorerOpen, setGraphExplorerOpen] = useState(false);
+  const [paperMapOpen, setPaperMapOpen] = useState(false);
   const [tourOpen, setTourOpen] = useState(false);
   const [tourSeen, setTourSeen] = useState(false);
   const [graphFocusNodeId, setGraphFocusNodeId] = useState<string | null>(null);
@@ -615,7 +623,7 @@ export default function Home() {
     const freshGapKeys = new Set<string>();
     if (savedMessages) {
       try {
-        restoredMessages = JSON.parse(savedMessages) as Message[];
+        restoredMessages = (JSON.parse(savedMessages) as Message[]).map(({ clarification: _clarification, clarifications: _clarifications, ...message }) => message);
         // Seed the dedup trackers directly from restored history (not from
         // messages state, which won't have committed yet) so checkGuidance
         // below doesn't re-post a clarification/gap card that's already
@@ -720,20 +728,6 @@ export default function Home() {
   // toast for something the user didn't ask for is not - both halves fail
   // silently and independently.
   async function checkGuidance() {
-    let clarification: PendingQuestion | undefined;
-    let clarifications: PendingQuestion[] | undefined;
-    try {
-      const questions = await listClarifications(sessionIdRef.current || undefined);
-      const fresh = questions.filter((q) => q.status === "open" && !shownClarificationIds.current.has(q.id));
-      fresh.forEach((q) => shownClarificationIds.current.add(q.id));
-      if (fresh.length === 1) clarification = fresh[0];
-      // More than one at once reads as a wall of doubt-cards, not a
-      // partner asking a smart question - one compact batched card
-      // instead of N full message bubbles.
-      else if (fresh.length > 1) clarifications = fresh;
-    } catch {
-      // silent
-    }
     let gaps: GapCandidate[] | undefined;
     try {
       const fresh = (await listGaps(3, sessionIdRef.current || undefined)).filter(
@@ -746,10 +740,10 @@ export default function Home() {
     }
     // One combined, collapsed-by-default card instead of up to two
     // separate full-content messages - see expandedFindings above for why.
-    if (clarification || clarifications || gaps) {
+    if (gaps) {
       setMessages((current) => [
         ...current,
-        { id: crypto.randomUUID(), role: "assistant" as const, text: "", notice: true, clarification, clarifications, gaps },
+        { id: crypto.randomUUID(), role: "assistant" as const, text: "", notice: true, gaps },
       ]);
     }
   }
@@ -780,14 +774,16 @@ export default function Home() {
   }
 
   function askAboutGap(candidate: GapCandidate) {
-    const question = `How does ${candidate.node_a_name} relate to ${candidate.node_b_name}?${candidate.explanation ? ` (${candidate.explanation})` : ""}`;
+    const evidence = candidate.citations
+      .slice(0, 4)
+      .map((citation) => `${citation.shared_node_name} (${citation.source_section ?? "unknown section"}): “${citation.source_quote}”`)
+      .join("\n");
+    const question = `Verify this possible graph connection between ${candidate.node_a_name} and ${candidate.node_b_name}. Treat it as a hypothesis, not an established fact. Does the paper text actually support the relationship? Distinguish graph evidence from direct paper evidence.${candidate.explanation ? `\nGraph hypothesis: ${candidate.explanation}` : ""}${evidence ? `\nUnderlying graph evidence:\n${evidence}` : ""}`;
     void recordGapFeedback(candidate.node_a_id, candidate.node_b_id, true).catch(() => {});
-    // Gaps come from GapFinder, which reasons over the whole graph, not the
-    // session's working set - explicitly ignore whatever papers are
-    // currently added, or this silently re-scopes the question to them and
-    // can wrongly report "no information" for evidence that's real but
-    // lives in a paper outside the working set.
-    void ask(undefined, question, []);
+    // Gap suggestions are hypotheses from this session's graph. Keep the
+    // current papers attached so the tutor can verify the graph claim
+    // against their source text instead of answering from graph labels alone.
+    void ask(undefined, question, papers);
   }
 
   function viewNodeInGraph(nodeId: string) {
@@ -861,7 +857,7 @@ export default function Home() {
       setMessages((current) => [...current, {
         id: crypto.randomUUID(),
         role: "assistant",
-        text: error instanceof Error ? `I couldn't reach Gemini: ${error.message}` : "I couldn't reach Gemini.",
+        text: error instanceof Error ? `I couldn't reach Atlas: ${error.message}` : "I couldn't reach Atlas.",
         notice: true,
       }]);
     } finally {
@@ -1066,6 +1062,7 @@ export default function Home() {
     <main className="assistant-app">
       <ConvergenceRitual entries={convergenceEntries} active={ingestingIds.size > 0} onSkip={() => {}}/>
       <GraphExplorer sessionId={currentSession?.id ?? null} sessionName={currentSession?.name} active={graphExplorerOpen} onClose={() => setGraphExplorerOpen(false)} onAskInChat={askFromGraphExplorer} focusNodeId={graphFocusNodeId} papers={papers}/>
+      <PaperMap sessionId={currentSession?.id ?? null} active={paperMapOpen} onClose={() => setPaperMapOpen(false)} papers={papers}/>
       <Tour steps={ATLAS_TOUR_STEPS} active={tourOpen} onClose={() => { setTourOpen(false); setTourSeen(true); }}/>
       <header className="app-header">
         <div className="brand"><span><Icon name="atlas" size={21}/></span><strong>Atlas</strong></div>
@@ -1074,7 +1071,7 @@ export default function Home() {
             <div className="paper-chip-row">
               {papers.map((p) => <span key={p.id} className="paper-chip"><Icon name="paper" size={12}/><strong>{p.title}</strong><button onClick={() => removePaperFromSet(p.id)} aria-label={`Remove ${p.title}`}><Icon name="close" size={11}/></button></span>)}
             </div>
-          ) : <><span className="online-dot"/><strong>General chat</strong><small>Gemini</small></>}
+          ) : <><span className="online-dot"/><strong>General chat</strong><small>Atlas</small></>}
         </div>
         <div className="header-actions">
           <div className="session-switcher" ref={sessionSwitcherRef}>
@@ -1110,6 +1107,7 @@ export default function Home() {
             title={papers.length === 0 ? "Add a paper to explore its graph" : "Explore this session's knowledge graph"}
             aria-label="Open graph explorer"
           ><Icon name="graph" size={17}/></button>
+          <button className="paper-map-toggle" onClick={() => setPaperMapOpen(true)} disabled={papers.length < 2} title={papers.length < 2 ? "Add at least two papers to map connections" : "Map connections between this session's papers"} aria-label="Map paper connections"><Icon name="graph" size={15}/><span>Map papers <em>BETA</em></span></button>
           <button className="tour-help-button" onClick={() => setTourOpen(true)} title="Replay the walkthrough" aria-label="Replay the walkthrough"><Icon name="help" size={17}/></button>
           <button className="add-paper-button" onClick={() => openAddPaper()}><Icon name="plus" size={17}/>{papers.length ? "Add another" : "Add paper"}</button>
         </div>
@@ -1121,12 +1119,9 @@ export default function Home() {
             <div className="welcome">
               <span className="welcome-icon"><Icon name="atlas" size={27}/></span>
               <h1>How can I help?</h1>
-              <p>Chat normally with Gemini, or add a research paper whenever you want to go deeper.</p>
+              <p>Ask Atlas anything, or take the tour to see how paper-grounded research works.</p>
               <div className="welcome-actions">
-                <button onClick={() => ask(undefined, "Help me understand how AI agents use memory")}>Explain a research topic</button>
-                <button onClick={() => ask(undefined, "Help me brainstorm a research question")}>Brainstorm with me</button>
-                <button onClick={() => openAddPaper()}><Icon name="paper" size={15}/>Add a paper</button>
-                <button className="welcome-tour-button" onClick={() => setTourOpen(true)}><Icon name="help" size={15}/>{tourSeen ? "Retake the tour" : "Take the tour"}</button>
+                <button type="button" className="welcome-tour-button" onClick={() => setTourOpen(true)}><Icon name="help" size={15}/>{tourSeen ? "Retake the tour" : "Take the tour"}</button>
               </div>
             </div>
           ) : (
@@ -1153,10 +1148,11 @@ export default function Home() {
                 return <article key={message.id} className={`message ${message.role} ${message.notice ? "notice" : ""} ${isGuideMessage ? "guide-message" : ""}`}>
                   {message.role === "assistant" && <span className="assistant-avatar"><Icon name={message.notice ? "check" : "atlas"} size={16}/></span>}
                   <div className="message-body">
-                    {message.role === "assistant" && <small>{isGuideMessage ? "Atlas guide" : message.notice ? "Atlas" : "Gemini"}</small>}
+                    {message.role === "assistant" && <small>{isGuideMessage ? "Atlas guide" : "Atlas"}</small>}
                     {message.text && <p>{message.text}</p>}
                     {message.guideLoading && <div className="guide-building"><span/><div><strong>Building your guided reading</strong><small>Finding the paper's structure, simplifying each section, and drawing useful visual explanations…</small></div></div>}
                     {message.guide && <GuidedReading guide={message.guide} paperId={message.paperId} sessionId={currentSession?.id} onViewNodeInGraph={viewNodeInGraph}/>}
+                    {message.guide && message.paperId && <button type="button" className="deep-dive-launch" onClick={() => window.location.assign(`/deep-dive/${encodeURIComponent(message.paperId!)}?session_id=${encodeURIComponent(currentSession?.id ?? "local")}`)}><strong>Open deeper dive <em>BETA</em></strong><small>Explore the full paper text with a section tutor.</small></button>}
                     {message.guideError && <span className="guide-error">{message.guideError}</span>}
                     {message.feynmanPickPaper && <div className="candidate-list">{papers.map((p) => <button key={p.id} onClick={() => setMessages((current) => current.map((m) => m.id === message.id ? { ...m, feynmanPickPaper: false, feynmanPaperId: p.id } : m))}><strong>{p.title}</strong></button>)}</div>}
                     {message.feynmanPaperId && currentSession?.id && <FeynmanCheck paperId={message.feynmanPaperId} sessionId={currentSession.id} onViewNodeInGraph={viewNodeInGraph}/>}
@@ -1217,7 +1213,7 @@ export default function Home() {
                       {visibleGaps && visibleGaps.length > 0 && <div className="gap-suggestions">
                         {visibleGaps.map((candidate) => <div key={gapKey(candidate)} className="gap-chip">
                           <button onClick={() => askAboutGap(candidate)}>
-                            <strong>{candidate.node_a_name} ↔ {candidate.node_b_name}</strong>
+                            <strong>Possible connection to verify: {candidate.node_a_name} ↔ {candidate.node_b_name}</strong>
                             {candidate.explanation && <span>{candidate.explanation}</span>}
                           </button>
                           <button className="gap-dismiss" onClick={() => dismissGap(candidate)} aria-label="Not interesting"><Icon name="close" size={12}/></button>
@@ -1238,16 +1234,16 @@ export default function Home() {
         {papers.length > 0 && <div className="paper-context-chip"><Icon name="paper" size={14}/><span>Using <strong>{papers.length === 1 ? papers[0].title : `${papers.length} papers`}</strong></span></div>}
         <form className="composer" onSubmit={(event) => ask(event)}>
           <button type="button" className="composer-add" onClick={() => openAddPaper()} aria-label="Add a paper"><Icon name="plus" size={19}/></button>
-          <textarea ref={composerInput} value={query} maxLength={8000} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void ask(); } }} rows={1} placeholder={papers.length ? "Ask anything about these papers…" : "Message Gemini…"}/>
+          <textarea ref={composerInput} value={query} maxLength={8000} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void ask(); } }} rows={1} placeholder={papers.length ? "Ask anything about these papers…" : "Message Atlas…"}/>
           <button type="submit" className="send-button" disabled={!query.trim() || loading} aria-label="Send"><Icon name="send" size={18}/></button>
         </form>
-        <small className="composer-hint">Gemini can make mistakes. Paper answers include sources when available.</small>
+        <small className="composer-hint">Atlas can make mistakes. Paper answers include sources when available.</small>
       </footer>
 
       {addOpen && <div className="add-modal" role="dialog" aria-modal="true" aria-label="Add a research paper">
         <div className="modal-scrim" onClick={() => setAddOpen(false)} aria-hidden="true"/>
         <section className={`modal-card ${buildingGraphQueue.length > 0 ? "modal-card-fullscreen" : ""}`}>
-          <header><div><span><Icon name="paper" size={18}/></span><div><strong>Add a research paper</strong><small>Give Gemini a paper to read with you</small></div></div><button onClick={() => setAddOpen(false)} aria-label="Close"><Icon name="close" size={19}/></button></header>
+          <header><div><span><Icon name="paper" size={18}/></span><div><strong>Add a research paper</strong><small>Give Atlas a paper to read with you</small></div></div><button onClick={() => setAddOpen(false)} aria-label="Close"><Icon name="close" size={19}/></button></header>
 
           {buildingGraphQueue.length > 0 ? (
             <GraphBuildAnimation
