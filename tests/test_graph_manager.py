@@ -23,12 +23,13 @@ def _make_manager(fake_db) -> GraphManager:
     return GraphManager(project_id="test-project", db_client=fake_db)
 
 
-def _node(name: str, embedding: list[float] | None = None) -> Node:
+def _node(name: str, embedding: list[float] | None = None, owner_uid: str = "owner-1") -> Node:
     return Node(
         id=str(uuid.uuid4()),
         type=NodeType.CONCEPT,
         name=name,
         entity_embedding=embedding,
+        owner_uid=owner_uid,
     )
 
 
@@ -316,7 +317,7 @@ def test_canonicalize_string_match_auto_merges(fake_db):
     gm = _make_manager(fake_db)
     existing = _node("Chain of Thought")
     gm.add_node(existing)
-    result = gm.canonicalize("chain of thought")  # casing differs
+    result = gm.canonicalize("chain of thought", owner_uid="owner-1")  # casing differs
     assert result.decision == "auto_merge"
     assert result.matched_node_id == existing.id
 
@@ -325,7 +326,7 @@ def test_canonicalize_high_similarity_auto_merges(fake_db):
     gm = _make_manager(fake_db)
     existing = _node("Few-Shot Prompting", embedding=[1.0, 0.0])
     gm.add_node(existing)
-    result = gm.canonicalize("In-Context Learning", embedding=[1.0, 0.0])
+    result = gm.canonicalize("In-Context Learning", embedding=[1.0, 0.0], owner_uid="owner-1")
     assert result.decision == "auto_merge"
 
 
@@ -334,7 +335,7 @@ def test_canonicalize_middle_band_needs_clarification(fake_db):
     existing = _node("Fine-Tuning", embedding=[1.0, 0.0])
     gm.add_node(existing)
     # cosine similarity = 0.8, between LOW (0.75) and HIGH (0.92)
-    result = gm.canonicalize("Parameter Tuning", embedding=[0.8, 0.6])
+    result = gm.canonicalize("Parameter Tuning", embedding=[0.8, 0.6], owner_uid="owner-1")
     assert result.decision == "needs_clarification"
     assert result.matched_node_id == existing.id
 
@@ -343,7 +344,7 @@ def test_canonicalize_low_similarity_is_new(fake_db):
     gm = _make_manager(fake_db)
     existing = _node("Transformer", embedding=[1.0, 0.0])
     gm.add_node(existing)
-    result = gm.canonicalize("Reinforcement Learning", embedding=[0.0, 1.0])
+    result = gm.canonicalize("Reinforcement Learning", embedding=[0.0, 1.0], owner_uid="owner-1")
     assert result.decision == "new"
 
 
@@ -355,7 +356,7 @@ def test_canonicalize_unicode_math_variant_auto_merges(fake_db):
     gm = _make_manager(fake_db)
     existing = _node("Cochran's Q statistic")
     gm.add_node(existing)
-    result = gm.canonicalize("Cochran's \U0001d444 statistic")
+    result = gm.canonicalize("Cochran's \U0001d444 statistic", owner_uid="owner-1")
     assert result.decision == "auto_merge"
     assert result.matched_node_id == existing.id
 
@@ -364,7 +365,7 @@ def test_canonicalize_bare_abbreviation_matches_spelled_out_form(fake_db):
     gm = _make_manager(fake_db)
     existing = _node("moral operational design domain (moral ODD)")
     gm.add_node(existing)
-    result = gm.canonicalize("moral ODD")
+    result = gm.canonicalize("moral ODD", owner_uid="owner-1")
     assert result.decision == "auto_merge"
     assert result.matched_node_id == existing.id
 
@@ -373,7 +374,7 @@ def test_canonicalize_spelled_out_form_matches_existing_bare_abbreviation(fake_d
     gm = _make_manager(fake_db)
     existing = _node("moral ODD")
     gm.add_node(existing)
-    result = gm.canonicalize("moral operational design domain (moral ODD)")
+    result = gm.canonicalize("moral operational design domain (moral ODD)", owner_uid="owner-1")
     assert result.decision == "auto_merge"
     assert result.matched_node_id == existing.id
 
@@ -393,7 +394,7 @@ def test_canonicalize_does_not_match_two_differently_qualified_parenthetical_for
     gm.add_node(existing)
     result = gm.canonicalize(
         "moral operational design domain (moral ODD)", embedding=[0.0, 1.0]
-    )
+    , owner_uid="owner-1")
     assert result.decision == "new"
 
 
@@ -417,7 +418,7 @@ def test_canonicalize_bare_abbreviation_ambiguous_across_two_forms_falls_through
             embedding=[1.0, 0.0],
         )
     )
-    result = gm.canonicalize("moral ODD", embedding=[0.0, 1.0])
+    result = gm.canonicalize("moral ODD", embedding=[0.0, 1.0], owner_uid="owner-1")
     assert result.decision == "new"
 
 
@@ -430,8 +431,8 @@ def test_resolve_alias_merge_writes_same_as_edge(fake_db):
     canonical, alias = _node("LLM Agent"), _node("Language Model Agent")
     gm.add_node(canonical)
     gm.add_node(alias)
-    gm.resolve_alias(canonical.id, alias.id)
-    gm.resolve_alias(canonical.id, alias.id)
+    gm.resolve_alias(canonical.id, alias.id, owner_uid="owner-1")
+    gm.resolve_alias(canonical.id, alias.id, owner_uid="owner-1")
     edges = list(gm.graph.get_edge_data(alias.id, canonical.id).values())
     assert len(edges) == 1
     assert edges[0]["type"] == EdgeType.SAME_AS.value
@@ -445,7 +446,7 @@ def test_resolve_alias_distinct_prevents_recollision(fake_db):
     )
     gm.add_node(a)
     gm.add_node(b)
-    gm.resolve_alias(a.id, b.id, distinct=True)
+    gm.resolve_alias(a.id, b.id, owner_uid="owner-1", distinct=True)
     assert tuple(sorted((a.id, b.id))) in gm._known_distinct
 
     rehydrated = _make_manager(fake_db)
@@ -552,8 +553,8 @@ def test_apply_extraction_result_is_idempotent(fake_db):
         chunks=["chunk one"],
     )
 
-    first = gm.apply_extraction_result(extraction, paper_name="Paper Title")
-    second = gm.apply_extraction_result(extraction, paper_name="Paper Title")
+    first = gm.apply_extraction_result(extraction, paper_name="Paper Title", owner_uid="owner-1")
+    second = gm.apply_extraction_result(extraction, paper_name="Paper Title", owner_uid="owner-1")
 
     assert first.paper_node_id != "paper-1"
     assert len(first.node_writes) == 2
@@ -583,7 +584,7 @@ def test_apply_extraction_result_tags_new_nodes_and_edges_with_session_id(fake_d
 
     report = gm.apply_extraction_result(
         extraction, paper_name="Paper Title", session_id="session-a"
-    )
+    , owner_uid="owner-1")
 
     assert gm.graph.nodes[report.paper_node_id]["session_ids"] == ["session-a"]
     for write in report.node_writes:
@@ -609,7 +610,7 @@ def test_apply_extraction_result_reused_node_adds_the_new_session_alongside_the_
         ],
         relations=[],
     )
-    gm.apply_extraction_result(first, session_id="session-a")
+    gm.apply_extraction_result(first, session_id="session-a", owner_uid="owner-1")
 
     second = ExtractionResult(
         paper_id="paper-two",
@@ -618,7 +619,7 @@ def test_apply_extraction_result_reused_node_adds_the_new_session_alongside_the_
         ],  # casing differs - exact-match auto_merge into the session-a node
         relations=[],
     )
-    report = gm.apply_extraction_result(second, session_id="session-b")
+    report = gm.apply_extraction_result(second, session_id="session-b", owner_uid="owner-1")
 
     reused_node_id = report.node_writes[0].node_id
     assert report.node_writes[0].reused_existing_node is True
@@ -660,7 +661,7 @@ def test_concurrent_ingests_of_the_same_new_entity_do_not_create_duplicate_nodes
             ],
             relations=[],
         )
-        gm.apply_extraction_result(extraction, session_id="session-a")
+        gm.apply_extraction_result(extraction, session_id="session-a", owner_uid="owner-1")
 
     t1 = threading.Thread(target=ingest, args=("paper-one",))
     t2 = threading.Thread(target=ingest, args=("paper-two",))
@@ -688,8 +689,8 @@ def test_apply_extraction_result_paper_node_reingest_adds_the_new_session(fake_d
 
     first = gm.apply_extraction_result(
         extraction, paper_name="Paper Title", session_id="session-a"
-    )
-    gm.apply_extraction_result(extraction, paper_name="Paper Title", session_id="session-b")
+    , owner_uid="owner-1")
+    gm.apply_extraction_result(extraction, paper_name="Paper Title", session_id="session-b", owner_uid="owner-1")
 
     assert gm.graph.nodes[first.paper_node_id]["session_ids"] == ["session-a", "session-b"]
 
@@ -713,7 +714,7 @@ def test_relation_endpoint_uses_declared_entity_type(fake_db):
         ],
     )
 
-    report = gm.apply_extraction_result(extraction)
+    report = gm.apply_extraction_result(extraction, owner_uid="owner-1")
 
     model_id = report.node_writes[0].node_id
     assert report.edge_writes[0].source_id == model_id
@@ -761,7 +762,7 @@ def test_ambiguous_relation_endpoint_is_skipped_not_paper_fatal(fake_db):
         ],
     )
 
-    report = gm.apply_extraction_result(extraction)
+    report = gm.apply_extraction_result(extraction, owner_uid="owner-1")
 
     # The ambiguous relation (untyped "Attention" matches two nodes) is
     # skipped and counted, not raised.
@@ -785,7 +786,7 @@ def test_search_nodes_excludes_merged_alias_nodes(fake_db):
     gm.add_node(alias)
     assert len(gm.search_nodes("fine tuning parameter", min_score=0.0)) == 2
 
-    gm.resolve_alias(canonical.id, alias.id)
+    gm.resolve_alias(canonical.id, alias.id, owner_uid="owner-1")
 
     hits = gm.search_nodes("fine tuning parameter", min_score=0.0)
     assert [hit.node_id for hit in hits] == [canonical.id]
@@ -801,9 +802,9 @@ def test_canonicalize_exact_match_excludes_merged_alias_nodes(fake_db):
     alias = _node("Parameter Tuning")
     gm.add_node(canonical)
     gm.add_node(alias)
-    gm.resolve_alias(canonical.id, alias.id)
+    gm.resolve_alias(canonical.id, alias.id, owner_uid="owner-1")
 
-    result = gm.canonicalize("Parameter Tuning")
+    result = gm.canonicalize("Parameter Tuning", owner_uid="owner-1")
 
     assert result.decision == "new"  # not auto_merge against the dead alias
 
@@ -814,9 +815,9 @@ def test_canonicalize_embedding_match_excludes_merged_alias_nodes(fake_db):
     alias = _node("Language Model Agent", embedding=[1.0, 0.0])
     gm.add_node(canonical)
     gm.add_node(alias)
-    gm.resolve_alias(canonical.id, alias.id)
+    gm.resolve_alias(canonical.id, alias.id, owner_uid="owner-1")
 
-    result = gm.canonicalize("Autonomous Agent", embedding=[1.0, 0.0])
+    result = gm.canonicalize("Autonomous Agent", embedding=[1.0, 0.0], owner_uid="owner-1")
 
     # The alias had a perfect-similarity embedding but is merged away -
     # canonicalize must not return it as the match.
@@ -848,7 +849,7 @@ def test_get_incident_edges_includes_merged_aliases_edges(fake_db):
         )
     )
 
-    gm.resolve_alias(canonical.id, alias.id)
+    gm.resolve_alias(canonical.id, alias.id, owner_uid="owner-1")
 
     edges = gm.get_incident_edges(canonical.id)
     assert len(edges) == 1
@@ -868,7 +869,7 @@ def test_search_nodes_still_returns_pairs_marked_distinct(fake_db):
     gm.add_node(a)
     gm.add_node(b)
 
-    gm.resolve_alias(a.id, b.id, distinct=True)
+    gm.resolve_alias(a.id, b.id, owner_uid="owner-1", distinct=True)
 
     hits = gm.search_nodes("concept", min_score=0.0)
     assert {hit.node_id for hit in hits} == {a.id, b.id}
@@ -909,7 +910,7 @@ def test_needs_clarification_does_not_reask_a_pair_already_marked_distinct(fake_
 
     report = gm.apply_extraction_result(
         extraction, embedding_fn=embedding_fn, clarification=orchestrator
-    )
+    , owner_uid="owner-1")
 
     # The node itself is still created (canonicalize() still says
     # needs_clarification) - only the question is suppressed.
@@ -946,7 +947,7 @@ def test_needs_clarification_still_creates_node_and_registers_question(fake_db):
 
     report = gm.apply_extraction_result(
         extraction, embedding_fn=embedding_fn, clarification=orchestrator
-    )
+    , owner_uid="owner-1")
 
     provisional_id = report.node_writes[0].node_id
     assert provisional_id != existing.id
@@ -980,7 +981,7 @@ def test_needs_clarification_without_orchestrator_behaves_as_before(fake_db):
 
     report = gm.apply_extraction_result(
         extraction, embedding_fn=lambda entity: [0.8, 0.6]
-    )
+    , owner_uid="owner-1")
 
     assert report.node_writes[0].node_id != existing.id
     assert report.node_writes[0].decision == "needs_clarification"
@@ -1010,7 +1011,7 @@ def test_extracted_paper_entity_reuses_source_paper_node(fake_db):
         ],
     )
 
-    report = gm.apply_extraction_result(extraction, paper_name="Paper Title")
+    report = gm.apply_extraction_result(extraction, paper_name="Paper Title", owner_uid="owner-1")
 
     assert gm.graph.number_of_nodes() == 2
     assert report.node_writes[0].node_id == report.paper_node_id

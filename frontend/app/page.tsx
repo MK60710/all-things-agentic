@@ -25,13 +25,13 @@ import {
 } from "@/lib/api";
 import type { ChatHistoryItem, PaperContext, PaperIngestResult, PaperSearchResult, SessionMetadata } from "@/lib/api";
 import type { Citation, FeynmanCheckResult, FeynmanPrompt, GapCandidate, PaperGuide, PendingQuestion, QueryResponse } from "@/lib/types";
-import GraphBuildAnimation from "./GraphBuildAnimation";
 import ConvergenceRitual from "./ConvergenceRitual";
 import GraphExplorer from "./GraphExplorer";
 import Tour, { TourStep } from "./Tour";
 import PaperMap from "./PaperMap";
+import { useAuth } from "./AuthProvider";
 
-type IconName = "atlas" | "plus" | "send" | "paper" | "search" | "upload" | "close" | "quote" | "check" | "globe" | "thumbUp" | "thumbDown" | "rename" | "graph" | "help" | "quiz" | "book";
+type IconName = "atlas" | "plus" | "send" | "paper" | "search" | "upload" | "close" | "quote" | "check" | "globe" | "thumbUp" | "thumbDown" | "rename" | "graph" | "help" | "quiz" | "book" | "menu" | "papersLink";
 type AddMode = "choose" | "upload" | "search";
 
 interface Message {
@@ -80,11 +80,61 @@ function gapKey(candidate: { node_a_id: string; node_b_id: string }) {
   return `${candidate.node_a_id}:${candidate.node_b_id}`;
 }
 
+// Instant-paint cache for the active session, keyed by id - never the
+// source of truth (the server-side Firestore load below always still
+// runs and overwrites this the moment it resolves), purely so a refresh
+// shows the conversation immediately instead of a blank/loading state
+// while that real fetch is in flight. Confirmed live as the actual ask:
+// "it should instantly load into the session," not just a faster
+// backend - the backend fix alone still left a real network round trip
+// (even a fast one) between refresh and content appearing.
+interface SessionCache {
+  session: SessionMetadata;
+  messages: Message[];
+  papers: PaperContext[];
+}
+
+// Every key below is scoped by uid, not just session id - localStorage is
+// shared across whoever signs in on this browser, and unlike the
+// server-side session load (already safe: get_current_user + owner_uid
+// filtering means a foreign session id server-side just silently finds
+// nothing), this cache reads real cached content straight from local
+// storage with no server round trip at all. Confirmed live as a real gap
+// caught before shipping: without the uid scope, User A signing out and
+// User B signing in on the same device would have briefly hydrated the
+// page with A's actual cached conversation before B's own real fetch
+// caught up and corrected it.
+function sessionIdStorageKey(uid: string) {
+  return `atlas-session-id-${uid}`;
+}
+
+function sessionCacheKey(uid: string, sessionId: string) {
+  return `atlas-session-cache-${uid}-${sessionId}`;
+}
+
+function readSessionCache(uid: string, sessionId: string): SessionCache | null {
+  try {
+    const raw = window.localStorage.getItem(sessionCacheKey(uid, sessionId));
+    return raw ? (JSON.parse(raw) as SessionCache) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeSessionCache(uid: string, cache: SessionCache) {
+  try {
+    window.localStorage.setItem(sessionCacheKey(uid, cache.session.id), JSON.stringify(cache));
+  } catch {
+    // Storage full/unavailable/private-browsing - this cache is purely an
+    // optimization, so failing silently here just means the next refresh
+    // falls back to the normal network-loaded state, not broken behavior.
+  }
+}
+
 // Kept close in length to the original flat "Reading…" label on purpose -
-// .ingest-progress is absolutely positioned in a slot sized for that short
-// text (see .search-results article's reserved right padding in
-// globals.css); a noticeably longer label would overlap the title instead
-// of just replacing the badge text.
+// this feeds ConvergenceRitual's stageLabel suffix (see convergenceEntries
+// in the main component), which sits next to its own cosmetic word
+// rotation; a noticeably longer label crowds that line.
 const INGEST_STAGE_LABELS: Record<string, string> = {
   downloading: "Fetching…",
   // The real, long phase (60-90s+, see service/routers/papers.py's
@@ -149,9 +199,15 @@ const icons: Record<IconName, React.ReactNode> = {
   thumbDown: <path d="M17 14V3h4v11zM17 14l-4 7a2 2 0 0 1-2-2v-5H5.5a2 2 0 0 1-2-2.4l1.5-7A2 2 0 0 1 7 3h10"/>,
   rename: <path d="M12 20h9M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/>,
   graph: <><circle cx="6" cy="6" r="2.6"/><circle cx="18" cy="6" r="2.6"/><circle cx="12" cy="18" r="2.6"/><path d="M8.3 6.7L15.7 6.7M7.4 8.2L10.6 15.8M16.6 8.2L13.4 15.8"/></>,
+  // Two documents linked by a connector, distinct from the abstract
+  // node-cluster `graph` glyph on purpose - paper-map-toggle sat right
+  // next to graph-explorer-toggle using the same icon, confirmed live as
+  // a real "what's the difference between these two" moment.
+  papersLink: <><rect x="3" y="4" width="8" height="11" rx="1.5"/><rect x="13" y="9" width="8" height="11" rx="1.5"/><path d="M11 9.5L13 14.5"/></>,
   help: <><circle cx="12" cy="12" r="9"/><path d="M9.1 9a3 3 0 1 1 4.6 2.6c-.9.5-1.7 1.1-1.7 2.4"/><path d="M12 17.5h.01"/></>,
   quiz: <><path d="M9 21h6M10 18h4M8.5 12.5A5 5 0 1 1 15.5 12.5c-.7 1-1.5 1.6-1.5 3H10c0-1.4-.8-2-1.5-3Z"/></>,
   book: <><path d="M4 19.5V5a2 2 0 0 1 2-2h13v15H6a2 2 0 0 0 0 4h13"/></>,
+  menu: <path d="M4 7h16M4 12h16M4 17h16"/>,
 };
 
 function Icon({ name, size = 19 }: { name: IconName; size?: number }) {
@@ -160,40 +216,64 @@ function Icon({ name, size = 19 }: { name: IconName; size?: number }) {
 
 const ATLAS_TOUR_STEPS: TourStep[] = [
   {
-    target: ".brand",
+    target: ".welcome-icon",
     title: "Welcome to Atlas",
-    body: "A quick tour of the essentials: five stops, skip anytime.",
-    placement: "bottom",
-    clickable: false,
+    body: "A quick nine stop tour. Skip anytime.",
+    placement: "top",
+    noHighlight: true,
   },
   {
     target: ".add-paper-button",
     title: "Add a paper",
-    body: "Click here to upload a PDF or search arXiv. Atlas reads it, builds a real knowledge graph from what's inside, and walks you through it section by section automatically.",
+    body: "Upload a PDF or search arXiv right here. Atlas reads the paper, builds a real knowledge graph from what's inside, and walks you through it section by section.",
     placement: "bottom",
   },
   {
     target: ".composer",
     title: "Ask anything",
-    body: "Ask a question here at any time. Once a paper's added, answers cite the exact section and page they came from.",
+    body: "Ask a question here anytime. Once you've added a paper, answers cite the exact section and page they came from.",
     placement: "top",
+  },
+  {
+    target: ".feynman-check-toggle",
+    title: "Test yourself",
+    body: "Once you've added a paper, explain a concept from it in your own words here. Atlas grades your explanation against the paper's real evidence.",
+    placement: "bottom",
   },
   {
     target: ".graph-explorer-toggle",
     title: "Explore the graph",
-    body: "Once you've added a paper, open this to see every idea it extracted as a real, clickable graph, not just a summary.",
+    body: "Once you've added a paper, open this to see everything it extracted as a real, clickable graph, not just a summary.",
     placement: "bottom",
   },
   {
-    target: ".session-switcher-toggle",
+    target: ".paper-map-toggle",
+    title: "Map papers",
+    body: "A different view: once you've added at least two papers, this shows how they connect to each other, not everything inside each one.",
+    placement: "bottom",
+  },
+  {
+    target: ".app-sidebar-toggle",
     title: "Sessions",
-    body: "Each session is its own research thread with its own papers and graph. Switch or start a new one here anytime.",
+    body: "Each session is its own research thread with its own papers and graph. Switch between sessions or start a new one here.",
+    placement: "bottom",
+  },
+  {
+    target: ".user-menu-toggle",
+    title: "Your account",
+    body: "Switch between light and dark mode or sign out here.",
+    placement: "bottom",
+  },
+  {
+    target: ".tour-help-button",
+    title: "Need a refresher?",
+    body: "Come back here anytime to replay this tour.",
     placement: "bottom",
   },
 ];
 
 const FLOW_REVEAL_INTERVAL_MS = 200;
-const MAX_SESSION_PAPERS = 3;
+const MAX_SESSION_PAPERS = 5;
 
 function FlowDiagram({ guide }: { guide: NonNullable<PaperGuide["sections"][number]["diagram"]> }) {
   // Builds itself in on a timer (same idea as GraphBuildAnimation's
@@ -460,6 +540,53 @@ function FeynmanCheck({ paperId, sessionId, onViewNodeInGraph }: { paperId: stri
 }
 
 export default function Home() {
+  const { user, signOut } = useAuth();
+  const [userMenuOpen, setUserMenuOpen] = useState(false);
+  // Reflects whatever's actually showing right now (an explicit choice, or
+  // the system default when none was ever made) - not just "did the user
+  // pick something." layout.tsx's inline blocking script already applied
+  // any stored explicit choice before this component ever mounts (avoids
+  // a flash of the wrong theme); this effect only needs to sync React's
+  // own state to match what's already on the page, plus resolve the
+  // no-stored-choice case against the system preference for the toggle's
+  // own icon/label.
+  const [theme, setTheme] = useState<"light" | "dark">("light");
+  useEffect(() => {
+    const stored = window.localStorage.getItem("atlas-theme");
+    const resolved =
+      stored === "dark" || stored === "light"
+        ? stored
+        : window.matchMedia("(prefers-color-scheme: dark)").matches
+          ? "dark"
+          : "light";
+    setTheme(resolved);
+  }, []);
+  function toggleTheme() {
+    const next = theme === "dark" ? "light" : "dark";
+    setTheme(next);
+    document.documentElement.setAttribute("data-theme", next);
+    window.localStorage.setItem("atlas-theme", next);
+  }
+  // Desktop: collapses the persistent sidebar to reclaim width, persisted
+  // like the theme choice so it stays collapsed across reloads. Mobile:
+  // the CSS for a collapsed sidebar only exists inside the >680px media
+  // query, so this state has no visible effect there - sessionMenuOpen
+  // (below, unrelated pre-existing state) is what the same toggle button
+  // drives for the small-screen off-canvas overlay instead. One button,
+  // one handler, two different states, because only one of the two is
+  // ever visually active for a given viewport.
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  useEffect(() => {
+    setSidebarCollapsed(window.localStorage.getItem("atlas-sidebar-collapsed") === "1");
+  }, []);
+  function toggleSidebar() {
+    setSidebarCollapsed((current) => {
+      const next = !current;
+      window.localStorage.setItem("atlas-sidebar-collapsed", next ? "1" : "0");
+      return next;
+    });
+    setSessionMenuOpen((open) => !open);
+  }
   const fileInput = useRef<HTMLInputElement>(null);
   const composerInput = useRef<HTMLTextAreaElement>(null);
   const chatEnd = useRef<HTMLDivElement>(null);
@@ -480,9 +607,21 @@ export default function Home() {
   const [uploading, setUploading] = useState(false);
   const uploadBatchCancelled = useRef(false);
   const [uploadError, setUploadError] = useState("");
+  const [uploadingFileNames, setUploadingFileNames] = useState<string[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<PaperSearchResult[]>([]);
   const [searching, setSearching] = useState(false);
+  // Papers picked but not yet sent for extraction - "Start breaking down"
+  // is what actually kicks off ingestion for the whole batch at once, so
+  // the full-screen ConvergenceRitual reflects everything the user asked
+  // for in one pass instead of starting piecemeal per click.
+  const [stagedResults, setStagedResults] = useState<PaperSearchResult[]>([]);
+  const [stagedFiles, setStagedFiles] = useState<File[]>([]);
+  // Snapshot of staged titles at the moment ingestion actually starts -
+  // searchResults/stagedResults are cleared right after so the modal
+  // resets cleanly, but ConvergenceRitual still needs a title per
+  // in-flight id for as long as that id stays in ingestingIds.
+  const [ingestTitles, setIngestTitles] = useState<Record<string, string>>({});
   // Multiple searches can be in flight at once now - keyed by result.id so
   // each card can show its own "Reading…"/cancel independently instead of
   // one global flag blocking every other result while it's in progress.
@@ -565,6 +704,16 @@ export default function Home() {
       if (saveMessagesTimer.current) window.clearTimeout(saveMessagesTimer.current);
     };
   }, [messages]);
+  // Keeps the instant-paint cache current through a live session too, not
+  // just at load time - switchToSession already writes it once the
+  // server confirms a fresh load, but without this a long chat session's
+  // cache would stay frozen at whatever it looked like the moment you
+  // switched in, so a refresh after chatting a while would flash that
+  // stale snapshot before the real fetch corrected it.
+  useEffect(() => {
+    if (!currentSession || sessionIdRef.current !== currentSession.id) return;
+    writeSessionCache(user.uid, { session: currentSession, messages, papers });
+  }, [messages, papers, currentSession]);
   const initRan = useRef(false);
   useEffect(() => {
     // React 18 StrictMode dev-mode double-invokes effects with no cleanup
@@ -573,26 +722,42 @@ export default function Home() {
     // from a single page load.
     if (initRan.current) return;
     initRan.current = true;
+    // Paint instantly from the last-known snapshot of this exact session,
+    // if there is one - initSession() below still runs immediately after
+    // and reconciles with the real server state (a stale/deleted session,
+    // a message sent from another device, etc always wins), this just
+    // means there's something real on screen the moment the page loads
+    // instead of a blank state for however long that fetch takes.
+    const savedId = window.localStorage.getItem(sessionIdStorageKey(user.uid));
+    const cached = savedId ? readSessionCache(user.uid, savedId) : null;
+    if (cached) {
+      sessionIdRef.current = cached.session.id;
+      setCurrentSession(cached.session);
+      setMessages(cached.messages);
+      setPapers(cached.papers);
+    }
     void initSession();
     setTourSeen(window.localStorage.getItem("atlas-tour-seen") === "1");
   }, []);
   const sessionSwitcherRef = useRef<HTMLDivElement | null>(null);
+  const userMenuRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     // graphExplorerOpen was missing here - confirmed live that Escape did
     // nothing while Graph Explorer was open, inconsistent with every other
     // modal in the app (the Add Paper dialog, the session switcher) which
     // this same handler already closes.
-    if (!sessionMenuOpen && !addOpen && !graphExplorerOpen && !createSessionOpen) return;
+    if (!sessionMenuOpen && !addOpen && !graphExplorerOpen && !createSessionOpen && !userMenuOpen) return;
     function onKeyDown(event: KeyboardEvent) {
       if (event.key !== "Escape") return;
       setSessionMenuOpen(false);
       setAddOpen(false);
       setGraphExplorerOpen(false);
       setCreateSessionOpen(false);
+      setUserMenuOpen(false);
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [sessionMenuOpen, addOpen, graphExplorerOpen, createSessionOpen]);
+  }, [sessionMenuOpen, addOpen, graphExplorerOpen, createSessionOpen, userMenuOpen]);
   useEffect(() => {
     // Neither modal had a focus trap - confirmed live: tabbing past
     // Cancel escaped the dialog entirely into background page elements
@@ -632,13 +797,22 @@ export default function Home() {
     document.addEventListener("mousedown", onMouseDown);
     return () => document.removeEventListener("mousedown", onMouseDown);
   }, [sessionMenuOpen]);
+  useEffect(() => {
+    if (!userMenuOpen) return;
+    function onMouseDown(event: MouseEvent) {
+      if (userMenuRef.current?.contains(event.target as Node)) return;
+      setUserMenuOpen(false);
+    }
+    document.addEventListener("mousedown", onMouseDown);
+    return () => document.removeEventListener("mousedown", onMouseDown);
+  }, [userMenuOpen]);
 
   async function initSession() {
     let resolved: SessionMetadata | null = null;
     try {
       const list = await listSessions();
       setSessions(list);
-      const savedId = window.localStorage.getItem("atlas-session-id");
+      const savedId = window.localStorage.getItem(sessionIdStorageKey(user.uid));
       resolved = list.find((s) => s.id === savedId) ?? list[0] ?? null;
       if (!resolved) {
         resolved = await createSession("Untitled session");
@@ -647,13 +821,21 @@ export default function Home() {
     } catch {
       // Backend unreachable at startup - fall back to a purely local
       // session id so the app still works; ingest calls just carry it.
-      const fallbackId = window.localStorage.getItem("atlas-session-id") ?? crypto.randomUUID();
+      const fallbackId = window.localStorage.getItem(sessionIdStorageKey(user.uid)) ?? crypto.randomUUID();
       resolved = { id: fallbackId, name: "Untitled session", created_at: new Date().toISOString() };
     }
     await switchToSession(resolved);
   }
 
   async function switchToSession(session: SessionMetadata) {
+    // Captured before sessionIdRef is overwritten below - true when this
+    // call is reconciling the session already on screen (the mount-time
+    // cache-hydrate case) rather than a genuine switch to a different
+    // one. Used below to skip the papers-flash a real switch needs (clear
+    // the old session's papers so they're never shown mislabeled as the
+    // new session's) but a same-session reconcile does not - there's
+    // nothing stale to clear, only real data to quietly confirm or update.
+    const isReconcilingSameSession = sessionIdRef.current === session.id;
     // Flush any pending debounced save for the session being left, right
     // now, synchronously with the old session id and its current messages
     // - confirmed live via code review that without this, a message sent
@@ -668,17 +850,26 @@ export default function Home() {
       void saveSessionMessages(sessionIdRef.current, messages as unknown as Record<string, unknown>[]).catch(() => {});
     }
     sessionIdRef.current = session.id;
-    window.localStorage.setItem("atlas-session-id", session.id);
+    window.localStorage.setItem(sessionIdStorageKey(user.uid), session.id);
     setCurrentSession(session);
     setSessionMenuOpen(false);
     setBuildingGraphQueue([]);
     setDismissedGapKeys(new Set());
 
+    // Fired together, not one after the other - these two calls don't
+    // depend on each other's result, but awaiting messages before even
+    // starting the papers fetch made every switch pay for both round
+    // trips added together instead of just the slower one. Confirmed
+    // live as a real, avoidable chunk of the "switching feels slow"
+    // complaint.
+    const messagesPromise = getSessionMessages(session.id);
+    const papersPromise = listPapersForSession(session.id);
+
     let restoredMessages: Message[] = [];
     const freshClarificationIds = new Set<string>();
     const freshGapKeys = new Set<string>();
     try {
-      const result = await getSessionMessages(session.id);
+      const result = await messagesPromise;
       const raw = result.messages as unknown as Message[];
       // Seed the dedup trackers directly from restored history (not from
       // messages state, which won't have committed yet) so checkGuidance
@@ -702,10 +893,18 @@ export default function Home() {
     shownClarificationIds.current = freshClarificationIds;
     shownGapKeys.current = freshGapKeys;
     setMessages(restoredMessages);
-    setPapers([]);
+    // A real switch clears papers first so the previous session's never
+    // sit on screen mislabeled as the new session's while its own fetch
+    // is in flight. Reconciling the session already on screen has nothing
+    // stale to clear this way - skipping it means the cache-hydrated
+    // papers stay visible the whole time instead of flashing empty and
+    // back the instant this real fetch confirms them.
+    if (!isReconcilingSameSession) setPapers([]);
 
+    let resolvedPapers: PaperContext[] = [];
     try {
-      setPapers(await listPapersForSession(session.id));
+      resolvedPapers = await papersPromise;
+      setPapers(resolvedPapers);
     } catch (error) {
       setMessages((current) => [...current, {
         id: crypto.randomUUID(),
@@ -714,6 +913,10 @@ export default function Home() {
         notice: true,
       }]);
     }
+    // Refreshes the instant-paint cache with what the server just
+    // confirmed - keeps the next refresh's snapshot current instead of
+    // silently drifting further out of date every session this ran for.
+    writeSessionCache(user.uid, { session, messages: restoredMessages, papers: resolvedPapers });
 
     window.setTimeout(() => composerInput.current?.focus(), 50);
     // A genuinely fresh session - nothing added, nothing asked yet - should
@@ -751,35 +954,72 @@ export default function Home() {
     }
   }
 
-  async function renameSessionPrompt(session: SessionMetadata) {
+  function renameSessionPrompt(session: SessionMetadata) {
     const name = window.prompt("Rename session:", session.name)?.trim();
     if (!name || name === session.name) return;
-    try {
-      const updated = await renameSession(session.id, name);
-      setSessions((current) => current.map((s) => (s.id === updated.id ? updated : s)));
-      setCurrentSession((current) => (current?.id === updated.id ? updated : current));
-    } catch (error) {
-      setMessages((current) => [...current, {
-        id: crypto.randomUUID(),
-        role: "assistant",
-        text: error instanceof Error ? error.message : "Could not rename the session.",
-        notice: true,
-      }]);
-    }
+    // Optimistic - another "little thing" per the same reasoning as
+    // deleteSessionPrompt: a rename is a single Firestore write, no
+    // reason the sidebar should wait on it before showing the new name.
+    // Reverted below on failure (unlike removePaperFromSet's silent
+    // no-revert, a session sitting under the wrong name is easy to
+    // notice and confusing to leave that way).
+    setSessions((current) => current.map((s) => (s.id === session.id ? { ...s, name } : s)));
+    setCurrentSession((current) => (current?.id === session.id ? { ...current, name } : current));
+    renameSession(session.id, name)
+      .then((updated) => {
+        setSessions((current) => current.map((s) => (s.id === updated.id ? updated : s)));
+        setCurrentSession((current) => (current?.id === updated.id ? updated : current));
+      })
+      .catch((error) => {
+        setSessions((current) => current.map((s) => (s.id === session.id ? session : s)));
+        setCurrentSession((current) => (current?.id === session.id ? session : current));
+        setMessages((current) => [...current, {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          text: error instanceof Error ? error.message : "Could not rename the session.",
+          notice: true,
+        }]);
+      });
   }
 
   async function deleteSessionPrompt(session: SessionMetadata) {
     if (!window.confirm(`Delete "${session.name}"? This removes its papers and can't be undone.`)) return;
+    // Optimistic removal - confirmed live as the actual "takes a long time
+    // to disappear from the sidebar" complaint: the row previously stayed
+    // visible until delete_session's full backend cascade (paper detach
+    // loop, graph pruning, two Firestore deletes) round-tripped, which is
+    // real work, not a CSS delay. Restored below if the delete call itself
+    // fails.
+    const index = sessions.findIndex((s) => s.id === session.id);
+    setSessions((current) => current.filter((s) => s.id !== session.id));
+    // Switches away from the local, already-updated session list rather
+    // than reusing initSession's own listSessions() re-fetch - that fetch
+    // would race the in-flight delete below and could still see the
+    // about-to-be-deleted session, re-selecting the very session being
+    // removed.
+    if (session.id === currentSession?.id) {
+      const remaining = sessions.filter((s) => s.id !== session.id);
+      if (remaining.length > 0) {
+        void switchToSession(remaining[0]);
+      } else {
+        void (async () => {
+          const created = await createSession("Untitled session");
+          setSessions((current) => [created, ...current]);
+          await switchToSession(created);
+        })();
+      }
+    }
     try {
       await deleteSession(session.id);
-      // No localStorage cleanup needed anymore - the backend's own
-      // delete_session cascade removes this session's stored messages.
-      setSessions((current) => current.filter((s) => s.id !== session.id));
-      // Reuses initSession's own fallback (pick another session, or
-      // create a fresh default one if none remain) instead of
-      // duplicating that logic here.
-      if (session.id === currentSession?.id) await initSession();
+      // No localStorage cleanup needed - the backend's own delete_session
+      // cascade removes this session's stored messages.
     } catch (error) {
+      setSessions((current) => {
+        if (current.some((s) => s.id === session.id)) return current;
+        const restored = [...current];
+        restored.splice(Math.min(index, restored.length), 0, session);
+        return restored;
+      });
       setMessages((current) => [...current, {
         id: crypto.randomUUID(),
         role: "assistant",
@@ -813,24 +1053,38 @@ export default function Home() {
     }
   }
 
-  async function answerClarificationQuestion(messageId: string, question: PendingQuestion, optionId: string) {
-    try {
-      const answered = await answerClarification(question.id, optionId);
-      setMessages((current) => current.map((m) => {
-        if (m.id !== messageId) return m;
-        if (m.clarifications) {
-          return { ...m, clarifications: m.clarifications.map((q) => (q.id === answered.id ? answered : q)) };
-        }
-        return { ...m, clarification: answered };
-      }));
-    } catch (error) {
-      setMessages((current) => [...current, {
-        id: crypto.randomUUID(),
-        role: "assistant",
-        text: error instanceof Error ? error.message : "Could not record that answer.",
-        notice: true,
-      }]);
-    }
+  function answerClarificationQuestion(messageId: string, question: PendingQuestion, optionId: string) {
+    // Optimistic - same "little thing" reasoning as deleteSessionPrompt:
+    // the card's own display only ever reads status/answer_option_id (see
+    // the "Answered: <label>" line below), both of which are known the
+    // instant the user clicks, with no reason to wait on the real
+    // entity_merge graph mutation to show the choice was recorded.
+    const applyQuestion = (q: PendingQuestion): PendingQuestion => (
+      q.id === question.id ? { ...q, status: "answered", answer_option_id: optionId } : q
+    );
+    setMessages((current) => current.map((m) => {
+      if (m.id !== messageId) return m;
+      if (m.clarifications) return { ...m, clarifications: m.clarifications.map(applyQuestion) };
+      return m.clarification ? { ...m, clarification: applyQuestion(m.clarification) } : m;
+    }));
+    void answerClarification(question.id, optionId)
+      .then((answered) => {
+        setMessages((current) => current.map((m) => {
+          if (m.id !== messageId) return m;
+          if (m.clarifications) {
+            return { ...m, clarifications: m.clarifications.map((q) => (q.id === answered.id ? answered : q)) };
+          }
+          return { ...m, clarification: answered };
+        }));
+      })
+      .catch((error) => {
+        setMessages((current) => [...current, {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          text: error instanceof Error ? error.message : "Could not record that answer.",
+          notice: true,
+        }]);
+      });
   }
 
   function submitQueryFeedback(messageId: string, nodeId: string, helpful: boolean) {
@@ -949,9 +1203,13 @@ export default function Home() {
     setAddOpen(true);
   }
 
-  async function handleFiles(files: File[]) {
+  // Validates and queues files into stagedFiles - does not upload. The
+  // actual upload/extract only happens once "Start breaking down" fires
+  // handleFiles below with the staged list.
+  function stageFiles(files: File[]) {
     if (!files.length) return;
-    const slots = MAX_SESSION_PAPERS - papers.length;
+    const committed = papers.length + stagedResults.length + stagedFiles.length;
+    const slots = MAX_SESSION_PAPERS - committed;
     if (slots <= 0) {
       setUploadError(`This session is limited to ${MAX_SESSION_PAPERS} papers.`);
       return;
@@ -959,12 +1217,18 @@ export default function Home() {
     const pdfFiles = files.filter((file) => file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf"));
     const validFiles = pdfFiles.slice(0, slots);
     const notices: string[] = [];
-    if (files.length > slots) notices.push(`You can add up to ${MAX_SESSION_PAPERS} papers per session; only the first ${slots} file${slots === 1 ? "" : "s"} will be processed.`);
+    if (files.length > slots) notices.push(`You can add up to ${MAX_SESSION_PAPERS} papers per session; only the first ${slots} file${slots === 1 ? "" : "s"} will be staged.`);
     if (validFiles.length !== files.length && files.length <= slots) notices.push("Only PDF files were included; other files were skipped.");
     if (validFiles.length === 0) {
       setUploadError(notices.join(" ") || "Please choose PDF files.");
       return;
     }
+    setUploadError(notices.join(" "));
+    setStagedFiles((current) => [...current, ...validFiles]);
+  }
+
+  async function handleFiles(files: File[]) {
+    if (!files.length) return;
     // Same synchronous-ref guard as addArxivPaper, and for the same
     // reason: the drop-zone's disabled={uploading} only takes effect
     // after React commits the setUploading(true) below, so a rapid
@@ -974,7 +1238,7 @@ export default function Home() {
     if (uploadControllers.current.size > 0) return;
     uploadBatchCancelled.current = false;
     setUploading(true);
-    setUploadError(notices.join(" "));
+    setUploadingFileNames(files.map((file) => file.name));
     const failures: string[] = [];
     try {
       // Upload all selected papers at once. Each request still runs through
@@ -982,7 +1246,7 @@ export default function Home() {
       // only prevents the second paper waiting for the first upload to
       // finish. The graph reveals remain queued so walkthroughs appear as
       // separate messages, one below the other, in the conversation.
-      await Promise.all(validFiles.map(async (file) => {
+      await Promise.all(files.map(async (file) => {
         if (uploadBatchCancelled.current) return;
         const controller = new AbortController();
         const controllerKey = `${file.name}:${file.lastModified}:${file.size}`;
@@ -999,10 +1263,18 @@ export default function Home() {
         }
       }));
       if (failures.length > 0) {
-        setUploadError([...notices, `Could not add ${failures.length} file${failures.length === 1 ? "" : "s"}: ${failures.join("; ")}`].join(" "));
+        // uploadError alone isn't enough now that "Start breaking down"
+        // closes the modal before this can resolve - uploadError only
+        // renders inside the modal's upload-panel, so a failure landing
+        // after close would otherwise vanish with nothing telling the
+        // user it happened.
+        const text = `Could not add ${failures.length} file${failures.length === 1 ? "" : "s"}: ${failures.join("; ")}`;
+        setUploadError(text);
+        setMessages((current) => [...current, { id: crypto.randomUUID(), role: "assistant", text, notice: true }]);
       }
     } finally {
       setUploading(false);
+      setUploadingFileNames([]);
       uploadControllers.current.clear();
       if (fileInput.current) fileInput.current.value = "";
     }
@@ -1123,7 +1395,7 @@ export default function Home() {
     // "extracting") to Firestore as it goes, so a concurrent poll can see
     // those writes mid-request instead of only finding out at the end.
     const pollTimer = window.setInterval(() => {
-      void getPaperStatus(result.id.replace(/^arxiv:/, "")).then((status) => {
+      void getPaperStatus(result.id.replace(/^arxiv:/, ""), user.uid).then((status) => {
         setIngestStage((current) => (current[result.id] ? { ...current, [result.id]: status } : current));
       });
     }, 1500);
@@ -1132,7 +1404,13 @@ export default function Home() {
       setBuildingGraphQueue((current) => [...current, ingested]);
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") return;
-      setSearchError(error instanceof Error ? error.message : "Could not read this paper.");
+      // Same reasoning as handleFiles's failure branch - by the time this
+      // rejects, "Start breaking down" has already closed the modal that
+      // searchError renders inside of, so a chat notice is the only
+      // surface guaranteed to still be visible.
+      const text = error instanceof Error ? error.message : `Could not read "${result.title}".`;
+      setSearchError(text);
+      setMessages((current) => [...current, { id: crypto.randomUUID(), role: "assistant", text, notice: true }]);
     } finally {
       window.clearInterval(pollTimer);
       ingestControllers.current.delete(result.id);
@@ -1149,33 +1427,104 @@ export default function Home() {
     }
   }
 
-  function cancelArxivIngest(resultId: string) {
-    ingestControllers.current.get(resultId)?.abort();
-  }
-
   function onDrop(event: DragEvent<HTMLButtonElement>) {
     event.preventDefault();
-    void handleFiles(Array.from(event.dataTransfer.files ?? []));
+    stageFiles(Array.from(event.dataTransfer.files ?? []));
   }
 
-  const convergenceEntries = Array.from(ingestingIds).map((id) => ({
-    id,
-    title: searchResults.find((result) => result.id === id)?.title ?? "your paper",
-    // The real backend stage, resolved to display text here (same helper
-    // the search-results ingest badge already uses) - ConvergenceRitual
-    // previously received a raw `stage` field and never actually used it,
-    // showing only its own cosmetic word rotation with no real signal.
-    stageLabel: ingestStageLabel(ingestStage[id]),
-  }));
+  // Fires everything staged in the modal at once, then closes it - the
+  // full-screen ConvergenceRitual is what the user watches from here, not
+  // the modal. Titles are snapshotted into ingestTitles first since
+  // stagedResults is cleared immediately after (see its own comment).
+  function startBreakdown() {
+    const toIngest = stagedResults;
+    const toUpload = stagedFiles;
+    if (toIngest.length === 0 && toUpload.length === 0) return;
+    setIngestTitles((current) => {
+      const updated = { ...current };
+      toIngest.forEach((result) => { updated[result.id] = result.title; });
+      return updated;
+    });
+    setStagedResults([]);
+    setStagedFiles([]);
+    setAddOpen(false);
+    setAddMode("choose");
+    toIngest.forEach((result) => void addArxivPaper(result));
+    if (toUpload.length) void handleFiles(toUpload);
+  }
+
+  // Only reveal finished walkthroughs into the chat once nothing from this
+  // batch is still being added - otherwise papers would land in chat
+  // staggered mid-animation instead of together once the whole "Start
+  // breaking down" batch settles. ingestingIds covers arXiv adds in
+  // flight, uploading covers a PDF batch (handleFiles's own Promise.all)
+  // in flight - both need to be clear, not just one, since a batch can
+  // mix both in the same "Start breaking down" click.
+  const readyToShowWalkthroughs = buildingGraphQueue.length > 0 && ingestingIds.size === 0 && !uploading;
+
+  // Drains buildingGraphQueue into real chat messages/graph state once the
+  // whole batch is done. The modal is already closed by then (startBreakdown
+  // closed it before ingestion even started) - this replaces the old
+  // in-modal GraphBuildAnimation step, which required the modal to stay
+  // open and is exactly what made the full-screen ConvergenceRitual
+  // invisible (it renders behind the modal, z-index 200 vs 201).
+  useEffect(() => {
+    if (!readyToShowWalkthroughs) return;
+    addPaper(buildingGraphQueue[0], false);
+    setBuildingGraphQueue((current) => current.slice(1));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [readyToShowWalkthroughs, buildingGraphQueue]);
+
+  const convergenceEntries = [
+    ...Array.from(ingestingIds).map((id) => ({
+      id,
+      title: ingestTitles[id] ?? "your paper",
+      // The real backend stage, resolved to display text here (same helper
+      // the search-results ingest badge already uses) - ConvergenceRitual
+      // previously received a raw `stage` field and never actually used it,
+      // showing only its own cosmetic word rotation with no real signal.
+      stageLabel: ingestStageLabel(ingestStage[id]),
+    })),
+    // Uploads have no per-file backend stage to poll (unlike arXiv ingest),
+    // so these only ever show the cosmetic word rotation - still real
+    // progress, just without a stageLabel suffix.
+    ...uploadingFileNames.map((name, index) => ({ id: `upload-${index}-${name}`, title: name })),
+  ];
 
   return (
+    <div className={`app-shell${sidebarCollapsed ? " sidebar-collapsed" : ""}`}>
+      <aside className={`app-sidebar${sessionMenuOpen ? " open" : ""}`} ref={sessionSwitcherRef}>
+        <div className="app-sidebar-brand"><span><Icon name="atlas" size={19}/></span><strong>Atlas</strong></div>
+        <button className="app-sidebar-new" onClick={() => { openCreateSession(); setSessionMenuOpen(false); }}><Icon name="plus" size={14}/>New session</button>
+        <div className="app-sidebar-sessions">
+          {sessions.map((s) => <div key={s.id} className="app-sidebar-session-row">
+            <button
+              className={`app-sidebar-session${s.id === currentSession?.id ? " active" : ""}`}
+              onClick={() => { void switchToSession(s); setSessionMenuOpen(false); }}
+            >
+              <strong>{s.name}</strong>
+              <small>{new Date(s.created_at).toLocaleDateString()}</small>
+            </button>
+            <button className="app-sidebar-session-rename" onClick={() => void renameSessionPrompt(s)} aria-label={`Rename ${s.name}`}><Icon name="rename" size={13}/></button>
+            <button className="app-sidebar-session-delete" onClick={() => void deleteSessionPrompt(s)} aria-label={`Delete ${s.name}`}><Icon name="close" size={13}/></button>
+          </div>)}
+        </div>
+      </aside>
+      {sessionMenuOpen && <div className="app-sidebar-scrim" onClick={() => setSessionMenuOpen(false)} aria-hidden="true"/>}
     <main className="assistant-app">
-      <ConvergenceRitual entries={convergenceEntries} active={ingestingIds.size > 0} onSkip={() => {}}/>
+      <ConvergenceRitual
+        entries={convergenceEntries}
+        active={ingestingIds.size > 0 || uploading}
+        onSkip={() => {
+          ingestControllers.current.forEach((controller) => controller.abort());
+          cancelUpload();
+        }}
+      />
       <GraphExplorer sessionId={currentSession?.id ?? null} sessionName={currentSession?.name} active={graphExplorerOpen} onClose={() => setGraphExplorerOpen(false)} onAskInChat={askFromGraphExplorer} focusNodeId={graphFocusNodeId} papers={papers}/>
       <PaperMap sessionId={currentSession?.id ?? null} active={paperMapOpen} onClose={() => setPaperMapOpen(false)} papers={papers}/>
       <Tour steps={ATLAS_TOUR_STEPS} active={tourOpen} onClose={() => { setTourOpen(false); setTourSeen(true); }}/>
       <header className="app-header">
-        <div className="brand"><span><Icon name="atlas" size={21}/></span><strong>Atlas</strong></div>
+        <button className="app-sidebar-toggle" onClick={toggleSidebar} title={sidebarCollapsed ? "Show sessions" : "Hide sessions"} aria-label="Toggle sessions"><Icon name="menu" size={19}/></button>
         <div className={`mode-label ${papers.length ? "paper-mode" : ""}`}>
           {papers.length > 0 ? (
             <div className="paper-chip-row">
@@ -1184,25 +1533,6 @@ export default function Home() {
           ) : <><span className="online-dot"/><strong>General chat</strong><small>Atlas</small></>}
         </div>
         <div className="header-actions">
-          <div className="session-switcher" ref={sessionSwitcherRef}>
-            <button className="session-switcher-toggle" onClick={() => setSessionMenuOpen((open) => !open)}>
-              <span>{currentSession?.name ?? "Session"}</span>
-            </button>
-            {sessionMenuOpen && <div className="session-menu">
-              <button className="session-menu-new" onClick={openCreateSession}><Icon name="plus" size={13}/>New session</button>
-              {sessions.map((s) => <div key={s.id} className="session-menu-row">
-                <button
-                  className={`session-menu-item${s.id === currentSession?.id ? " active" : ""}`}
-                  onClick={() => void switchToSession(s)}
-                >
-                  <strong>{s.name}</strong>
-                  <small>{new Date(s.created_at).toLocaleDateString()}</small>
-                </button>
-                <button className="session-menu-rename" onClick={() => void renameSessionPrompt(s)} aria-label={`Rename ${s.name}`}><Icon name="rename" size={13}/></button>
-                <button className="session-menu-delete" onClick={() => void deleteSessionPrompt(s)} aria-label={`Delete ${s.name}`}><Icon name="close" size={13}/></button>
-              </div>)}
-            </div>}
-          </div>
           <button
             className="feynman-check-toggle"
             onClick={openFeynmanCheck}
@@ -1217,9 +1547,31 @@ export default function Home() {
             title={papers.length === 0 ? "Add a paper to explore its graph" : "Explore this session's knowledge graph"}
             aria-label="Open graph explorer"
           ><Icon name="graph" size={17}/></button>
-          <button className="paper-map-toggle" onClick={() => setPaperMapOpen(true)} disabled={papers.length < 2} title={papers.length < 2 ? "Add at least two papers to map connections" : "Map connections between this session's papers"} aria-label="Map paper connections"><Icon name="graph" size={15}/><span>Map papers <em>ALPHA</em></span></button>
+          <button className="paper-map-toggle" onClick={() => setPaperMapOpen(true)} disabled={papers.length < 2} title={papers.length < 2 ? "Add at least two papers to map connections" : "Map connections between this session's papers"} aria-label="Map paper connections"><Icon name="papersLink" size={15}/><span>Map papers <em>ALPHA</em></span></button>
           <button className="tour-help-button" onClick={() => setTourOpen(true)} title="Replay the walkthrough" aria-label="Replay the walkthrough"><Icon name="help" size={17}/></button>
           <button className="add-paper-button" onClick={() => openAddPaper()}><Icon name="plus" size={17}/>{papers.length ? "Add another" : "Add paper"}</button>
+          <div className="user-menu" ref={userMenuRef}>
+            <button className="user-menu-toggle" onClick={() => setUserMenuOpen((open) => !open)} aria-label="Account menu">
+              {(user.displayName ?? user.email ?? "?").charAt(0).toUpperCase()}
+            </button>
+            {userMenuOpen && (
+              <div className="user-menu-panel">
+                <div>
+                  <strong>{user.displayName ?? "Signed in"}</strong>
+                  <small>{user.email}</small>
+                </div>
+                <button className="user-menu-item" onClick={() => { toggleTheme(); }}>
+                  {theme === "dark" ? (
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2.5M12 19.5V22M4.2 4.2l1.8 1.8M18 18l1.8 1.8M2 12h2.5M19.5 12H22M4.2 19.8l1.8-1.8M18 6l1.8-1.8"/></svg>
+                  ) : (
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M20.5 14.7A8.5 8.5 0 1 1 9.3 3.5a7 7 0 0 0 11.2 11.2z"/></svg>
+                  )}
+                  {theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+                </button>
+                <button className="user-menu-signout" onClick={() => { setUserMenuOpen(false); void signOut(); }}>Sign out</button>
+              </div>
+            )}
+          </div>
         </div>
       </header>
 
@@ -1352,21 +1704,9 @@ export default function Home() {
 
       {addOpen && <div className="add-modal" role="dialog" aria-modal="true" aria-label="Add a research paper">
         <div className="modal-scrim" onClick={() => setAddOpen(false)} aria-hidden="true"/>
-        <section className={`modal-card ${buildingGraphQueue.length > 0 ? "modal-card-fullscreen" : ""}`}>
+        <section className="modal-card">
           <header><div><span><Icon name="paper" size={18}/></span><div><strong>Add a research paper</strong><small>Give Atlas a paper to read with you</small></div></div><button onClick={() => setAddOpen(false)} aria-label="Close"><Icon name="close" size={19}/></button></header>
 
-          {buildingGraphQueue.length > 0 ? (
-            <GraphBuildAnimation
-              key={buildingGraphQueue[0].id}
-              newNodes={buildingGraphQueue[0].new_nodes}
-              newEdges={buildingGraphQueue[0].new_edges}
-              onComplete={() => {
-                const keepModalOpen = buildingGraphQueue.length > 1 || uploading;
-                addPaper(buildingGraphQueue[0], !keepModalOpen);
-                setBuildingGraphQueue((current) => current.slice(1));
-              }}
-            />
-          ) : <>
           {addMode === "choose" && <div className="add-choices">
             <button autoFocus onClick={() => setAddMode("upload")}><span className="choice-icon violet"><Icon name="upload" size={22}/></span><div><strong>Upload a PDF</strong><p>Choose a paper saved on your computer.</p></div></button>
             <button onClick={() => setAddMode("search")}><span className="choice-icon blue"><Icon name="globe" size={22}/></span><div><strong>Search online</strong><p>Find papers on arXiv by title, author, or topic.</p></div></button>
@@ -1374,11 +1714,10 @@ export default function Home() {
 
           {addMode === "upload" && <div className="upload-panel">
             <button className="back-button" onClick={() => setAddMode("choose")}>← Back</button>
-            <button className="drop-zone" onClick={() => fileInput.current?.click()} onDragOver={(event) => event.preventDefault()} onDrop={onDrop} disabled={uploading || papers.length >= MAX_SESSION_PAPERS}>
-              <span><Icon name="upload" size={25}/></span><strong>{uploading ? "Uploading and reading papers simultaneously…" : papers.length >= MAX_SESSION_PAPERS ? "Three-paper limit reached" : "Choose up to 3 PDFs or drag them here"}</strong><small>Selected papers are processed together, then their walkthroughs appear one below another.</small>
+            <button className="drop-zone" onClick={() => fileInput.current?.click()} onDragOver={(event) => event.preventDefault()} onDrop={onDrop} disabled={papers.length + stagedResults.length + stagedFiles.length >= MAX_SESSION_PAPERS}>
+              <span><Icon name="upload" size={25}/></span><strong>{papers.length + stagedResults.length + stagedFiles.length >= MAX_SESSION_PAPERS ? `${MAX_SESSION_PAPERS}-paper limit reached` : `Choose up to ${MAX_SESSION_PAPERS} PDFs or drag them here`}</strong><small>Papers are staged below - nothing is read until you start the breakdown.</small>
             </button>
-            {uploading && <button className="cancel-ingest" onClick={cancelUpload}>Cancel</button>}
-            <input ref={fileInput} className="hidden-input" type="file" accept="application/pdf,.pdf" multiple disabled={papers.length >= MAX_SESSION_PAPERS} onChange={(event: ChangeEvent<HTMLInputElement>) => void handleFiles(Array.from(event.target.files ?? []))}/>
+            <input ref={fileInput} className="hidden-input" type="file" accept="application/pdf,.pdf" multiple disabled={papers.length + stagedResults.length + stagedFiles.length >= MAX_SESSION_PAPERS} onChange={(event: ChangeEvent<HTMLInputElement>) => { stageFiles(Array.from(event.target.files ?? [])); event.target.value = ""; }}/>
             {uploadError && <p className="form-error">{uploadError}</p>}
           </div>}
 
@@ -1387,14 +1726,24 @@ export default function Home() {
             <form onSubmit={runSearch}><Icon name="search" size={18}/><input autoFocus value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Search by title, author, or topic…"/><button disabled={searchQuery.trim().length < 2 || searching}>{searching ? "Searching…" : "Search"}</button></form>
             {searchError && <p className="form-error">{searchError}</p>}
             <div className="search-results">{searchResults.map((result) => {
-              const isIngesting = ingestingIds.has(result.id);
+              const isStaged = stagedResults.some((staged) => staged.id === result.id);
+              const atLimit = papers.length + stagedResults.length + stagedFiles.length >= MAX_SESSION_PAPERS;
               return <article key={result.id}><div><span>arXiv</span><small>{result.published}</small></div><h3>{result.title}</h3><p>{result.authors}</p>
-                {isIngesting ? <div className="ingest-progress"><span>{ingestStageLabel(ingestStage[result.id])}</span><button className="cancel-ingest" onClick={() => cancelArxivIngest(result.id)}>Cancel</button></div>
-                  : <button onClick={() => void addArxivPaper(result)}>Add to chat</button>}
+                {isStaged
+                  ? <button className="staged-toggle" onClick={() => setStagedResults((current) => current.filter((staged) => staged.id !== result.id))}><Icon name="check" size={13}/>Added - remove</button>
+                  : <button onClick={() => setStagedResults((current) => [...current, result])} disabled={atLimit}>Add to list</button>}
               </article>;
             })}</div>
           </div>}
-          </>}
+
+          {(stagedResults.length > 0 || stagedFiles.length > 0) && <div className="staged-papers">
+            <p>{stagedResults.length + stagedFiles.length} paper{stagedResults.length + stagedFiles.length === 1 ? "" : "s"} ready to add</p>
+            <ul>
+              {stagedResults.map((result) => <li key={result.id}><span>{result.title}</span><button onClick={() => setStagedResults((current) => current.filter((staged) => staged.id !== result.id))} aria-label={`Remove ${result.title}`}><Icon name="close" size={11}/></button></li>)}
+              {stagedFiles.map((file, index) => <li key={`${file.name}-${index}`}><span>{file.name}</span><button onClick={() => setStagedFiles((current) => current.filter((_, i) => i !== index))} aria-label={`Remove ${file.name}`}><Icon name="close" size={11}/></button></li>)}
+            </ul>
+            <button className="start-breakdown-button" onClick={startBreakdown}>Start breaking down {stagedResults.length + stagedFiles.length} paper{stagedResults.length + stagedFiles.length === 1 ? "" : "s"}</button>
+          </div>}
         </section>
       </div>}
       {createSessionOpen && <div className="add-modal" role="dialog" aria-modal="true" aria-label="New session">
@@ -1413,5 +1762,6 @@ export default function Home() {
         </section>
       </div>}
     </main>
+    </div>
   );
 }

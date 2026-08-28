@@ -162,8 +162,12 @@ def main() -> None:
             print(f"  [FAILED]  {outcome.paper_id}: {outcome.issue.message if outcome.issue else 'unknown error'}")
             continue
         status = "ok" if outcome.ok else "partial"
+        # No real account concept in this standalone batch script - every
+        # paper it ingests lands under one fixed owner_uid, matching how
+        # it already has no session_id concept either.
         store.ingest(
             outcome.result,
+            "batch-script",
             paper_name=outcome.paper_id,
             entity_embedding_fn=entity_embedding_fn,
             clarification=orchestrator,
@@ -179,7 +183,7 @@ def main() -> None:
     pending = orchestrator.pending()
     print(f"{len(pending)} clarification question(s) need your input.")
     if pending and not args.no_review:
-        orchestrator.run_terminal_review_loop()
+        orchestrator.run_terminal_review_loop(owner_uid="batch-script")
 
 
 if __name__ == "__main__":

@@ -82,7 +82,7 @@ def test_entity_merge_question_merge_answer_writes_same_as_edge(fake_db):
 
     assert orchestrator.pending() == [question]
 
-    orchestrator.answer(question.id, existing.id)
+    orchestrator.answer(question.id, existing.id, owner_uid="owner-1")
 
     edges = list(gm.graph.get_edge_data(provisional.id, existing.id).values())
     assert len(edges) == 1
@@ -106,7 +106,7 @@ def test_entity_merge_question_distinct_answer_marks_known_distinct(fake_db):
         candidate_name="Fine-Tuning",
     )
 
-    orchestrator.answer(question.id, DISTINCT_OPTION_ID)
+    orchestrator.answer(question.id, DISTINCT_OPTION_ID, owner_uid="owner-1")
 
     assert tuple(sorted((existing.id, provisional.id))) in gm._known_distinct
     # No merge edge should have been written.
@@ -123,7 +123,7 @@ def test_entity_merge_answer_without_graph_manager_raises():
     )
 
     with pytest.raises(RuntimeError):
-        orchestrator.answer(question.id, "c")
+        orchestrator.answer(question.id, "c", owner_uid="owner-1")
 
 
 def test_answer_rejects_unknown_option(fake_db):
@@ -136,13 +136,13 @@ def test_answer_rejects_unknown_option(fake_db):
     )
 
     with pytest.raises(ValueError):
-        orchestrator.answer(question.id, "not-a-real-option")
+        orchestrator.answer(question.id, "not-a-real-option", owner_uid="owner-1")
 
 
 def test_answer_rejects_unknown_question_id():
     orchestrator = ClarificationOrchestrator()
     with pytest.raises(KeyError):
-        orchestrator.answer("does-not-exist", "anything")
+        orchestrator.answer("does-not-exist", "anything", owner_uid="owner-1")
 
 
 def test_query_disambiguation_answer_records_choice_without_graph_mutation(fake_db):
@@ -163,7 +163,7 @@ def test_query_disambiguation_answer_records_choice_without_graph_mutation(fake_
     question = orchestrator.register_query_disambiguation(
         "What is attention?", candidates
     )
-    orchestrator.answer(question.id, "b")
+    orchestrator.answer(question.id, "b", owner_uid="owner-1")
 
     answered = orchestrator.get(question.id)
     assert answered.status == "answered"
@@ -180,7 +180,7 @@ def test_pending_only_returns_open_questions(fake_db):
         provisional_node_id="p2", entity_name="Z", candidate_node_id="c2", candidate_name="W"
     )
 
-    orchestrator.answer(q1.id, DISTINCT_OPTION_ID)
+    orchestrator.answer(q1.id, DISTINCT_OPTION_ID, owner_uid="owner-1")
 
     assert len(orchestrator.pending()) == 1
     assert q1 not in orchestrator.pending()
@@ -212,7 +212,7 @@ def test_terminal_review_loop_answers_and_skips(fake_db):
     printed: list[str] = []
 
     answered = orchestrator.run_terminal_review_loop(
-        input_fn=lambda _: next(responses), print_fn=lambda *a: printed.append(" ".join(map(str, a)))
+        owner_uid="owner-1", input_fn=lambda _: next(responses), print_fn=lambda *a: printed.append(" ".join(map(str, a)))
     )
 
     assert answered == 1
@@ -242,7 +242,7 @@ def test_terminal_review_loop_rejects_zero_instead_of_wrapping_to_last_option(fa
     )
 
     answered = orchestrator.run_terminal_review_loop(
-        input_fn=lambda _: "0", print_fn=lambda *a: None
+        owner_uid="owner-1", input_fn=lambda _: "0", print_fn=lambda *a: None
     )
 
     assert answered == 0
@@ -259,7 +259,7 @@ def test_terminal_review_loop_rejects_negative_choice(fake_db):
     )
 
     answered = orchestrator.run_terminal_review_loop(
-        input_fn=lambda _: "-1", print_fn=lambda *a: None
+        owner_uid="owner-1", input_fn=lambda _: "-1", print_fn=lambda *a: None
     )
 
     assert answered == 0
@@ -273,7 +273,7 @@ def test_terminal_review_loop_handles_invalid_choice_gracefully(fake_db):
     )
 
     answered = orchestrator.run_terminal_review_loop(
-        input_fn=lambda _: "99", print_fn=lambda *a: None
+        owner_uid="owner-1", input_fn=lambda _: "99", print_fn=lambda *a: None
     )
 
     assert answered == 0
@@ -285,7 +285,7 @@ def test_terminal_review_loop_reports_no_pending_questions():
     printed: list[str] = []
 
     answered = orchestrator.run_terminal_review_loop(
-        input_fn=lambda _: "", print_fn=lambda *a: printed.append(" ".join(map(str, a)))
+        owner_uid="owner-1", input_fn=lambda _: "", print_fn=lambda *a: printed.append(" ".join(map(str, a)))
     )
 
     assert answered == 0

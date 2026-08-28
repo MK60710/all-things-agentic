@@ -226,7 +226,7 @@ class ClarificationOrchestrator:
                 self._db.collection("clarifications").document(question_id).delete()
         return len(stale_ids)
 
-    def answer(self, question_id: str, option_id: str) -> PendingQuestion:
+    def answer(self, question_id: str, option_id: str, owner_uid: str) -> PendingQuestion:
         """Apply a chosen option back to the system.
 
         entity_merge answers actually mutate the graph (merge or mark
@@ -234,6 +234,11 @@ class ClarificationOrchestrator:
         answers just record the choice - re-running the query with the
         chosen node_id is the caller's job, not this method's, since
         nothing here was ever wrong, just ambiguous.
+
+        owner_uid is required unconditionally (not just for the
+        entity_merge branch) so this method's own signature can't let the
+        same gap back in - the router always has it available via
+        Depends(get_current_user) regardless of question type.
         """
         question = self._questions.get(question_id)
         if question is None:
@@ -253,6 +258,7 @@ class ClarificationOrchestrator:
             self._graph.resolve_alias(
                 canonical_id=question.candidate_node_id,
                 alias_id=question.provisional_node_id,
+                owner_uid=owner_uid,
                 distinct=not merge,
             )
 
@@ -263,13 +269,19 @@ class ClarificationOrchestrator:
 
     def run_terminal_review_loop(
         self,
+        owner_uid: str,
         input_fn: Callable[[str], str] = input,
         print_fn: Callable[..., None] = print,
     ) -> int:
         """Prints every open question and prompts for an answer right there
         in the terminal - the interim way a person finds out about and
         resolves extraction-side ambiguity until Part 8 (the frontend)
-        exists. Returns how many questions got answered."""
+        exists. Returns how many questions got answered.
+
+        owner_uid is required same as answer() itself - scripts/
+        run_extraction_batch.py (this method's one real caller) already has
+        its own fixed "batch-script" convention for exactly this, matching
+        what it passes to ResearchStore.ingest."""
         open_questions = self.pending()
         if not open_questions:
             print_fn("No pending clarification questions.")
@@ -299,7 +311,7 @@ class ClarificationOrchestrator:
             except ValueError:
                 print_fn("Not a valid choice, skipping.")
                 continue
-            self.answer(question.id, selected.id)
+            self.answer(question.id, selected.id, owner_uid=owner_uid)
             answered += 1
         print_fn(f"\nAnswered {answered} of {len(open_questions)} question(s).")
         return answered

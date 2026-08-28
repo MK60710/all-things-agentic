@@ -13,6 +13,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       headers: {
         "Content-Type": "application/json",
         ...(process.env.API_SHARED_SECRET ? { "X-API-Key": process.env.API_SHARED_SECRET } : {}),
+        ...(request.headers.get("authorization") ? { Authorization: request.headers.get("authorization")! } : {}),
       },
       body: JSON.stringify(body),
       cache: "no-store",

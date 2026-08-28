@@ -1,6 +1,19 @@
 import type { ContradictionCandidate, DeepDiveResponse, FeynmanCheckResult, FeynmanPrompt, GapCandidate, GraphVizEdge, GraphVizNode, PaperConnection, PaperGuide, PendingQuestion, QueryResponse, SessionGraphEdge, SessionGraphNode } from "./types";
+import { getIdToken } from "./firebase";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL;
+
+// Every call in this file goes through this - the Next.js proxy routes
+// under app/api/**/route.ts forward this header to the backend, which
+// verifies it (service/auth.py's get_current_user) as the real identity
+// boundary. A signed-out call (no token yet) sends no Authorization
+// header at all, which the backend correctly rejects with 401 - this
+// never happens in practice since AuthProvider (app/AuthProvider.tsx)
+// never renders the app's own components until a user exists.
+async function authHeaders(): Promise<Record<string, string>> {
+  const token = await getIdToken();
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
 
 export interface ChatHistoryItem {
   role: "user" | "assistant";
@@ -34,7 +47,7 @@ export interface SessionMetadata {
 export async function createSession(name: string, goal?: string): Promise<SessionMetadata> {
   const response = await fetch("/api/sessions", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(await authHeaders()) },
     body: JSON.stringify({ name, goal: goal || undefined }),
   });
   const data = await response.json() as SessionMetadata & { error?: string };
@@ -43,7 +56,7 @@ export async function createSession(name: string, goal?: string): Promise<Sessio
 }
 
 export async function listSessions(): Promise<SessionMetadata[]> {
-  const response = await fetch("/api/sessions");
+  const response = await fetch("/api/sessions", { headers: await authHeaders() });
   const data = await response.json() as SessionMetadata[] & { error?: string };
   if (!response.ok) throw new Error((data as unknown as { error?: string }).error ?? "Could not load sessions");
   return data;
@@ -52,7 +65,7 @@ export async function listSessions(): Promise<SessionMetadata[]> {
 export async function renameSession(sessionId: string, name: string): Promise<SessionMetadata> {
   const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, {
     method: "PATCH",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(await authHeaders()) },
     body: JSON.stringify({ name }),
   });
   const data = await response.json() as SessionMetadata & { error?: string };
@@ -61,7 +74,10 @@ export async function renameSession(sessionId: string, name: string): Promise<Se
 }
 
 export async function deleteSession(sessionId: string): Promise<void> {
-  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+    method: "DELETE",
+    headers: await authHeaders(),
+  });
   if (!response.ok) {
     const data = await response.json().catch(() => ({})) as { error?: string };
     throw new Error(data.error ?? "Could not delete the session");
@@ -77,7 +93,9 @@ export interface SessionMessagesResult {
 }
 
 export async function getSessionMessages(sessionId: string): Promise<SessionMessagesResult> {
-  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/messages`);
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
+    headers: await authHeaders(),
+  });
   const data = await response.json() as SessionMessagesResult & { error?: string };
   if (!response.ok) throw new Error(data.error ?? "Could not load this session's messages");
   return data;
@@ -89,7 +107,7 @@ export async function saveSessionMessages(
 ): Promise<SessionMessagesResult> {
   const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
     method: "PUT",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(await authHeaders()) },
     body: JSON.stringify({ messages }),
   });
   const data = await response.json() as SessionMessagesResult & { error?: string };
@@ -98,7 +116,9 @@ export async function saveSessionMessages(
 }
 
 export async function listPapersForSession(sessionId: string): Promise<PaperContext[]> {
-  const response = await fetch(`/api/papers?session_id=${encodeURIComponent(sessionId)}`);
+  const response = await fetch(`/api/papers?session_id=${encodeURIComponent(sessionId)}`, {
+    headers: await authHeaders(),
+  });
   const data = await response.json() as Array<{
     id: string;
     title: string;
@@ -117,7 +137,10 @@ export async function listPapersForSession(sessionId: string): Promise<PaperCont
 }
 
 export async function detachPaper(paperId: string, sessionId: string): Promise<void> {
-  const response = await fetch(`/api/papers/${encodeURIComponent(paperId)}/detach?session_id=${encodeURIComponent(sessionId)}`, { method: "POST" });
+  const response = await fetch(`/api/papers/${encodeURIComponent(paperId)}/detach?session_id=${encodeURIComponent(sessionId)}`, {
+    method: "POST",
+    headers: await authHeaders(),
+  });
   if (!response.ok) {
     const data = await response.json().catch(() => ({})) as { error?: string };
     throw new Error(data.error ?? "Could not remove this paper from the session");
@@ -136,7 +159,7 @@ export async function askAssistant(
   const paperIds = papers?.map((paper) => paper.id) ?? [];
   const response = await fetch("/api/chat", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(await authHeaders()) },
     body: JSON.stringify({ message, history, paper_ids: paperIds, goal: goal || undefined, node_id: nodeId, session_id: sessionId, section: section || undefined }),
   });
 
@@ -158,7 +181,11 @@ export async function uploadPaper(
   sessionId?: string,
 ): Promise<PaperIngestResult> {
   if (!API_URL) throw new Error("NEXT_PUBLIC_API_URL is not configured");
-  const tokenResponse = await fetch("/api/papers/upload-token", { method: "POST", signal });
+  const tokenResponse = await fetch("/api/papers/upload-token", {
+    method: "POST",
+    headers: await authHeaders(),
+    signal,
+  });
   const tokenData = await tokenResponse.json() as { token?: string; max_bytes?: number; error?: string };
   if (!tokenResponse.ok || !tokenData.token) {
     throw new Error(tokenData.error ?? "Could not authorize the upload");
@@ -170,9 +197,14 @@ export async function uploadPaper(
   body.append("file", file);
   body.append("title", file.name.replace(/\.pdf$/i, ""));
   if (sessionId) body.append("session_id", sessionId);
+  // This one call goes straight to the backend (not through a Next.js
+  // proxy route) - the upload token above is the existing cost gate for
+  // it, but identity still needs to travel too, same as every proxied
+  // call, since service/routers/papers.py's upload_paper now also
+  // requires Depends(get_current_user).
   const response = await fetch(`${API_URL.replace(/\/$/, "")}/papers`, {
     method: "POST",
-    headers: { "X-Upload-Token": tokenData.token },
+    headers: { "X-Upload-Token": tokenData.token, ...(await authHeaders()) },
     body,
     signal,
   });
@@ -181,19 +213,23 @@ export async function uploadPaper(
   return data;
 }
 
-// Mirrors service/routers/papers.py's _sanitize_paper_id(f"arxiv-{arxiv_id}")
+// Mirrors service/routers/papers.py's _sanitize_paper_id(f"{uid}-arxiv-{arxiv_id}")
 // so the frontend can predict an in-flight ingest's paper_id and poll its
 // status before the ingest request itself has returned. Arxiv IDs matching
 // _ARXIV_ID are almost always already-safe characters (digits/dots, or the
 // legacy category/number form with a slash) - this only has to replicate
-// the same substitution, not validate the id.
-function sanitizeArxivPaperId(arxivId: string): string {
-  const cleaned = `arxiv-${arxivId}`.replace(/[^A-Za-z0-9._-]/g, "_");
+// the same substitution, not validate the id. uid is required now that
+// paper ids are namespaced per-owner (two accounts ingesting the same
+// arXiv id must land on two separate papers, not one shared one).
+function sanitizeArxivPaperId(arxivId: string, uid: string): string {
+  const cleaned = `${uid}-arxiv-${arxivId}`.replace(/[^A-Za-z0-9._-]/g, "_");
   return cleaned.replace(/^[._-]+/, "").replace(/[._-]+$/, "") || arxivId;
 }
 
-export async function getPaperStatus(arxivId: string): Promise<string> {
-  const response = await fetch(`/api/papers/${encodeURIComponent(sanitizeArxivPaperId(arxivId))}/status`);
+export async function getPaperStatus(arxivId: string, uid: string): Promise<string> {
+  const response = await fetch(`/api/papers/${encodeURIComponent(sanitizeArxivPaperId(arxivId, uid))}/status`, {
+    headers: await authHeaders(),
+  });
   if (!response.ok) return "unknown";
   const data = await response.json() as { status?: string };
   return data.status ?? "unknown";
@@ -206,7 +242,7 @@ export async function ingestArxivPaper(
 ): Promise<PaperIngestResult> {
   const response = await fetch("/api/papers/arxiv", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(await authHeaders()) },
     body: JSON.stringify({
       arxiv_id: paper.id.replace(/^arxiv:/, ""),
       title: paper.title,
@@ -225,7 +261,7 @@ export async function ingestArxivPaper(
 export async function buildPaperGuide(paperId: string): Promise<PaperGuide> {
   const response = await fetch("/api/papers/guide", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(await authHeaders()) },
     body: JSON.stringify({ paper_id: paperId }),
   });
   const data = await response.json() as PaperGuide & { error?: string };
@@ -234,14 +270,19 @@ export async function buildPaperGuide(paperId: string): Promise<PaperGuide> {
 }
 
 export async function getPaperDeepDive(paperId: string): Promise<DeepDiveResponse> {
-  const response = await fetch(`/api/papers/${encodeURIComponent(paperId)}/deep-dive`, { cache: "no-store" });
+  const response = await fetch(`/api/papers/${encodeURIComponent(paperId)}/deep-dive`, {
+    cache: "no-store",
+    headers: await authHeaders(),
+  });
   const data = await response.json() as DeepDiveResponse & { error?: string };
   if (!response.ok) throw new Error(data.error ?? "Could not open the deep dive");
   return data;
 }
 
 export async function searchPapers(query: string): Promise<PaperSearchResult[]> {
-  const response = await fetch(`/api/papers/search?q=${encodeURIComponent(query)}`);
+  const response = await fetch(`/api/papers/search?q=${encodeURIComponent(query)}`, {
+    headers: await authHeaders(),
+  });
   const data = await response.json() as { papers: PaperSearchResult[]; error?: string };
   if (!response.ok) throw new Error(data.error ?? "Paper search failed");
   return data.papers;
@@ -249,7 +290,7 @@ export async function searchPapers(query: string): Promise<PaperSearchResult[]> 
 
 export async function listClarifications(sessionId?: string): Promise<PendingQuestion[]> {
   const query = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : "";
-  const response = await fetch(`/api/clarifications${query}`);
+  const response = await fetch(`/api/clarifications${query}`, { headers: await authHeaders() });
   if (!response.ok) throw new Error("Could not load clarifications");
   return await response.json() as PendingQuestion[];
 }
@@ -257,7 +298,7 @@ export async function listClarifications(sessionId?: string): Promise<PendingQue
 export async function answerClarification(id: string, optionId: string): Promise<PendingQuestion> {
   const response = await fetch(`/api/clarifications/${encodeURIComponent(id)}/answer`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(await authHeaders()) },
     body: JSON.stringify({ option_id: optionId }),
   });
   const data = await response.json() as PendingQuestion & { error?: string };
@@ -268,7 +309,7 @@ export async function answerClarification(id: string, optionId: string): Promise
 export async function listGaps(limit = 3, sessionId?: string): Promise<GapCandidate[]> {
   const params = new URLSearchParams({ limit: String(limit) });
   if (sessionId) params.set("session_id", sessionId);
-  const response = await fetch(`/api/gaps?${params.toString()}`);
+  const response = await fetch(`/api/gaps?${params.toString()}`, { headers: await authHeaders() });
   if (!response.ok) throw new Error("Could not load suggestions");
   return await response.json() as GapCandidate[];
 }
@@ -276,21 +317,28 @@ export async function listGaps(limit = 3, sessionId?: string): Promise<GapCandid
 export async function getSessionGraph(
   sessionId: string,
 ): Promise<{ nodes: SessionGraphNode[]; edges: SessionGraphEdge[] }> {
-  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/graph`);
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/graph`, {
+    headers: await authHeaders(),
+  });
   const data = await response.json() as { nodes: SessionGraphNode[]; edges: SessionGraphEdge[]; error?: string };
   if (!response.ok) throw new Error(data.error ?? "Could not load the graph");
   return data;
 }
 
 export async function getSessionPaperMap(sessionId: string): Promise<PaperConnection[]> {
-  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/paper-map`, { cache: "no-store" });
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/paper-map`, {
+    cache: "no-store",
+    headers: await authHeaders(),
+  });
   const data = await response.json() as { connections: PaperConnection[]; error?: string };
   if (!response.ok) throw new Error(data.error ?? "Could not map paper connections");
   return data.connections;
 }
 
 export async function getSessionBibliography(sessionId: string): Promise<string> {
-  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/bibliography`);
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/bibliography`, {
+    headers: await authHeaders(),
+  });
   if (!response.ok) {
     const data = await response.json().catch(() => ({})) as { error?: string };
     throw new Error(data.error ?? "Could not export citations");
@@ -299,14 +347,19 @@ export async function getSessionBibliography(sessionId: string): Promise<string>
 }
 
 export async function checkForContradictions(sessionId: string): Promise<ContradictionCandidate[]> {
-  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/contradictions/check`, { method: "POST" });
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/contradictions/check`, {
+    method: "POST",
+    headers: await authHeaders(),
+  });
   const data = await response.json() as ContradictionCandidate[] & { error?: string };
   if (!response.ok) throw new Error((data as unknown as { error?: string }).error ?? "Could not check for contradictions");
   return data;
 }
 
 export async function getFeynmanPrompts(paperId: string, sessionId: string): Promise<FeynmanPrompt[]> {
-  const response = await fetch(`/api/papers/${encodeURIComponent(paperId)}/feynman/prompts?session_id=${encodeURIComponent(sessionId)}`);
+  const response = await fetch(`/api/papers/${encodeURIComponent(paperId)}/feynman/prompts?session_id=${encodeURIComponent(sessionId)}`, {
+    headers: await authHeaders(),
+  });
   const data = await response.json() as FeynmanPrompt[] & { error?: string };
   if (!response.ok) throw new Error((data as unknown as { error?: string }).error ?? "Could not load a question about this paper");
   return data;
@@ -315,7 +368,7 @@ export async function getFeynmanPrompts(paperId: string, sessionId: string): Pro
 export async function checkFeynmanExplanation(paperId: string, nodeId: string, sessionId: string, explanation: string): Promise<FeynmanCheckResult> {
   const response = await fetch(`/api/papers/${encodeURIComponent(paperId)}/feynman/check`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(await authHeaders()) },
     body: JSON.stringify({ node_id: nodeId, session_id: sessionId, explanation }),
   });
   const data = await response.json() as FeynmanCheckResult & { error?: string };
@@ -326,7 +379,7 @@ export async function checkFeynmanExplanation(paperId: string, nodeId: string, s
 export async function recordGapFeedback(nodeAId: string, nodeBId: string, interesting: boolean): Promise<void> {
   const response = await fetch("/api/gaps/feedback", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(await authHeaders()) },
     body: JSON.stringify({ node_a_id: nodeAId, node_b_id: nodeBId, interesting }),
   });
   if (!response.ok) throw new Error("Could not record feedback");
@@ -335,7 +388,7 @@ export async function recordGapFeedback(nodeAId: string, nodeBId: string, intere
 export async function recordQueryFeedback(nodeId: string, helpful: boolean): Promise<void> {
   const response = await fetch("/api/query/feedback", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(await authHeaders()) },
     body: JSON.stringify({ node_id: nodeId, helpful }),
   });
   if (!response.ok) throw new Error("Could not record feedback");

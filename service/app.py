@@ -81,7 +81,7 @@ app.add_middleware(
     allow_origins=origins,
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "X-API-Key", "X-Upload-Token"],
+    allow_headers=["Content-Type", "X-API-Key", "X-Upload-Token", "Authorization"],
 )
 
 for router in (health.router, chat.router, query.router, clarifications.router, gaps.router, contradictions.router, feynman.router, papers.router, sessions.router):

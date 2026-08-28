@@ -139,6 +139,18 @@ class SessionStore:
         sessions = [snapshot.to_dict() for snapshot in self._collection.stream()]
         return sorted(sessions, key=lambda session: str(session.get("updated_at", "")), reverse=True)
 
+    def get(self, session_id: str) -> dict[str, Any] | None:
+        """Targeted single-document read, same pattern as PaperStore.get -
+        every route resolving "does this session_id belong to me" was
+        previously doing `next(... for s in self.list() ...)`, a full scan
+        of every session ever created by every account just to find one by
+        id. Confirmed live as a real, measured contributor to slow page
+        loads (every session-scoped route pays this on every request, and
+        it gets worse as the collection grows) - use this instead of
+        list() wherever only one session_id's data is actually needed."""
+        snapshot = self._collection.document(session_id).get()
+        return snapshot.to_dict() if snapshot.exists else None
+
     def delete(self, session_id: str) -> None:
         self._collection.document(session_id).delete()
 

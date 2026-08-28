@@ -11,7 +11,10 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
   try {
     const response = await fetch(`${apiUrl.replace(/\/$/, "")}/papers/${encodeURIComponent(id)}/detach?session_id=${encodeURIComponent(sessionId)}`, {
       method: "POST",
-      headers: process.env.API_SHARED_SECRET ? { "X-API-Key": process.env.API_SHARED_SECRET } : {},
+      headers: {
+        ...(process.env.API_SHARED_SECRET ? { "X-API-Key": process.env.API_SHARED_SECRET } : {}),
+        ...(request.headers.get("authorization") ? { Authorization: request.headers.get("authorization")! } : {}),
+      },
       cache: "no-store",
     });
     const data = await response.json();

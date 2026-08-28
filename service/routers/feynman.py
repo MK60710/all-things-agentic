@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from agent.feynman_checker import FeynmanCheckResult, FeynmanPrompt
+from service.auth import get_current_user
 from service.deps import get_state, require_api_key
 from service.state import AppState
 
@@ -25,10 +26,20 @@ class FeynmanCheckRequest(BaseModel):
     explanation: str = Field(max_length=MAX_EXPLANATION_CHARS)
 
 
+def _check_session_owned(state: AppState, session_id: str, uid: str) -> None:
+    owned = state.session_store.get(session_id)
+    if owned is None or owned.get("owner_uid") != uid:
+        raise HTTPException(status_code=404, detail=f"no session {session_id!r}")
+
+
 @router.get("/{paper_id}/feynman/prompts", response_model=list[FeynmanPrompt])
 def get_feynman_prompts(
-    paper_id: str, session_id: str, state: AppState = Depends(get_state)
+    paper_id: str,
+    session_id: str,
+    state: AppState = Depends(get_state),
+    uid: str = Depends(get_current_user),
 ) -> list[FeynmanPrompt]:
+    _check_session_owned(state, session_id, uid)
     if state.paper_store.get(paper_id) is None:
         raise HTTPException(status_code=404, detail=f"no paper {paper_id!r}")
     return state.feynman_checker.pick_prompts(paper_id, session_id)
@@ -36,8 +47,12 @@ def get_feynman_prompts(
 
 @router.post("/{paper_id}/feynman/check", response_model=FeynmanCheckResult)
 def check_feynman_explanation(
-    paper_id: str, body: FeynmanCheckRequest, state: AppState = Depends(get_state)
+    paper_id: str,
+    body: FeynmanCheckRequest,
+    state: AppState = Depends(get_state),
+    uid: str = Depends(get_current_user),
 ) -> FeynmanCheckResult:
+    _check_session_owned(state, body.session_id, uid)
     if state.paper_store.get(paper_id) is None:
         raise HTTPException(status_code=404, detail=f"no paper {paper_id!r}")
     result = state.feynman_checker.check(

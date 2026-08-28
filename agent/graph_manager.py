@@ -358,7 +358,7 @@ class GraphManager:
             return fully_removed_node_ids
 
     def resolve_alias(
-        self, canonical_id: str, alias_id: str, distinct: bool = False
+        self, canonical_id: str, alias_id: str, owner_uid: str, distinct: bool = False
     ) -> None:
         """Apply a user correction on an ambiguous canonicalization match.
 
@@ -366,6 +366,13 @@ class GraphManager:
         (INFERRED — no single source quote by definition). distinct=True
         records the pair as known-distinct so the same question isn't asked
         again later in the batch.
+
+        owner_uid is required, same discipline as canonicalize's own
+        required owner_uid - this was previously the one place in the
+        owner_uid rollout that got missed: the merge edge below was built
+        with no owner_uid at all, confirmed live as real orphaned SAME_AS
+        edges in the production data (owner_uid=None, unreachable by any
+        real account's own graph reads).
         """
         with self._lock:
             if distinct:
@@ -399,6 +406,7 @@ class GraphManager:
                 target_id=canonical_id,
                 type=EdgeType.SAME_AS,
                 provenance=ProvenanceTag.INFERRED,
+                owner_uid=owner_uid,
             )
             self.add_edge(edge)
 
@@ -431,7 +439,12 @@ class GraphManager:
         )
 
     def search_nodes(
-        self, query: str, *, limit: int = 8, min_score: float = 0.0
+        self,
+        query: str,
+        *,
+        limit: int = 8,
+        min_score: float = 0.0,
+        owner_uid: str | None = None,
     ) -> list[NodeSearchHit]:
         """Lexical relevance search over node name+description.
 
@@ -449,6 +462,13 @@ class GraphManager:
         it's an uncached edge scan, so only paying it for nodes that
         already cleared the cheap check keeps the common case (no overlap)
         fast.
+
+        owner_uid, when given, excludes every node belonging to another
+        account before it's scored at all - this method scans the whole
+        graph with no session_id concept to lean on (unlike
+        export_session_graph/find_sparse_pairs), so it's the one read
+        path that must filter by owner directly rather than inheriting
+        safety from session scoping.
         """
         query_tokens = search_tokens(query)
         if not query_tokens:
@@ -456,6 +476,8 @@ class GraphManager:
         with self._lock:
             hits: list[NodeSearchHit] = []
             for node_id, data in self.graph.nodes(data=True):
+                if owner_uid is not None and data.get("owner_uid") != owner_uid:
+                    continue
                 node_tokens = self._node_tokens(node_id, data)
                 if not node_tokens:
                     continue
@@ -663,6 +685,7 @@ class GraphManager:
         node_type: NodeType | None = None,
         limit: int = 10,
         session_id: str | None = None,
+        owner_uid: str | None = None,
     ) -> list[tuple[str, str]]:
         """Candidate pairs with no direct edge but at least one common
         neighbor — topology decides, not LLM guessing.
@@ -670,13 +693,21 @@ class GraphManager:
         session_id, when given, restricts candidates to nodes tagged with
         that session (same tagging remove_by_session already relies on) -
         otherwise gap suggestions draw from every paper ever ingested in
-        any session, not just what's actually in this one."""
+        any session, not just what's actually in this one. owner_uid is
+        the account boundary and should always be passed by an
+        authenticated caller regardless of whether session_id is also
+        given - a session can never belong to another account (Phase 1)
+        and a node can never belong to another account than the session
+        that created it (canonicalize's own owner_uid scoping), but
+        filtering here too means gap suggestions never draw from another
+        account's graph even when session_id is omitted entirely."""
         with self._lock:
             candidates = [
                 n
                 for n, data in self.graph.nodes(data=True)
                 if (node_type is None or data.get("type") == node_type.value)
                 and (session_id is None or session_id in _session_ids(data))
+                and (owner_uid is None or data.get("owner_uid") == owner_uid)
             ]
             undirected = self.graph.to_undirected()
             pairs: list[tuple[str, str, int]] = []
@@ -699,13 +730,26 @@ class GraphManager:
     def canonicalize(
         self,
         name: str,
+        owner_uid: str,
         embedding: list[float] | None = None,
         node_type: NodeType | None = None,
     ) -> CanonicalizationResult:
         """Two-tier match: cheap string match first, then embedding
         similarity. Three-way routing on the result.
 
-        Both loops skip already-merged alias nodes (resolve_alias
+        owner_uid is the real isolation boundary between accounts - both
+        loops below only ever consider nodes already tagged with this
+        same owner_uid, so a name or embedding match against another
+        account's entity can never return auto_merge/needs_clarification.
+        Without this, two different accounts referencing the same concept
+        (e.g. "transformer architecture" from two different papers) would
+        land on one shared node with a combined citation list, which is
+        exactly the cross-account bleed full per-user isolation exists to
+        prevent - see the "no mixing" requirement in
+        service/routers/papers.py's paper_id namespacing for the sibling
+        fix at the paper-identity layer.
+
+        Both loops also skip already-merged alias nodes (resolve_alias
         (distinct=False) target) - without this, a later entity could
         match a node that itself got superseded by an earlier merge, and
         canonicalize/apply_extraction_result would auto-merge or raise a
@@ -718,6 +762,8 @@ class GraphManager:
             new_abbreviation = _abbreviation_of(name)
             abbreviation_matches: list[str] = []
             for node_id, data in self.graph.nodes(data=True):
+                if data.get("owner_uid") != owner_uid:
+                    continue
                 if node_type is not None and data.get("type") != node_type.value:
                     continue
                 if self._is_merged_alias(node_id):
@@ -750,6 +796,8 @@ class GraphManager:
 
             best_id, best_score = None, 0.0
             for node_id, data in self.graph.nodes(data=True):
+                if data.get("owner_uid") != owner_uid:
+                    continue
                 if node_type is not None and data.get("type") != node_type.value:
                     continue
                 if self._is_merged_alias(node_id):
@@ -770,6 +818,7 @@ class GraphManager:
     def apply_extraction_result(
         self,
         extraction: ExtractionResult,
+        owner_uid: str,
         *,
         paper_name: str | None = None,
         embedding_fn: Callable[[ExtractedEntity], list[float] | None] | None = None,
@@ -807,6 +856,7 @@ class GraphManager:
             name=paper_name or extraction.paper_id,
             description="Source paper",
             session_id=session_id,
+            owner_uid=owner_uid,
         )
         self.add_node(paper_node)
 
@@ -842,7 +892,7 @@ class GraphManager:
             # internally on the same thread is safe.
             with self._lock:
                 canonical = self.canonicalize(
-                    entity.name, embedding=embedding, node_type=entity.type
+                    entity.name, owner_uid, embedding=embedding, node_type=entity.type
                 )
                 if canonical.decision == "auto_merge" and canonical.matched_node_id:
                     node_id = canonical.matched_node_id
@@ -867,6 +917,7 @@ class GraphManager:
                             description=existing_data.get("description", ""),
                             entity_embedding=existing_data.get("entity_embedding"),
                             session_id=session_id,
+                            owner_uid=owner_uid,
                         )
                     )
                 else:
@@ -881,6 +932,7 @@ class GraphManager:
                             description=entity.description,
                             entity_embedding=embedding,
                             session_id=session_id,
+                            owner_uid=owner_uid,
                         )
                     )
                     reused = False
@@ -941,6 +993,7 @@ class GraphManager:
                     relation.source_entity,
                     relation.source_type,
                     entity_to_node_id,
+                    owner_uid,
                     session_id=session_id,
                 )
                 target_id = self._resolve_relation_endpoint(
@@ -948,6 +1001,7 @@ class GraphManager:
                     relation.target_entity,
                     relation.target_type,
                     entity_to_node_id,
+                    owner_uid,
                     session_id=session_id,
                 )
             except ValueError:
@@ -989,6 +1043,7 @@ class GraphManager:
                 source_section=relation.source_section,
                 source_quote=relation.source_quote,
                 session_id=session_id,
+                owner_uid=owner_uid,
             )
             self.add_edge(edge)
             edge_writes.append(
@@ -1014,6 +1069,7 @@ class GraphManager:
         name: str,
         node_type: NodeType | None,
         entity_to_node_id: dict[tuple[str, NodeType], str],
+        owner_uid: str,
         *,
         session_id: str | None = None,
     ) -> str:
@@ -1035,7 +1091,7 @@ class GraphManager:
                     f"ambiguous relation endpoint {name!r}; source_type/target_type is required"
                 )
 
-        canonical = self.canonicalize(name, node_type=node_type)
+        canonical = self.canonicalize(name, owner_uid, node_type=node_type)
         if canonical.decision == "auto_merge" and canonical.matched_node_id:
             # Same accumulation gap as the main entity loop above: reusing
             # an existing node id is not itself a write, so this
@@ -1049,6 +1105,7 @@ class GraphManager:
                     description=existing_data.get("description", ""),
                     entity_embedding=existing_data.get("entity_embedding"),
                     session_id=session_id,
+                    owner_uid=owner_uid,
                 )
             )
             return canonical.matched_node_id
@@ -1062,6 +1119,7 @@ class GraphManager:
                 name=name,
                 description="Implicit relation endpoint from extraction",
                 session_id=session_id,
+                owner_uid=owner_uid,
             )
         )
         entity_to_node_id[(normalized, resolved_type)] = node_id

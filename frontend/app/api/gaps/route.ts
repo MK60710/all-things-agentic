@@ -11,7 +11,10 @@ export async function GET(request: NextRequest) {
   if (sessionId) params.set("session_id", sessionId);
   try {
     const response = await fetch(`${apiUrl.replace(/\/$/, "")}/gaps?${params.toString()}`, {
-      headers: process.env.API_SHARED_SECRET ? { "X-API-Key": process.env.API_SHARED_SECRET } : {},
+      headers: {
+        ...(process.env.API_SHARED_SECRET ? { "X-API-Key": process.env.API_SHARED_SECRET } : {}),
+        ...(request.headers.get("authorization") ? { Authorization: request.headers.get("authorization")! } : {}),
+      },
       cache: "no-store",
     });
     const data = await response.json();

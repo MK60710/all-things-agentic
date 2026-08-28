@@ -90,6 +90,11 @@ class ChunkRecord:
     content_type: str = "prose"
     previous_chunk_id: str | None = None
     next_chunk_id: str | None = None
+    # Set on upsert_paper - the account this chunk's paper belongs to.
+    # search()/assemble_context() filter by it when a caller passes
+    # owner_uid, the same account boundary GraphManager.canonicalize
+    # enforces on the graph side.
+    owner_uid: str | None = None
 
 
 @dataclass(frozen=True)
@@ -157,6 +162,7 @@ class ChunkIndex:
                 content_type=str(data.get("content_type", "prose")),
                 previous_chunk_id=data.get("previous_chunk_id"),
                 next_chunk_id=data.get("next_chunk_id"),
+                owner_uid=data.get("owner_uid"),
             )
 
     def remove_paper(self, paper_id: str) -> int:
@@ -189,7 +195,10 @@ class ChunkIndex:
         return len(stale_ids)
 
     def upsert_paper(
-        self, paper_id: str, chunks: list[str] | list[ExtractionChunk]
+        self,
+        paper_id: str,
+        chunks: list[str] | list[ExtractionChunk],
+        owner_uid: str | None = None,
     ) -> list[str]:
         """The lock only wraps the in-memory _records mutation below, not
         the Firestore reads/writes - those are real network calls, one
@@ -239,6 +248,7 @@ class ChunkIndex:
                         chunk_ids[index + 1] if index + 1 < len(chunk_ids) else None
                     ),
                     embedding=self._embedding_fn(normalized),
+                    owner_uid=owner_uid,
                 )
             )
 
@@ -273,6 +283,7 @@ class ChunkIndex:
                         "previous_chunk_id": record.previous_chunk_id,
                         "next_chunk_id": record.next_chunk_id,
                         "embedding": record.embedding,
+                        "owner_uid": record.owner_uid,
                     },
                     merge=True,
                 )
@@ -286,6 +297,7 @@ class ChunkIndex:
         paper_ids: set[str] | None = None,
         section: str | None = None,
         min_score: float = 0.0,
+        owner_uid: str | None = None,
     ) -> list[SearchHit]:
         if limit < 1:
             return []
@@ -294,6 +306,8 @@ class ChunkIndex:
             query_tokens = _search_tokens(query)
             hits = []
             for record in self._records.values():
+                if owner_uid is not None and record.owner_uid != owner_uid:
+                    continue
                 if paper_ids is not None and record.paper_id not in paper_ids:
                     continue
                 if section is not None and record.section != section:
@@ -333,11 +347,25 @@ class ChunkIndex:
         paper_ids: set[str] | None = None,
         section: str | None = None,
         max_characters: int = 14000,
+        owner_uid: str | None = None,
+        min_score: float = 0.0,
     ) -> AssembledContext:
-        """Retrieve, expand around hits, and restore paper reading order."""
+        """Retrieve, expand around hits, and restore paper reading order.
+
+        min_score defaults to 0.0 (no floor) for direct callers that
+        genuinely want whatever's closest regardless of how weak the
+        match is (e.g. a specific section lookup). QueryAgent's own
+        vector-fallback call passes its own floor - confirmed live this
+        was previously always 0.0 from that call site specifically, so a
+        query with zero real signal (a bare "HI") still always returned
+        *some* top-N nearest chunks, no matter how irrelevant, and Gemini
+        was left to notice and disclaim in the answer text while the
+        citations were already committed and shown regardless."""
 
         with self._lock:
-            seeds = self.search(query, limit=limit, paper_ids=paper_ids, section=section)
+            seeds = self.search(
+                query, limit=limit, paper_ids=paper_ids, section=section, owner_uid=owner_uid, min_score=min_score
+            )
             selected: dict[str, tuple[ChunkRecord, float]] = {}
             for seed in seeds:
                 record = self._records[seed.chunk_id]
@@ -349,7 +377,19 @@ class ChunkIndex:
                         if neighbor_id is None or neighbor_id not in self._records:
                             break
                         cursor = self._records[neighbor_id]
-                        selected.setdefault(cursor.id, (cursor, seed.score))
+                        # 0.0, not seed.score - a neighbor pulled in purely
+                        # for surrounding context was never itself matched
+                        # by the query, so it shouldn't inherit its seed's
+                        # relevance. Confirmed live this let a chunk that
+                        # min_score had just filtered out sneak back in
+                        # wearing its neighbor's high score, which then won
+                        # a citation-truncation tie it had no real claim to
+                        # (query_agent.py's max_citations sort is by this
+                        # exact score). setdefault still means a chunk that
+                        # genuinely is its own seed keeps its real score -
+                        # this only affects chunks with no seed entry of
+                        # their own.
+                        selected.setdefault(cursor.id, (cursor, 0.0))
 
             ordered = sorted(
                 selected.values(), key=lambda item: (item[0].paper_id, item[0].ordinal)
