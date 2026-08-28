@@ -382,9 +382,10 @@ class GapFinder:
         # pair with strong real topology can still outrank an on-goal one,
         # same as _node_boost.
         goal: str | None = None,
+        owner_uid: str | None = None,
     ) -> list[GapCandidate]:
         pairs = self._gm.find_sparse_pairs(
-            node_type=node_type, limit=limit * 3, session_id=session_id
+            node_type=node_type, limit=limit * 3, session_id=session_id, owner_uid=owner_uid
         )
         undirected = self._gm.graph.to_undirected()
         goal_tokens = frozenset(search_tokens(goal)) if goal else frozenset()

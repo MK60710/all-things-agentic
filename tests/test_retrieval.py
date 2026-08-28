@@ -96,6 +96,27 @@ def test_assemble_context_expands_neighbors_and_restores_order():
     )
 
 
+def test_assemble_context_neighbors_dont_inherit_their_seeds_score():
+    """A neighbor pulled in purely for surrounding context was never
+    itself matched by the query - confirmed live this previously
+    inherited its seed's real score, which then let a chunk min_score had
+    just filtered out sneak back in wearing a borrowed high score and win
+    a citation-truncation tie (query_agent.py's max_citations sort) it had
+    no genuine claim to."""
+    index = ChunkIndex()
+    chunks = [
+        ExtractionChunk(text="Completely unrelated filler sentence.", ordinal=0, page_start=1, page_end=1),
+        ExtractionChunk(text="Random forest accuracy reached 99.75 percent.", ordinal=1, page_start=2, page_end=2),
+    ]
+    index.upsert_paper("paper-1", chunks)
+
+    context = index.assemble_context("random forest accuracy", limit=1, neighbor_window=1)
+
+    scores = {hit.ordinal: hit.score for hit in context.hits}
+    assert scores[1] > 0.0  # the real seed keeps its own real score
+    assert scores[0] == 0.0  # its neighbor, never itself matched, does not inherit it
+
+
 def test_context_metadata_is_json_encoded():
     index = ChunkIndex()
     index.upsert_paper(

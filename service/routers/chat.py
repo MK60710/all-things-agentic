@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from agent.general_chat import ChatTurn
 from agent.query_agent import QueryResult
+from service.auth import get_current_user
 from service.deps import get_state, require_api_key
 from service.schemas import ChatRequest
 from service.state import AppState
@@ -13,7 +14,15 @@ router = APIRouter(tags=["chat"], dependencies=[Depends(require_api_key)])
 
 
 @router.post("/chat", response_model=QueryResult)
-def chat(body: ChatRequest, state: AppState = Depends(get_state)) -> QueryResult:
+def chat(
+    body: ChatRequest,
+    state: AppState = Depends(get_state),
+    uid: str = Depends(get_current_user),
+) -> QueryResult:
+    if body.session_id:
+        owned = state.session_store.get(body.session_id)
+        if owned is None or owned.get("owner_uid") != uid:
+            raise HTTPException(status_code=404, detail=f"no session {body.session_id!r}")
     history = [ChatTurn(role=item.role, text=item.text) for item in body.history]
     paper_ids = body.paper_ids
     if body.session_id and paper_ids:
@@ -39,6 +48,7 @@ def chat(body: ChatRequest, state: AppState = Depends(get_state)) -> QueryResult
             goal=body.goal,
             node_id=body.node_id,
             section=body.section,
+            owner_uid=uid,
         )
     # An empty working set doesn't mean "skip the graph" - it means search
     # the whole graph instead of a specific session's papers. Previously
@@ -48,7 +58,13 @@ def chat(body: ChatRequest, state: AppState = Depends(get_state)) -> QueryResult
     # back to plain chat when the graph genuinely has nothing relevant, not
     # just when no papers were attached.
     graph_result = state.query_agent.answer(
-        body.message, paper_ids=None, history=history, goal=body.goal, node_id=body.node_id, section=body.section
+        body.message,
+        paper_ids=None,
+        history=history,
+        goal=body.goal,
+        node_id=body.node_id,
+        section=body.section,
+        owner_uid=uid,
     )
     if graph_result.retrieval_mode != "no_results":
         return graph_result

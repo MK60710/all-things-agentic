@@ -16,7 +16,26 @@ export interface ConvergenceEntry {
 // numbers, since this is an estimate, not a real completion signal.
 const ESTIMATED_SECONDS = 70;
 
-const BUILD_WORDS = ["Reading", "Analyzing", "Scanning"];
+// A real extraction pass runs 45-90s+ - three words cycling every 1.7s
+// repeats itself a dozen times over before it's done, which reads as
+// stale rather than alive. A longer, more varied set (same spirit as
+// Claude Code's own status-word rotation) keeps the cutscene feeling
+// like something is actually still happening, not a stuck loop.
+const BUILD_WORDS = [
+  "Reading",
+  "Parsing",
+  "Analyzing",
+  "Scanning",
+  "Untangling",
+  "Cross-referencing",
+  "Distilling",
+  "Mapping",
+  "Connecting",
+  "Synthesizing",
+  "Tracing citations",
+  "Weighing evidence",
+  "Building the graph",
+];
 const WORD_INTERVAL_MS = 1700;
 
 type Phase = "idle" | "active" | "closing" | "leaving";
@@ -86,14 +105,6 @@ export default function ConvergenceRitual({
   const remaining = ESTIMATED_SECONDS - elapsed;
   const timeLabel = phase === "active" ? (remaining > 0 ? `~${remaining}s left` : "Almost there…") : null;
   const statusWord = BUILD_WORDS[wordIndex];
-  // Real backend stage (e.g. "Extracting…"), not just the cosmetic word
-  // rotation above - confirmed live this was previously computed by the
-  // caller and passed in but never actually rendered anywhere, so the
-  // whole 60-90s+ extraction phase looked identical to a silent wait
-  // beyond the estimate/countdown. Only the first entry's stage is shown
-  // - concurrent ingests are rare and this is a shared overlay, not a
-  // per-paper progress list.
-  const stageLabel = entries[0]?.stageLabel;
 
   return (
     <div className={`convergence-stage${phase === "leaving" ? " leaving" : ""}`}>
@@ -107,22 +118,28 @@ export default function ConvergenceRitual({
             <path d="M12 3v6M12 15v6M3 12h6M15 12h6M5.6 5.6l4.2 4.2M14.2 14.2l4.2 4.2M18.4 5.6l-4.2 4.2M9.8 14.2l-4.2 4.2"/>
           </svg>
         </div>
-      </div>
-
-      <div className="convergence-below">
-        {phase === "active" && (
-          <>
-            <p className="convergence-status">
-              <span className="convergence-shimmer">{statusWord}…</span>
-              {(stageLabel || timeLabel) && (
-                <small>{[stageLabel, timeLabel].filter(Boolean).join(" · ")}</small>
-              )}
-            </p>
-          </>
-        )}
-        {(phase === "closing" || phase === "leaving") && (
-          <p className="convergence-closing">This is a guide for reference, built on your knowledge graph.</p>
-        )}
+        {/* Nested inside convergence-star-anchor on purpose - convergence-below's
+            top:100% is meant to read as "right below the star", the same
+            reference box .convergence-halo/.convergence-star already use for
+            their own top:50%/left:50% centering. As a sibling of this anchor
+            instead (its previous position), top:100% resolved against
+            convergence-stage - the full-screen fixed container - pushing the
+            status text ~150px below the bottom of the viewport. Confirmed live
+            via getBoundingClientRect: the text existed in the DOM with the
+            right content the whole time, just never actually on screen. */}
+        <div className="convergence-below">
+          {phase === "active" && (
+            <>
+              <p className="convergence-status">
+                <span className="convergence-shimmer">{statusWord}…</span>
+                {timeLabel && <small>{timeLabel}</small>}
+              </p>
+            </>
+          )}
+          {(phase === "closing" || phase === "leaving") && (
+            <p className="convergence-closing">This is a guide for reference, built on your knowledge graph.</p>
+          )}
+        </div>
       </div>
 
       <div className="convergence-papers">

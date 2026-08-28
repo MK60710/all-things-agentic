@@ -21,9 +21,31 @@ from agent.research_store import ResearchStore
 from agent.retrieval import ChunkIndex
 from agent.schema import Node, NodeType
 from service.app import app
+from service.auth import get_current_user
 from service.deps import get_state
 from service.state import AppState
 from service.storage import PaperStore, SessionMessagesStore, SessionStore, UploadTokenStore
+
+# Every fixture-seeded session/paper/graph node uses this as owner_uid,
+# matching the get_current_user override below - keeps ownership checks
+# in the routers (sessions.py's _get_owned_session, papers.py's
+# _owned_paper, etc.) passing for fixture data without each test needing
+# to know about auth at all.
+TEST_UID = "test-uid"
+
+
+def _seed_session(app_state, session_id: str, owner_uid: str = TEST_UID) -> None:
+    """Some tests reference a bare session_id string directly (in a URL or
+    query param) without ever creating it through the real POST /sessions
+    route - now that every session-scoped route requires a real, owned
+    session record (not just a client-supplied id), those tests need one
+    seeded directly via the store."""
+    app_state.session_store.save(
+        session_id,
+        name="Test Session",
+        created_at="2024-01-01T00:00:00+00:00",
+        owner_uid=owner_uid,
+    )
 
 
 def _no_op_judge(claim_a: str, claim_b: str):
@@ -89,9 +111,11 @@ def client(app_state, monkeypatch):
     # every route handler gets app_state regardless.
     monkeypatch.setattr("service.app.build_state", lambda: app_state)
     app.dependency_overrides[get_state] = lambda: app_state
+    app.dependency_overrides[get_current_user] = lambda: TEST_UID
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.pop(get_state, None)
+    app.dependency_overrides.pop(get_current_user, None)
 
 
 def test_health(client):
@@ -120,14 +144,14 @@ def test_clarifications_session_filter_excludes_a_different_sessions_question(
     """With named sessions coexisting, an entity-merge question created by
     one session's ingest must not surface to a different session - it's
     ambiguity about that session's own data, not a shared prompt."""
-    candidate = Node(id="candidate-node", type=NodeType.CONCEPT, name="Existing Concept")
+    candidate = Node(id="candidate-node", type=NodeType.CONCEPT, name="Existing Concept", owner_uid=TEST_UID)
     app_state.graph.add_node(candidate)
     provisional = Node(
         id="provisional-node",
         type=NodeType.CONCEPT,
         name="New Concept",
         session_id="session-a",
-    )
+     owner_uid=TEST_UID)
     app_state.graph.add_node(provisional)
     app_state.clarification.register_entity_merge_question(
         provisional_node_id=provisional.id,
@@ -194,8 +218,8 @@ def test_session_without_goal_defaults_to_none(client):
 def test_session_graph_endpoint_returns_only_that_sessions_nodes(client, app_state):
     created = client.post("/sessions", json={"name": "Graph session"}).json()
     session_id = created["id"]
-    a = Node(id="node-a", type=NodeType.CONCEPT, name="In Session", session_id=session_id)
-    b = Node(id="node-b", type=NodeType.CONCEPT, name="Other Session", session_id="other-session")
+    a = Node(id="node-a", type=NodeType.CONCEPT, name="In Session", session_id=session_id, owner_uid=TEST_UID)
+    b = Node(id="node-b", type=NodeType.CONCEPT, name="Other Session", session_id="other-session", owner_uid=TEST_UID)
     app_state.graph.add_node(a)
     app_state.graph.add_node(b)
     app_state.graph.add_edge(
@@ -207,7 +231,7 @@ def test_session_graph_endpoint_returns_only_that_sessions_nodes(client, app_sta
             provenance=ProvenanceTag.EXTRACTED,
             source_quote="quote",
             session_id=session_id,
-        )
+         owner_uid=TEST_UID)
     )
 
     response = client.get(f"/sessions/{session_id}/graph")
@@ -228,7 +252,7 @@ def test_bibliography_endpoint_returns_real_bibtex_for_the_sessions_papers(clien
     session_id = created["id"]
     app_state.paper_store.save(
         "arxiv-2106.09685", title="LoRA", authors="Edward J. Hu", status="ready", session_id=session_id
-    )
+    , owner_uid=TEST_UID)
 
     response = client.get(f"/sessions/{session_id}/bibliography")
 
@@ -241,8 +265,8 @@ def test_bibliography_endpoint_returns_real_bibtex_for_the_sessions_papers(clien
 def test_bibliography_endpoint_only_includes_this_sessions_papers(client, app_state):
     created = client.post("/sessions", json={"name": "Bib session"}).json()
     session_id = created["id"]
-    app_state.paper_store.save("paper-mine", title="Mine", status="ready", session_id=session_id)
-    app_state.paper_store.save("paper-other", title="Other", status="ready", session_id="a-different-session")
+    app_state.paper_store.save("paper-mine", title="Mine", status="ready", session_id=session_id, owner_uid=TEST_UID)
+    app_state.paper_store.save("paper-other", title="Other", status="ready", session_id="a-different-session", owner_uid=TEST_UID)
 
     response = client.get(f"/sessions/{session_id}/bibliography")
 
@@ -285,9 +309,10 @@ def test_feynman_prompts_endpoint_404s_for_unknown_paper(client):
 
 
 def test_feynman_prompts_endpoint_returns_testable_nodes_for_the_paper(client, app_state):
-    app_state.paper_store.save("paper-a", title="Paper A", status="ready", session_id="session-a")
-    paper = Node(id="paper-a", type=NodeType.PAPER, name="Paper A", description="Source paper", session_id="session-a")
-    concept = Node(id="concept-a", type=NodeType.CONCEPT, name="Concept A", description="A concept with a real, substantive description.", session_id="session-a")
+    _seed_session(app_state, "session-a")
+    app_state.paper_store.save("paper-a", title="Paper A", status="ready", session_id="session-a", owner_uid=TEST_UID)
+    paper = Node(id="paper-a", type=NodeType.PAPER, name="Paper A", description="Source paper", session_id="session-a", owner_uid=TEST_UID)
+    concept = Node(id="concept-a", type=NodeType.CONCEPT, name="Concept A", description="A concept with a real, substantive description.", session_id="session-a", owner_uid=TEST_UID)
     app_state.graph.add_node(paper)
     app_state.graph.add_node(concept)
     app_state.graph.add_edge(
@@ -299,7 +324,7 @@ def test_feynman_prompts_endpoint_returns_testable_nodes_for_the_paper(client, a
             provenance=ProvenanceTag.EXTRACTED,
             source_paper_id="paper-a",
             session_id="session-a",
-        )
+         owner_uid=TEST_UID)
     )
 
     response = client.get("/papers/paper-a/feynman/prompts?session_id=session-a")
@@ -328,7 +353,7 @@ def _link_node_to_paper(app_state, node_id: str, paper_id: str, session_id: str)
             provenance=ProvenanceTag.EXTRACTED,
             source_paper_id=paper_id,
             session_id=session_id,
-        )
+         owner_uid=TEST_UID)
     )
 
 
@@ -336,9 +361,10 @@ def test_feynman_check_endpoint_502s_when_the_judge_fails(client, app_state):
     """app_state's feynman_checker uses _no_op_feynman_judge, which always
     returns None - mirrors how a real Gemini outage should surface as a
     clear error, not a fabricated verdict."""
-    app_state.paper_store.save("paper-a", title="Paper A", status="ready", session_id="session-a")
-    paper = Node(id="paper-a", type=NodeType.PAPER, name="Paper A", description="Source paper", session_id="session-a")
-    concept = Node(id="concept-a", type=NodeType.CONCEPT, name="Concept A", description="A concept", session_id="session-a")
+    _seed_session(app_state, "session-a")
+    app_state.paper_store.save("paper-a", title="Paper A", status="ready", session_id="session-a", owner_uid=TEST_UID)
+    paper = Node(id="paper-a", type=NodeType.PAPER, name="Paper A", description="Source paper", session_id="session-a", owner_uid=TEST_UID)
+    concept = Node(id="concept-a", type=NodeType.CONCEPT, name="Concept A", description="A concept", session_id="session-a", owner_uid=TEST_UID)
     app_state.graph.add_node(paper)
     app_state.graph.add_node(concept)
     _link_node_to_paper(app_state, "concept-a", "paper-a", "session-a")
@@ -355,15 +381,16 @@ def test_feynman_check_endpoint_rejects_a_node_from_a_different_session(client, 
     """Router-level regression test for the live-confirmed cross-session
     leak: a node_id that belongs to a different session must be rejected
     before it ever reaches the judge, not just filtered client-side."""
-    app_state.paper_store.save("paper-a", title="Paper A", status="ready", session_id="session-a")
-    paper = Node(id="paper-a", type=NodeType.PAPER, name="Paper A", description="Source paper", session_id="session-a")
+    _seed_session(app_state, "session-a")
+    app_state.paper_store.save("paper-a", title="Paper A", status="ready", session_id="session-a", owner_uid=TEST_UID)
+    paper = Node(id="paper-a", type=NodeType.PAPER, name="Paper A", description="Source paper", session_id="session-a", owner_uid=TEST_UID)
     foreign_concept = Node(
         id="foreign-concept",
         type=NodeType.CONCEPT,
         name="Foreign Concept",
         description="Belongs to a different session entirely.",
         session_id="session-b",
-    )
+     owner_uid=TEST_UID)
     app_state.graph.add_node(paper)
     app_state.graph.add_node(foreign_concept)
     _link_node_to_paper(app_state, "foreign-concept", "paper-a", "session-b")
@@ -381,7 +408,7 @@ def test_feynman_check_endpoint_rejects_an_oversized_explanation(client, app_sta
     17+ seconds before failing - a free cost/DoS surface on a paid,
     per-call Gemini endpoint. Must 422 before it ever reaches the graph
     lookup or the judge, not fail slowly downstream."""
-    app_state.paper_store.save("paper-a", title="Paper A", status="ready", session_id="session-a")
+    app_state.paper_store.save("paper-a", title="Paper A", status="ready", session_id="session-a", owner_uid=TEST_UID)
 
     response = client.post(
         "/papers/paper-a/feynman/check",
@@ -406,15 +433,15 @@ def test_delete_session_cascades_papers_graph_and_clarifications(client, app_sta
 
     app_state.paper_store.save(
         "paper-a", title="Paper A", status="ready", session_id=session_id
-    )
-    app_state.chunks.upsert_paper("paper-a", ["Some paper text about apples."])
+    , owner_uid=TEST_UID)
+    app_state.chunks.upsert_paper("paper-a", ["Some paper text about apples."], owner_uid=TEST_UID)
     provisional = Node(
         id="provisional-node",
         type=NodeType.CONCEPT,
         name="New Concept",
         session_id=session_id,
-    )
-    candidate = Node(id="candidate-node", type=NodeType.CONCEPT, name="Existing Concept")
+     owner_uid=TEST_UID)
+    candidate = Node(id="candidate-node", type=NodeType.CONCEPT, name="Existing Concept", owner_uid=TEST_UID)
     app_state.graph.add_node(provisional)
     app_state.graph.add_node(candidate)
     app_state.clarification.register_entity_merge_question(
@@ -452,10 +479,10 @@ def test_delete_session_leaves_a_paper_shared_with_another_session_intact(client
     session_a = client.post("/sessions", json={"name": "Session A"}).json()["id"]
     session_b = client.post("/sessions", json={"name": "Session B"}).json()["id"]
 
-    app_state.paper_store.save("shared-paper", title="Shared Paper", status="ready", session_id=session_a)
-    app_state.paper_store.save("shared-paper", title="Shared Paper", status="ready", session_id=session_b)
-    app_state.chunks.upsert_paper("shared-paper", ["Some shared paper text."])
-    shared_node = Node(id="shared-node", type=NodeType.CONCEPT, name="Shared Concept")
+    app_state.paper_store.save("shared-paper", title="Shared Paper", status="ready", session_id=session_a, owner_uid=TEST_UID)
+    app_state.paper_store.save("shared-paper", title="Shared Paper", status="ready", session_id=session_b, owner_uid=TEST_UID)
+    app_state.chunks.upsert_paper("shared-paper", ["Some shared paper text."], owner_uid=TEST_UID)
+    shared_node = Node(id="shared-node", type=NodeType.CONCEPT, name="Shared Concept", owner_uid=TEST_UID)
     app_state.graph.add_node(shared_node)
     app_state.graph.add_node(Node(**{**shared_node.model_dump(), "session_id": session_a}))
     app_state.graph.add_node(Node(**{**shared_node.model_dump(), "session_id": session_b}))
@@ -500,8 +527,8 @@ def test_answer_clarification_end_to_end(client, app_state):
     POST, and confirm the graph mutation actually happened - the same
     round trip a frontend would do."""
     graph = app_state.graph
-    existing = Node(id="existing", type=NodeType.CONCEPT, name="Existing")
-    provisional = Node(id="provisional", type=NodeType.CONCEPT, name="Provisional")
+    existing = Node(id="existing", type=NodeType.CONCEPT, name="Existing", owner_uid=TEST_UID)
+    provisional = Node(id="provisional", type=NodeType.CONCEPT, name="Provisional", owner_uid=TEST_UID)
     graph.add_node(existing)
     graph.add_node(provisional)
 
@@ -527,6 +554,11 @@ def test_answer_clarification_end_to_end(client, app_state):
     edges = list(graph.graph.get_edge_data("provisional", "existing").values())
     assert len(edges) == 1
     assert edges[0]["type"] == "SAME_AS"
+    # Confirmed live as a real gap: the merge edge below was previously
+    # built with no owner_uid at all (resolve_alias never received one),
+    # leaving real production SAME_AS edges permanently unreachable by any
+    # account's own owner-scoped graph reads.
+    assert edges[0]["owner_uid"] == TEST_UID
 
 
 def test_answer_clarification_invalid_option_returns_400(client, app_state):
@@ -661,7 +693,7 @@ def test_papers_upload_auto_merges_a_bare_abbreviation_without_asking(
         id="existing-moral-odd",
         type=NodeType.CONCEPT,
         name="moral operational design domain (moral ODD)",
-    )
+     owner_uid=TEST_UID)
     app_state.graph.add_node(existing)
 
     def fake_extract_one(paper_id, path, fail_closed=False):
@@ -735,7 +767,12 @@ def test_papers_upload_persists_the_given_session_id(client, app_state, monkeypa
     )
 
     assert response.status_code == 200
-    saved = next(p for p in app_state.paper_store.list() if p["id"] == "session-tagged-paper")
+    # paper_id is namespaced with the caller's uid (see papers.py's
+    # upload_paper) so two accounts uploading a same-named paper never
+    # collide on one shared doc.
+    saved = next(
+        p for p in app_state.paper_store.list() if p["id"] == f"{TEST_UID}-session-tagged-paper"
+    )
     assert saved["session_ids"] == ["session-xyz"]
 
 
@@ -773,9 +810,81 @@ def test_arxiv_ingest_persists_the_given_session_id(client, app_state, monkeypat
 
     assert response.status_code == 200
     saved = next(
-        p for p in app_state.paper_store.list() if p["id"] == "arxiv-2101.00001"
+        p
+        for p in app_state.paper_store.list()
+        if p["id"] == f"{TEST_UID}-arxiv-2101.00001"
     )
     assert saved["session_ids"] == ["session-xyz"]
+
+
+def test_arxiv_ingest_rejects_one_paper_past_the_session_cap(client, app_state, monkeypatch):
+    """MAX_SESSION_PAPERS was previously only a frontend React-state check
+    (frontend/app/page.tsx) - nothing on the backend actually stopped a
+    direct API call from exceeding it. Confirmed live as a real gap before
+    this test/fix existed. Reads the real constant rather than a hardcoded
+    count so this test stays correct if the cap itself changes again."""
+    from service.routers.papers import MAX_SESSION_PAPERS
+
+    for i in range(MAX_SESSION_PAPERS):
+        app_state.paper_store.save(
+            f"existing-{i}", title=f"Existing {i}", status="ready",
+            session_id="full-session", owner_uid=TEST_UID,
+        )
+    unexpected_request = lambda *a, **k: pytest.fail("should reject before downloading")
+    monkeypatch.setattr("service.routers.papers.requests.get", unexpected_request)
+
+    response = client.post(
+        "/papers/arxiv",
+        json={"arxiv_id": "2101.00002", "title": "One Too Many", "session_id": "full-session"},
+    )
+
+    assert response.status_code == 409
+    assert len(app_state.paper_store.list()) == MAX_SESSION_PAPERS
+
+
+def test_arxiv_ingest_allows_re_ingesting_an_existing_member_of_a_full_session(client, app_state, monkeypatch):
+    """A session already at the cap must still be able to refresh/re-add a
+    paper it already has (the same deterministic paper_id) - only a
+    genuinely new paper should be blocked."""
+    from agent.document_ingestion import DocumentIngestionResult
+    from agent.extraction_agent import ExtractionOutcome
+    from agent.schema import ExtractionResult
+
+    def fake_extract_one(paper_id, path, fail_closed=False):
+        return ExtractionOutcome(
+            paper_id=paper_id,
+            document=DocumentIngestionResult(
+                paper_id=paper_id, pdf_path=path, pages=[], raw_text="text", chunks=["text"]
+            ),
+            result=ExtractionResult(paper_id=paper_id, entities=[], relations=[]),
+        )
+
+    monkeypatch.setattr(app_state.extraction_agent, "extract_one", fake_extract_one)
+    monkeypatch.setattr(
+        "service.routers.papers.requests.get",
+        lambda *a, **k: SimpleNamespace(
+            raise_for_status=lambda: None,
+            iter_content=lambda chunk_size=None: [b"%PDF-1.4 fake"],
+        ),
+    )
+    from service.routers.papers import MAX_SESSION_PAPERS
+
+    app_state.paper_store.save(
+        f"{TEST_UID}-arxiv-2101.00003", title="Already In", status="ready",
+        session_id="full-session", owner_uid=TEST_UID,
+    )
+    for i in range(MAX_SESSION_PAPERS - 1):
+        app_state.paper_store.save(
+            f"existing-{i}", title=f"Existing {i}", status="ready",
+            session_id="full-session", owner_uid=TEST_UID,
+        )
+
+    response = client.post(
+        "/papers/arxiv",
+        json={"arxiv_id": "2101.00003", "title": "Already In", "session_id": "full-session"},
+    )
+
+    assert response.status_code == 200
 
 
 def _fake_extract_one(paper_id, path, fail_closed=False):
@@ -816,7 +925,9 @@ def test_papers_upload_pregenerates_and_caches_the_guide(client, app_state, monk
     )
 
     assert response.status_code == 200
-    saved = next(p for p in app_state.paper_store.list() if p["id"] == "pregen-paper")
+    saved = next(
+        p for p in app_state.paper_store.list() if p["id"] == f"{TEST_UID}-pregen-paper"
+    )
     assert isinstance(saved["guide"], dict)
     assert saved["guide"]["sections"]
 
@@ -841,13 +952,15 @@ def test_papers_upload_survives_a_failing_guide_worker(client, app_state, monkey
 
     assert response.status_code == 200
     assert response.json()["status"] == "ready"
-    saved = next(p for p in app_state.paper_store.list() if p["id"] == "guide-fails-paper")
+    saved = next(
+        p for p in app_state.paper_store.list() if p["id"] == f"{TEST_UID}-guide-fails-paper"
+    )
     assert saved["guide"] is None
 
     # Undo the failing patch - the real on-demand path (no cache hit,
     # since guide is None) should still work normally afterward.
     monkeypatch.undo()
-    guide_response = client.post("/papers/guide-fails-paper/guide")
+    guide_response = client.post(f"/papers/{TEST_UID}-guide-fails-paper/guide")
     assert guide_response.status_code == 200
 
 
@@ -878,7 +991,9 @@ def test_papers_upload_discards_a_pregenerated_guide_on_extraction_failure(
 
     assert response.status_code == 422
     saved = next(
-        p for p in app_state.paper_store.list() if p["id"] == "extraction-fails-paper"
+        p
+        for p in app_state.paper_store.list()
+        if p["id"] == f"{TEST_UID}-extraction-fails-paper"
     )
     assert saved["status"] == "failed"
     # fake_db's set(merge=True) replaces the whole document rather than
@@ -894,10 +1009,10 @@ def test_papers_upload_discards_a_pregenerated_guide_on_extraction_failure(
 def test_papers_list_filters_by_session_id(client, app_state):
     app_state.paper_store.save(
         "paper-a", title="Paper A", status="ready", session_id="session-a"
-    )
+    , owner_uid=TEST_UID)
     app_state.paper_store.save(
         "paper-b", title="Paper B", status="ready", session_id="session-b"
-    )
+    , owner_uid=TEST_UID)
 
     response = client.get("/papers", params={"session_id": "session-a"})
 
@@ -906,10 +1021,62 @@ def test_papers_list_filters_by_session_id(client, app_state):
     assert ids == {"paper-a"}
 
 
+def test_papers_list_excludes_failed_papers(client, app_state):
+    """_ingest tags a failed paper with session_id anyway (so a concurrent
+    status poll has something to find mid-extraction) - confirmed live this
+    made a failed upload reappear as if genuinely attached on the next
+    session load, with no usable content behind it, and permanently ate a
+    slot against MAX_SESSION_PAPERS with no way for the user to tell why."""
+    app_state.paper_store.save(
+        "paper-ready", title="Paper Ready", status="ready", session_id="session-a", owner_uid=TEST_UID
+    )
+    app_state.paper_store.save(
+        "paper-failed", title="Paper Failed", status="failed", session_id="session-a", owner_uid=TEST_UID
+    )
+
+    response = client.get("/papers", params={"session_id": "session-a"})
+
+    assert response.status_code == 200
+    ids = {p["id"] for p in response.json()}
+    assert ids == {"paper-ready"}
+
+
+def test_session_paper_count_excludes_failed_papers_from_the_cap(client, app_state, monkeypatch):
+    """Same bug as test_papers_list_excludes_failed_papers, at the other
+    call site - a failed paper must not occupy a slot against
+    MAX_SESSION_PAPERS, since it never produced usable content. Confirmed
+    live: a session with only 3 real papers plus 2 failed test uploads
+    already read as "full" at a cap of 5, silently blocking a genuinely
+    new paper with no indication why."""
+    from service.routers.papers import MAX_SESSION_PAPERS
+
+    monkeypatch.setattr(app_state.extraction_agent, "extract_one", _fake_extract_one)
+    monkeypatch.setattr(app_state.extraction_agent, "parse_document", _fake_parse_document)
+    monkeypatch.setattr(
+        "service.routers.papers.requests.get",
+        lambda *a, **k: SimpleNamespace(
+            raise_for_status=lambda: None,
+            iter_content=lambda chunk_size=None: [b"%PDF-1.4 fake"],
+        ),
+    )
+    for i in range(MAX_SESSION_PAPERS):
+        app_state.paper_store.save(
+            f"failed-{i}", title=f"Failed {i}", status="failed",
+            session_id="full-session", owner_uid=TEST_UID,
+        )
+
+    response = client.post(
+        "/papers/arxiv",
+        json={"arxiv_id": "2101.00099", "title": "Real Paper", "session_id": "full-session"},
+    )
+
+    assert response.status_code == 200
+
+
 def test_detach_paper_removes_only_the_given_sessions_membership(client, app_state):
     app_state.paper_store.save(
         "paper-a", title="Paper A", authors="A. Uthor", status="ready", session_id="session-a"
-    )
+    , owner_uid=TEST_UID)
 
     response = client.post("/papers/paper-a/detach", params={"session_id": "session-a"})
 
@@ -931,8 +1098,8 @@ def test_detach_paper_leaves_a_paper_shared_with_another_session_intact(client, 
     the first, must not remove it from the second - confirmed live this
     was previously the reverse bug (re-ingest silently stole it from the
     first session entirely)."""
-    app_state.paper_store.save("paper-a", title="Paper A", status="ready", session_id="session-a")
-    app_state.paper_store.save("paper-a", title="Paper A", status="ready", session_id="session-b")
+    app_state.paper_store.save("paper-a", title="Paper A", status="ready", session_id="session-a", owner_uid=TEST_UID)
+    app_state.paper_store.save("paper-a", title="Paper A", status="ready", session_id="session-b", owner_uid=TEST_UID)
 
     response = client.post("/papers/paper-a/detach", params={"session_id": "session-a"})
 
@@ -948,7 +1115,7 @@ def test_detach_paper_404_for_unknown_paper(client):
 
 
 def test_detach_paper_requires_session_id(client, app_state):
-    app_state.paper_store.save("paper-a", title="Paper A", status="ready", session_id="session-a")
+    app_state.paper_store.save("paper-a", title="Paper A", status="ready", session_id="session-a", owner_uid=TEST_UID)
     response = client.post("/papers/paper-a/detach")
     assert response.status_code == 422
 
@@ -994,7 +1161,7 @@ def test_paper_status_endpoint_requires_api_key_when_secret_is_set(client, app_s
     """Every other /papers route already required this - status was the
     one route missing it, letting anyone poll ingest status for any
     paper_id with no key once API_SHARED_SECRET is set."""
-    app_state.paper_store.save("paper-a", title="Paper A", status="ready")
+    app_state.paper_store.save("paper-a", title="Paper A", status="ready", owner_uid=TEST_UID)
     monkeypatch.setenv("API_SHARED_SECRET", "correct-secret")
 
     unauthenticated = client.get("/papers/paper-a/status")
@@ -1047,8 +1214,8 @@ def test_general_chat_uses_shared_fastapi_surface(client, app_state, monkeypatch
 
 
 def test_paper_chat_is_scoped_to_requested_paper(client, app_state):
-    app_state.chunks.upsert_paper("paper-a", ["Alpha paper studies apples."])
-    app_state.chunks.upsert_paper("paper-b", ["Beta paper studies bananas."])
+    app_state.chunks.upsert_paper("paper-a", ["Alpha paper studies apples."], owner_uid=TEST_UID)
+    app_state.chunks.upsert_paper("paper-b", ["Beta paper studies bananas."], owner_uid=TEST_UID)
 
     response = client.post(
         "/chat", json={"message": "What does the paper study?", "paper_ids": ["paper-b"]}
@@ -1065,9 +1232,10 @@ def test_chat_drops_paper_ids_not_actually_in_the_given_session(client, app_stat
     must be dropped server-side rather than silently answered against -
     a session_id with no matching real membership must not leak evidence
     from a paper the caller doesn't actually have in that session."""
-    app_state.chunks.upsert_paper("paper-a", ["Alpha paper studies apples."])
-    app_state.chunks.upsert_paper("paper-b", ["Beta paper studies bananas."])
-    app_state.paper_store.save("paper-a", title="Alpha", status="ready", session_id="session-a")
+    _seed_session(app_state, "session-a")
+    app_state.chunks.upsert_paper("paper-a", ["Alpha paper studies apples."], owner_uid=TEST_UID)
+    app_state.chunks.upsert_paper("paper-b", ["Beta paper studies bananas."], owner_uid=TEST_UID)
+    app_state.paper_store.save("paper-a", title="Alpha", status="ready", session_id="session-a", owner_uid=TEST_UID)
     # paper-b deliberately NOT tagged to session-a.
 
     response = client.post(
@@ -1089,7 +1257,7 @@ def test_chat_without_session_id_keeps_trusting_the_client_paper_ids(client, app
     """session_id is optional - omitting it (unscoped/general chat, or
     any caller with no session concept) must behave exactly as before,
     with no server-side filtering applied."""
-    app_state.chunks.upsert_paper("paper-a", ["Alpha paper studies apples."])
+    app_state.chunks.upsert_paper("paper-a", ["Alpha paper studies apples."], owner_uid=TEST_UID)
 
     response = client.post(
         "/chat", json={"message": "What does the paper study?", "paper_ids": ["paper-a"]}
@@ -1103,9 +1271,9 @@ def test_paper_chat_scopes_to_a_multi_paper_working_set(client, app_state):
     """paper_ids is a session's working set, not a single paper - a query
     should draw evidence from every paper in the set and nothing outside
     it."""
-    app_state.chunks.upsert_paper("paper-a", ["Alpha paper studies apples."])
-    app_state.chunks.upsert_paper("paper-b", ["Beta paper studies bananas."])
-    app_state.chunks.upsert_paper("paper-c", ["Gamma paper studies cherries."])
+    app_state.chunks.upsert_paper("paper-a", ["Alpha paper studies apples."], owner_uid=TEST_UID)
+    app_state.chunks.upsert_paper("paper-b", ["Beta paper studies bananas."], owner_uid=TEST_UID)
+    app_state.chunks.upsert_paper("paper-c", ["Gamma paper studies cherries."], owner_uid=TEST_UID)
 
     response = client.post(
         "/chat",
@@ -1130,7 +1298,7 @@ def test_unscoped_chat_searches_the_graph_before_falling_back_to_general_chat(
     Confirmed live: this produced a confident but wrong hallucinated answer
     for a real graph entity. general_chat must only be reached when the
     graph genuinely has nothing relevant."""
-    app_state.chunks.upsert_paper("paper-a", ["Alpha paper studies apples."])
+    app_state.chunks.upsert_paper("paper-a", ["Alpha paper studies apples."], owner_uid=TEST_UID)
 
     def unexpected_general_chat(message, history):
         raise AssertionError(
@@ -1229,8 +1397,8 @@ def test_paper_guide_covers_indexed_paper_and_is_cached(client, app_state, monke
     app_state.chunks.upsert_paper(
         "guided-paper",
         ["Introduction and motivation.", "Method and experimental results."],
-    )
-    app_state.paper_store.save("guided-paper", title="A Guided Paper", status="ready")
+     owner_uid=TEST_UID)
+    app_state.paper_store.save("guided-paper", title="A Guided Paper", status="ready", owner_uid=TEST_UID)
     calls = []
 
     def generate(title, chunks):
@@ -1263,17 +1431,28 @@ def test_paper_guide_returns_404_when_paper_has_no_chunks(client):
     assert response.status_code == 404
 
 
-def test_get_session_messages_returns_empty_list_for_unknown_session(client):
-    """Deliberately no 404 here - unlike every other single-session route,
-    a brand-new session's first load has nothing stored yet, which is a
-    normal empty-list state, not an error."""
+def test_get_session_messages_404s_for_a_session_that_does_not_exist(client):
+    """A session that isn't real (or isn't the caller's) 404s just like
+    every other single-session route - it's not the "empty list" case
+    below, which needs a real, owned, just-empty session."""
     response = client.get("/sessions/does-not-exist/messages")
+    assert response.status_code == 404
+
+
+def test_get_session_messages_returns_empty_list_for_a_real_session_with_none_saved(
+    client, app_state
+):
+    """A brand-new (but real, owned) session's first load has nothing
+    stored yet, which is a normal empty-list state, not an error."""
+    _seed_session(app_state, "session-a")
+    response = client.get("/sessions/session-a/messages")
 
     assert response.status_code == 200
     assert response.json() == {"messages": [], "compacted": False}
 
 
-def test_put_session_messages_round_trips_below_threshold(client):
+def test_put_session_messages_round_trips_below_threshold(client, app_state):
+    _seed_session(app_state, "session-a")
     messages = [{"id": "1", "role": "user", "text": "What is attention?"}]
 
     put_response = client.put("/sessions/session-a/messages", json={"messages": messages})
@@ -1295,7 +1474,8 @@ def _oversized_messages(count: int = 850) -> list[dict]:
     ]
 
 
-def test_put_session_messages_triggers_compaction_over_threshold(client):
+def test_put_session_messages_triggers_compaction_over_threshold(client, app_state):
+    _seed_session(app_state, "session-a")
     response = client.put(
         "/sessions/session-a/messages", json={"messages": _oversized_messages()}
     )
@@ -1318,6 +1498,7 @@ def test_put_session_messages_triggers_compaction_over_threshold(client):
 def test_put_session_messages_falls_back_to_raw_storage_when_summarizer_fails(
     client, app_state
 ):
+    _seed_session(app_state, "session-a")
     app_state.session_summarizer = lambda messages: None
     oversized = _oversized_messages()
 
@@ -1329,16 +1510,20 @@ def test_put_session_messages_falls_back_to_raw_storage_when_summarizer_fails(
     assert body["messages"] == oversized
 
 
-def test_delete_session_also_deletes_its_messages_doc(client):
+def test_delete_session_also_deletes_its_messages_doc(client, app_state):
     created = client.post("/sessions", json={"name": "To delete"}).json()
     session_id = created["id"]
     client.put(f"/sessions/{session_id}/messages", json={"messages": [{"id": "1", "role": "user", "text": "hi"}]})
 
     delete_response = client.delete(f"/sessions/{session_id}")
-    get_response = client.get(f"/sessions/{session_id}/messages")
 
     assert delete_response.status_code == 204
-    assert get_response.json() == {"messages": [], "compacted": False}
+    # The session itself is gone, so its messages route 404s like any
+    # other session-scoped route would - but the underlying doc really
+    # is gone too, not just orphaned: confirm directly against the store.
+    get_response = client.get(f"/sessions/{session_id}/messages")
+    assert get_response.status_code == 404
+    assert app_state.session_messages_store.get(session_id) == []
 
 
 def test_put_session_messages_rejects_a_payload_over_the_size_ceiling(client):

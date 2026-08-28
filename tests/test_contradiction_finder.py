@@ -54,7 +54,7 @@ def test_only_pairs_above_similarity_threshold_are_judged(fake_db):
     judge = _CountingJudge()
     finder = ContradictionFinder(gm, judge=judge)
 
-    finder.check_session("session-a")
+    finder.check_session("session-a", owner_uid="owner-1")
 
     judged_pairs = {frozenset(pair) for pair in judge.calls}
     assert frozenset({"Close A", "Close B"}) in judged_pairs
@@ -69,7 +69,7 @@ def test_contradicts_verdict_writes_a_real_edge(fake_db):
     judge = _CountingJudge(verdict="contradicts", explanation="They disagree.")
     finder = ContradictionFinder(gm, judge=judge)
 
-    results = finder.check_session("session-a")
+    results = finder.check_session("session-a", owner_uid="owner-1")
 
     assert len(results) == 1
     assert results[0].explanation == "They disagree."
@@ -86,7 +86,7 @@ def test_consistent_verdict_does_not_write_an_edge(fake_db):
     judge = _CountingJudge(verdict="consistent")
     finder = ContradictionFinder(gm, judge=judge)
 
-    results = finder.check_session("session-a")
+    results = finder.check_session("session-a", owner_uid="owner-1")
 
     assert results == []
     assert gm.get_incident_edges(a.id) == []
@@ -100,10 +100,10 @@ def test_second_run_does_not_recall_the_judge_for_an_already_checked_pair(fake_d
     judge = _CountingJudge(verdict="consistent")
     finder = ContradictionFinder(gm, judge=judge, db_client=fake_db)
 
-    finder.check_session("session-a")
+    finder.check_session("session-a", owner_uid="owner-1")
     assert len(judge.calls) == 1
 
-    finder.check_session("session-a")
+    finder.check_session("session-a", owner_uid="owner-1")
     assert len(judge.calls) == 1  # not called again
 
 
@@ -117,12 +117,12 @@ def test_a_failed_judge_call_is_retried_on_the_next_run(fake_db):
     gm.add_node(b)
     failing_judge = _CountingJudge(verdict=None)
     finder = ContradictionFinder(gm, judge=failing_judge, db_client=fake_db)
-    finder.check_session("session-a")
+    finder.check_session("session-a", owner_uid="owner-1")
     assert len(failing_judge.calls) == 1
 
     working_judge = _CountingJudge(verdict="consistent")
     finder_retry = ContradictionFinder(gm, judge=working_judge, db_client=fake_db)
-    finder_retry.check_session("session-a")
+    finder_retry.check_session("session-a", owner_uid="owner-1")
 
     assert len(working_judge.calls) == 1  # retried, not skipped
 
@@ -145,7 +145,7 @@ def test_existing_contradicts_edge_is_not_rechecked(fake_db):
     judge = _CountingJudge(verdict="contradicts")
     finder = ContradictionFinder(gm, judge=judge)
 
-    results = finder.check_session("session-a")
+    results = finder.check_session("session-a", owner_uid="owner-1")
 
     assert results == []
     assert judge.calls == []
@@ -160,7 +160,7 @@ def test_claims_from_a_different_session_are_never_compared(fake_db):
     judge = _CountingJudge(verdict="contradicts")
     finder = ContradictionFinder(gm, judge=judge)
 
-    results = finder.check_session("session-a")
+    results = finder.check_session("session-a", owner_uid="owner-1")
 
     assert results == []
     assert judge.calls == []
@@ -174,7 +174,7 @@ def test_max_llm_calls_caps_how_many_pairs_get_judged(fake_db):
     judge = _CountingJudge(verdict="consistent")
     finder = ContradictionFinder(gm, judge=judge)
 
-    finder.check_session("session-a", max_llm_calls=2)
+    finder.check_session("session-a", owner_uid="owner-1", max_llm_calls=2)
 
     assert len(judge.calls) == 2
 
@@ -207,7 +207,7 @@ def test_concurrent_check_session_calls_never_double_judge_the_same_pair(fake_db
     results: list[list] = [None, None]
 
     def run(index: int):
-        results[index] = finder.check_session("session-a")
+        results[index] = finder.check_session("session-a", owner_uid="owner-1")
 
     t1 = threading.Thread(target=run, args=(0,))
     t2 = threading.Thread(target=run, args=(1,))

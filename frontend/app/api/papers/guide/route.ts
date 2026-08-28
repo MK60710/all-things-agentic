@@ -12,7 +12,10 @@ export async function POST(request: NextRequest) {
       `${apiUrl.replace(/\/$/, "")}/papers/${encodeURIComponent(body.paper_id)}/guide`,
       {
         method: "POST",
-        headers: process.env.API_SHARED_SECRET ? { "X-API-Key": process.env.API_SHARED_SECRET } : {},
+        headers: {
+          ...(process.env.API_SHARED_SECRET ? { "X-API-Key": process.env.API_SHARED_SECRET } : {}),
+          ...(request.headers.get("authorization") ? { Authorization: request.headers.get("authorization")! } : {}),
+        },
         cache: "no-store",
       },
     );

@@ -56,6 +56,12 @@ class Node(BaseModel):
     # cleanup (scripts/clear_session.py) safe: deleting session X never
     # touches a node another session only referenced.
     session_id: str | None = None
+    # Unlike session_id, never accumulated/reassigned - a node can only
+    # ever belong to one account. canonicalize() (GraphManager) refuses to
+    # match a node whose owner_uid differs from the entity currently being
+    # ingested, so this is set once, on creation, and every later reuse of
+    # the same node id carries the same value forward unchanged.
+    owner_uid: str | None = None
 
 
 class Edge(BaseModel):
@@ -72,6 +78,7 @@ class Edge(BaseModel):
     )
     valid_until: datetime | None = None
     session_id: str | None = None
+    owner_uid: str | None = None
 
 
 class ExtractedEntity(BaseModel):

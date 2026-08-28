@@ -3,18 +3,19 @@
 import { useCallback, useEffect, useState } from "react";
 
 export interface TourStep {
-  target: string;
+  // Omit entirely for a standalone step (e.g. the "Welcome to Atlas"
+  // intro) that isn't anchored to any element - it renders centered on
+  // screen with no spotlight cutout and no arrow, instead of pointing at
+  // something the user has no reason to recognize.
+  target?: string;
   title: string;
   body: string;
   placement?: "top" | "bottom" | "left" | "right";
-  // Defaults true. The pulsing cursor dot means "click this" - set false
-  // for a step whose target is purely a visual anchor (e.g. the "Welcome
-  // to Atlas" intro pinned near the logo) rather than something the step
-  // is actually telling the user to interact with. Confirmed live: the
-  // welcome step's own body never says to click anything, and its
-  // target (.brand) isn't even a button - showing the cursor there
-  // implied an action that doesn't exist.
-  clickable?: boolean;
+  // Positions the callout relative to target (e.g. above it) without the
+  // spotlight cutout or arrow - for a step that should sit near a
+  // landmark (the Atlas loader) without implying it's something to
+  // click or look inside of.
+  noHighlight?: boolean;
 }
 
 const SPOTLIGHT_PAD = 8;
@@ -78,6 +79,10 @@ export default function Tour({ steps, active, onClose }: { steps: TourStep[]; ac
 
   const locate = useCallback(() => {
     if (!step) return;
+    if (!step.target) {
+      setRect(null);
+      return;
+    }
     const el = document.querySelector(step.target);
     if (!el) {
       // Target isn't in the DOM right now (e.g. mid-remount) - skip this
@@ -116,43 +121,57 @@ export default function Tour({ steps, active, onClose }: { steps: TourStep[]; ac
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [active, finish]);
 
-  if (!active || !step || !rect) return null;
+  if (!active || !step) return null;
+  if (step.target && !rect) return null;
 
   const isLast = stepIndex === steps.length - 1;
-  const { top, left, side } = calloutPosition(rect, step.placement);
-  const arrowLeft = arrowOffset(rect, left);
+  const centered = !step.target;
+  const dimOnly = centered || Boolean(step.noHighlight);
+  const position = rect ? calloutPosition(rect, step.placement) : null;
+  const arrowLeft = rect && position ? arrowOffset(rect, position.left) : 0;
 
-  return (
-    <div className="tour-overlay" role="dialog" aria-modal="true" aria-label="Atlas walkthrough">
-      <div
-        className="tour-spotlight"
-        style={{
-          top: rect.top - SPOTLIGHT_PAD,
-          left: rect.left - SPOTLIGHT_PAD,
-          width: rect.width + SPOTLIGHT_PAD * 2,
-          height: rect.height + SPOTLIGHT_PAD * 2,
-        }}
-      />
-      {step.clickable !== false && (
-        <div className="tour-cursor" style={{ top: rect.top + rect.height / 2, left: rect.left + rect.width / 2 }} />
-      )}
-      <div
-        className={`tour-callout tour-callout-${side}`}
-        style={{ top, left, width: CALLOUT_WIDTH, "--arrow-left": `${arrowLeft}px` } as React.CSSProperties}
-      >
-        <div className="tour-callout-progress">
-          {steps.map((s, index) => <i key={s.target + index} className={index === stepIndex ? "active" : index < stepIndex ? "done" : ""} />)}
-        </div>
-        <h4>{step.title}</h4>
-        <p>{step.body}</p>
-        <div className="tour-callout-actions">
-          <button type="button" className="tour-skip" onClick={finish}>Skip</button>
-          <div>
-            {stepIndex > 0 && <button type="button" onClick={() => setStepIndex((i) => i - 1)}>Back</button>}
-            <button type="button" onClick={isLast ? finish : () => setStepIndex((i) => i + 1)}>{isLast ? "Done" : "Next"}</button>
-          </div>
+  const calloutBody = (
+    <>
+      <div className="tour-callout-progress">
+        {steps.map((_, index) => <i key={index} className={index === stepIndex ? "active" : index < stepIndex ? "done" : ""} />)}
+      </div>
+      <h4>{step.title}</h4>
+      <p>{step.body}</p>
+      <div className="tour-callout-actions">
+        <button type="button" className="tour-skip" onClick={finish}>Skip</button>
+        <div>
+          {stepIndex > 0 && <button type="button" onClick={() => setStepIndex((i) => i - 1)}>Back</button>}
+          <button type="button" onClick={isLast ? finish : () => setStepIndex((i) => i + 1)}>{isLast ? "Done" : "Next"}</button>
         </div>
       </div>
+    </>
+  );
+
+  return (
+    <div className={`tour-overlay${dimOnly ? " tour-overlay-dim" : ""}`} role="dialog" aria-modal="true" aria-label="Atlas walkthrough">
+      {rect && !dimOnly && (
+        <div
+          className="tour-spotlight"
+          style={{
+            top: rect.top - SPOTLIGHT_PAD,
+            left: rect.left - SPOTLIGHT_PAD,
+            width: rect.width + SPOTLIGHT_PAD * 2,
+            height: rect.height + SPOTLIGHT_PAD * 2,
+          }}
+        />
+      )}
+      {centered ? (
+        <div className="tour-callout tour-callout-centered" style={{ width: CALLOUT_WIDTH }}>
+          {calloutBody}
+        </div>
+      ) : (
+        <div
+          className={`tour-callout tour-callout-${position!.side}${step.noHighlight ? " tour-callout-no-arrow" : ""}`}
+          style={{ top: position!.top, left: position!.left, width: CALLOUT_WIDTH, "--arrow-left": `${arrowLeft}px` } as React.CSSProperties}
+        >
+          {calloutBody}
+        </div>
+      )}
     </div>
   );
 }

@@ -12,7 +12,10 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     const response = await fetch(
       `${apiUrl.replace(/\/$/, "")}/papers/${encodeURIComponent(id)}/feynman/prompts?session_id=${encodeURIComponent(sessionId)}`,
       {
-        headers: process.env.API_SHARED_SECRET ? { "X-API-Key": process.env.API_SHARED_SECRET } : {},
+        headers: {
+          ...(process.env.API_SHARED_SECRET ? { "X-API-Key": process.env.API_SHARED_SECRET } : {}),
+          ...(request.headers.get("authorization") ? { Authorization: request.headers.get("authorization")! } : {}),
+        },
         cache: "no-store",
       },
     );
