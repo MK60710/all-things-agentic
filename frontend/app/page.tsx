@@ -1547,7 +1547,7 @@ export default function Home() {
             title={papers.length === 0 ? "Add a paper to explore its graph" : "Explore this session's knowledge graph"}
             aria-label="Open graph explorer"
           ><Icon name="graph" size={17}/></button>
-          <button className="paper-map-toggle" onClick={() => setPaperMapOpen(true)} disabled={papers.length < 2} title={papers.length < 2 ? "Add at least two papers to map connections" : "Map connections between this session's papers"} aria-label="Map paper connections"><Icon name="papersLink" size={15}/><span>Map papers <em>BETA</em></span></button>
+          <button className="paper-map-toggle" onClick={() => setPaperMapOpen(true)} disabled={papers.length < 2} title={papers.length < 2 ? "Add at least two papers to map connections" : "Map connections between this session's papers"} aria-label="Map paper connections"><Icon name="papersLink" size={15}/><span>Map papers <em>ALPHA</em></span></button>
           <button className="tour-help-button" onClick={() => setTourOpen(true)} title="Replay the walkthrough" aria-label="Replay the walkthrough"><Icon name="help" size={17}/></button>
           <button className="add-paper-button" onClick={() => openAddPaper()}><Icon name="plus" size={17}/>{papers.length ? "Add another" : "Add paper"}</button>
           <div className="user-menu" ref={userMenuRef}>
@@ -1614,7 +1614,7 @@ export default function Home() {
                     {message.text && <p>{message.text}</p>}
                     {message.guideLoading && <div className="guide-building"><span/><div><strong>Building your guided reading</strong><small>Finding the paper's structure, simplifying each section, and drawing useful visual explanations…</small></div></div>}
                     {message.guide && <GuidedReading guide={message.guide} paperId={message.paperId} sessionId={currentSession?.id} onViewNodeInGraph={viewNodeInGraph}/>}
-                    {message.guide && message.paperId && <button type="button" className="deep-dive-launch" onClick={() => window.location.assign(`/deep-dive/${encodeURIComponent(message.paperId!)}?session_id=${encodeURIComponent(currentSession?.id ?? "local")}`)}><strong>Open deeper dive <em>BETA</em></strong><small>Explore the full paper text with a section tutor.</small></button>}
+                    {message.guide && message.paperId && <button type="button" className="deep-dive-launch" onClick={() => window.location.assign(`/deep-dive/${encodeURIComponent(message.paperId!)}?session_id=${encodeURIComponent(currentSession?.id ?? "local")}`)}><strong>Open deeper dive <em>ALPHA</em></strong><small>Explore the full paper text with a section tutor.</small></button>}
                     {message.guideError && <span className="guide-error">{message.guideError}</span>}
                     {message.feynmanPickPaper && <div className="candidate-list">{papers.map((p) => <button key={p.id} onClick={() => setMessages((current) => current.map((m) => m.id === message.id ? { ...m, feynmanPickPaper: false, feynmanPaperId: p.id } : m))}><strong>{p.title}</strong></button>)}</div>}
                     {message.feynmanPaperId && currentSession?.id && <FeynmanCheck paperId={message.feynmanPaperId} sessionId={currentSession.id} onViewNodeInGraph={viewNodeInGraph}/>}

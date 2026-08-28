@@ -204,10 +204,10 @@ def _ingest(
         outcome = extraction_future.result()
         guide = guide_future.result()
 
-    if outcome.result is None:
-        # Extraction genuinely failed - discard any concurrently-computed
-        # guide rather than caching a walkthrough for a paper that never
-        # successfully ingested.
+    if outcome.result is None or outcome.issue is not None:
+        # Do not persist a partial graph. A result with skipped source windows
+        # is not a complete representation of the paper and previously made
+        # the UI look like the paper had unrelated disconnected components.
         message = outcome.issue.message if outcome.issue else "extraction failed"
         logger.error(
             "ingest_failed paper_id=%s session_id=%s stage=%s error=%s duration_ms=%d",
