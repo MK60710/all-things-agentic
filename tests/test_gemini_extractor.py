@@ -1,4 +1,3 @@
-import threading
 import time
 from types import SimpleNamespace
 
@@ -269,14 +268,10 @@ def test_windows_beyond_the_call_cap_count_as_skipped():
     assert result.skipped_windows == 2  # the other 2 windows never ran
 
 
-def test_windows_are_extracted_concurrently_not_one_at_a_time():
-    """The whole point of parallelizing extract()'s per-window loop: wall
-    clock for N windows must be close to one window's latency, not N of
-    them summed - this is what turned a real paper's ~281s ingest
-    (8 windows x up to 30-35s each, fully sequential) into the dominant
-    remaining cost after guide pre-generation was already fixed."""
+def test_windows_are_extracted_sequentially_to_avoid_quota_bursts():
+    """A paper's windows must not all hit Gemini at once. Quota bursts can
+    turn a normal paper into a partial, under-connected graph."""
     call_count = 0
-    lock = threading.Lock()
 
     def make_entity(index: int) -> ExtractedEntity:
         return ExtractedEntity(
@@ -286,9 +281,8 @@ def test_windows_are_extracted_concurrently_not_one_at_a_time():
     class Models:
         def generate_content(self, **kwargs):
             nonlocal call_count
-            with lock:
-                index = call_count
-                call_count += 1
+            index = call_count
+            call_count += 1
             time.sleep(0.2)
             semantic = SemanticExtraction(entities=[make_entity(index)], relations=[])
             return SimpleNamespace(parsed=semantic, text=semantic.model_dump_json())
@@ -309,9 +303,7 @@ def test_windows_are_extracted_concurrently_not_one_at_a_time():
     result = extractor.extract(document)
     elapsed = time.monotonic() - start
 
-    # 4 windows x 0.2s would be 0.8s run sequentially - concurrent
-    # execution should land close to one window's latency.
-    assert elapsed < 0.6
+    assert elapsed >= 0.7
     assert {entity.name for entity in result.entities} == {
         "Entity0",
         "Entity1",
