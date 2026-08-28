@@ -289,6 +289,23 @@ def test_low_confidence_vector_match_is_flagged_not_hidden():
     assert result.confidence == "low"
 
 
+def test_greeting_style_non_question_returns_no_results_not_noise_citations():
+    """Confirmed live: "HI" scores exactly 0.0 (zero lexical overlap, zero
+    vector signal) against real paper chunks, but assemble_context's own
+    min_score used to always default to 0.0 - so a bare "HI" still always
+    surfaced whatever its top-N nearest chunks happened to be as if they
+    were real evidence, leaving Gemini to notice and disclaim it in the
+    answer text while the (irrelevant) citations were already shown."""
+    index = ChunkIndex()
+    index.upsert_paper("paper-1", ["Something about gradient descent."])
+    agent = QueryAgent(index)
+
+    result = agent.answer("HI")
+
+    assert result.retrieval_mode == "no_results"
+    assert result.citations == []
+
+
 def test_confident_vector_match_is_not_flagged():
     """Full lexical overlap guarantees score >= 0.65 regardless of the
     vector-similarity component, so this must always land as confident."""

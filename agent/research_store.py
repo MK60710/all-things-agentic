@@ -35,6 +35,7 @@ class ResearchStore:
     def ingest(
         self,
         extraction: ExtractionResult,
+        owner_uid: str,
         *,
         paper_name: str | None = None,
         entity_embedding_fn: Callable[
@@ -46,11 +47,13 @@ class ResearchStore:
         chunk_ids = self._chunks.upsert_paper(
             extraction.paper_id,
             extraction.chunk_metadata or extraction.chunks,
+            owner_uid=owner_uid,
         )
         graph_report = None
         if self._graph is not None and (extraction.entities or extraction.relations):
             graph_report = self._graph.apply_extraction_result(
                 extraction,
+                owner_uid,
                 paper_name=paper_name,
                 embedding_fn=entity_embedding_fn,
                 clarification=clarification,

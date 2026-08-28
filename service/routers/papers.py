@@ -14,6 +14,7 @@ import requests
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 
+from service.auth import get_current_user
 from service.deps import get_state, require_api_key
 from service.schemas import (
     ArxivIngestRequest,
@@ -41,6 +42,29 @@ _UNSAFE_PAPER_ID_CHARS = re.compile(r"[^A-Za-z0-9._-]")
 _ARXIV_ID = re.compile(
     r"^(?:\d{4}\.\d{4,5}|[A-Za-z][A-Za-z0-9.-]*/\d{7})(?:v\d+)?$"
 )
+# Mirrors frontend/app/page.tsx's MAX_SESSION_PAPERS - that check is
+# client-side only (a few lines of React state), never enforced here, so
+# it was trivial to exceed by calling either ingest route directly. A read-
+# then-write count check, not a transaction - same "good enough for this
+# app's single-instance concurrency profile" tolerance already documented
+# on GraphManager.apply_extraction_result's own race, not a banking-grade
+# guarantee.
+MAX_SESSION_PAPERS = 5
+
+
+def _session_paper_count(state: AppState, session_id: str) -> int:
+    # Excludes status="failed" - _ingest tags a failed paper with the
+    # session_id anyway (so a concurrent status poll has something to find
+    # mid-extraction, see _ingest's own comment), but a paper that never
+    # produced usable content should never permanently occupy a slot
+    # against MAX_SESSION_PAPERS. Confirmed live: two failed test uploads
+    # were silently eating 2 of 5 slots with no way to notice why "Start
+    # breaking down" kept rejecting a genuinely new paper.
+    return sum(
+        1
+        for p in state.paper_store.list()
+        if session_id in _paper_session_ids(p) and p.get("status") != "failed"
+    )
 
 
 def _deep_dive_source_text(text: str, section_title: str, index: int) -> str:
@@ -141,6 +165,7 @@ def _ingest(
     paper_id: str,
     path: Path,
     title: str,
+    owner_uid: str,
     authors: str | None = None,
     abstract: str | None = None,
     pdf_url: str | None = None,
@@ -156,8 +181,14 @@ def _ingest(
     metadata = dict(title=title, authors=authors, abstract=abstract, pdf_url=pdf_url)
     # guide=None invalidates any previously generated walkthrough on a
     # re-ingest of the same paper_id - stale content shouldn't be served
-    # from cache once the underlying extraction reruns.
-    state.paper_store.save(paper_id, **metadata, status="extracting", session_id=session_id, guide=None)
+    # from cache once the underlying extraction reruns. owner_uid is set
+    # once here and never changes on later saves below - paper_id is
+    # already namespaced per-owner by its caller (see upload_paper/
+    # ingest_arxiv), so this is belt-and-suspenders, not the only thing
+    # standing between two accounts' papers.
+    state.paper_store.save(
+        paper_id, **metadata, status="extracting", session_id=session_id, guide=None, owner_uid=owner_uid
+    )
     # Entity extraction and the guide walkthrough are two independent
     # slow Gemini calls over the same PDF - neither depends on the
     # other's output (see _pregenerate_guide) - so they run concurrently
@@ -186,7 +217,9 @@ def _ingest(
             message,
             round((time.monotonic() - started) * 1000),
         )
-        state.paper_store.save(paper_id, **metadata, status="failed", error=message, session_id=session_id)
+        state.paper_store.save(
+            paper_id, **metadata, status="failed", error=message, session_id=session_id, owner_uid=owner_uid
+        )
         raise HTTPException(status_code=422, detail=message)
 
     # Extraction is a background operation. It must not interrupt the user
@@ -197,6 +230,7 @@ def _ingest(
         paper_name=title,
         entity_embedding_fn=state.entity_embedding_fn,
         session_id=session_id,
+        owner_uid=owner_uid,
     )
     # Caches the concurrently pre-generated guide (None if that worker
     # failed) so the frontend's separate POST /papers/{id}/guide call -
@@ -205,7 +239,12 @@ def _ingest(
     # running a second full generation.
     guide_payload = guide.model_dump(mode="json") if guide is not None else None
     state.paper_store.save(
-        paper_id, **metadata, status="ready", session_id=session_id, guide=guide_payload
+        paper_id,
+        **metadata,
+        status="ready",
+        session_id=session_id,
+        guide=guide_payload,
+        owner_uid=owner_uid,
     )
     logger.info(
         "ingest_ready paper_id=%s session_id=%s entities=%d relations=%d guide=%s duration_ms=%d",
@@ -298,31 +337,54 @@ def _authorize_upload(state: AppState, *, x_api_key: str, x_upload_token: str) -
     return min(int(constraints.get("max_bytes", MAX_PDF_BYTES)), MAX_PDF_BYTES)
 
 
+def _owned_paper(state: AppState, paper_id: str, uid: str) -> dict | None:
+    """Same "not yours reads as not found" treatment as
+    sessions.py's _get_owned_session - a paper doc created by _ingest
+    always carries owner_uid now, so this is a direct field check, not a
+    session_ids traversal."""
+    paper = state.paper_store.get(paper_id)
+    if paper is None or paper.get("owner_uid") != uid:
+        return None
+    return paper
+
+
 @router.get("", response_model=list[PaperMetadata], dependencies=[Depends(require_api_key)])
 def list_papers(
     session_id: str | None = Query(default=None),
     state: AppState = Depends(get_state),
+    uid: str = Depends(get_current_user),
 ) -> list[PaperMetadata]:
-    papers = state.paper_store.list()
+    # Excludes status="failed" - the frontend's PaperContext type (see
+    # frontend/lib/api.ts's listPapersForSession) drops status entirely,
+    # so a failed paper returned here is indistinguishable from a real one
+    # client-side and gets attached as if it has usable content. Same
+    # reasoning as _session_paper_count above.
+    papers = [
+        p for p in state.paper_store.list() if p.get("owner_uid") == uid and p.get("status") != "failed"
+    ]
     if session_id is not None:
         papers = [p for p in papers if session_id in _paper_session_ids(p)]
     return [PaperMetadata.model_validate(item) for item in papers]
 
 
 @router.get("/{paper_id}/status", dependencies=[Depends(require_api_key)])
-def get_paper_status(paper_id: str, state: AppState = Depends(get_state)) -> dict[str, str]:
+def get_paper_status(
+    paper_id: str, state: AppState = Depends(get_state), uid: str = Depends(get_current_user)
+) -> dict[str, str]:
     """Lightweight poll target for ingest progress - deliberately just the
     status string, not the full PaperMetadata list_papers already returns,
     so the frontend can poll every second or two during a "Reading..."
     card without pulling the whole papers list on each tick."""
-    paper = state.paper_store.get(paper_id)
+    paper = _owned_paper(state, paper_id, uid)
     return {"status": paper.get("status", "unknown") if paper else "unknown"}
 
 
 @router.get("/{paper_id}/source", dependencies=[Depends(require_api_key)])
-def get_paper_source(paper_id: str, state: AppState = Depends(get_state)) -> FileResponse:
+def get_paper_source(
+    paper_id: str, state: AppState = Depends(get_state), uid: str = Depends(get_current_user)
+) -> FileResponse:
     """Serve the session's stored PDF so graph/map paper links work for uploads."""
-    paper = state.paper_store.get(paper_id)
+    paper = _owned_paper(state, paper_id, uid)
     if paper is None:
         raise HTTPException(status_code=404, detail="paper not found")
     root = Path(state.upload_root).resolve()
@@ -338,7 +400,10 @@ def get_paper_source(paper_id: str, state: AppState = Depends(get_state)) -> Fil
     dependencies=[Depends(require_api_key)],
 )
 def detach_paper(
-    paper_id: str, session_id: str = Query(...), state: AppState = Depends(get_state)
+    paper_id: str,
+    session_id: str = Query(...),
+    state: AppState = Depends(get_state),
+    uid: str = Depends(get_current_user),
 ) -> PaperMetadata:
     """Removes this one session's membership - the real, server-side
     version of "remove this from my session," so it stays gone on the
@@ -346,8 +411,7 @@ def detach_paper(
     on a later switch. A paper genuinely shared with another session
     (added there separately) survives; only detaching from every session
     that has it makes it disappear entirely - see PaperStore.detach_session."""
-    existing = next((p for p in state.paper_store.list() if p.get("id") == paper_id), None)
-    if existing is None:
+    if _owned_paper(state, paper_id, uid) is None:
         raise HTTPException(status_code=404, detail=f"no paper {paper_id!r}")
     updated = state.paper_store.detach_session(paper_id, session_id)
     return PaperMetadata.model_validate(updated)
@@ -358,7 +422,9 @@ def detach_paper(
     response_model=UploadTokenResponse,
     dependencies=[Depends(require_api_key)],
 )
-def create_upload_token(state: AppState = Depends(get_state)) -> UploadTokenResponse:
+def create_upload_token(
+    state: AppState = Depends(get_state), uid: str = Depends(get_current_user)
+) -> UploadTokenResponse:
     token, expires_at = state.upload_tokens.issue(max_bytes=MAX_PDF_BYTES)
     return UploadTokenResponse(token=token, expires_at=expires_at.isoformat(), max_bytes=MAX_PDF_BYTES)
 
@@ -372,20 +438,34 @@ def upload_paper(
     x_api_key: str = Header(default=""),
     x_upload_token: str = Header(default=""),
     state: AppState = Depends(get_state),
+    uid: str = Depends(get_current_user),
 ) -> PaperIngestResponse:
     max_bytes = _authorize_upload(state, x_api_key=x_api_key, x_upload_token=x_upload_token)
     if file.content_type not in {"application/pdf", "application/octet-stream"}:
         raise HTTPException(status_code=415, detail="only PDF uploads are accepted")
 
     raw_pid = paper_id or (Path(file.filename).stem if file.filename else str(uuid.uuid4()))
-    pid = _sanitize_paper_id(raw_pid)
+    # Prefixed with uid before sanitizing - two different accounts
+    # uploading a file with the same name (or the same explicit paper_id)
+    # would otherwise collide on one shared papers/{id} doc and one
+    # shared PDF path on disk, silently merging their metadata/content.
+    pid = _sanitize_paper_id(f"{uid}-{raw_pid}")
+    if session_id:
+        existing = state.paper_store.get(pid)
+        already_member = existing is not None and session_id in _paper_session_ids(existing)
+        if not already_member and _session_paper_count(state, session_id) >= MAX_SESSION_PAPERS:
+            raise HTTPException(
+                status_code=409, detail=f"This session is limited to {MAX_SESSION_PAPERS} papers."
+            )
     upload_root = Path(state.upload_root).resolve()
     dest = (upload_root / f"{pid}.pdf").resolve()
     if not dest.is_relative_to(upload_root):
         raise HTTPException(status_code=400, detail="invalid paper_id")
     _write_pdf(dest, _file_chunks(file), max_bytes=max_bytes)
     paper_title = (title or (Path(file.filename).stem if file.filename else pid)).strip()
-    return _ingest(state, paper_id=pid, path=dest, title=paper_title or pid, session_id=session_id)
+    return _ingest(
+        state, paper_id=pid, path=dest, title=paper_title or pid, owner_uid=uid, session_id=session_id
+    )
 
 
 @router.post(
@@ -393,11 +473,25 @@ def upload_paper(
     response_model=PaperIngestResponse,
     dependencies=[Depends(require_api_key)],
 )
-def ingest_arxiv(body: ArxivIngestRequest, state: AppState = Depends(get_state)) -> PaperIngestResponse:
+def ingest_arxiv(
+    body: ArxivIngestRequest,
+    state: AppState = Depends(get_state),
+    uid: str = Depends(get_current_user),
+) -> PaperIngestResponse:
     arxiv_id = body.arxiv_id.removeprefix("arxiv:").strip()
     if not _ARXIV_ID.fullmatch(arxiv_id):
         raise HTTPException(status_code=400, detail="invalid arXiv identifier")
-    pid = _sanitize_paper_id(f"arxiv-{arxiv_id}")
+    # Prefixed with uid, same reasoning as upload_paper - otherwise two
+    # different accounts ingesting the same arXiv id would land on one
+    # shared papers/{id} doc instead of two separate, isolated ones.
+    pid = _sanitize_paper_id(f"{uid}-arxiv-{arxiv_id}")
+    if body.session_id:
+        existing = state.paper_store.get(pid)
+        already_member = existing is not None and body.session_id in _paper_session_ids(existing)
+        if not already_member and _session_paper_count(state, body.session_id) >= MAX_SESSION_PAPERS:
+            raise HTTPException(
+                status_code=409, detail=f"This session is limited to {MAX_SESSION_PAPERS} papers."
+            )
     upload_root = Path(state.upload_root).resolve()
     dest = (upload_root / f"{pid}.pdf").resolve()
     if not dest.is_relative_to(upload_root):
@@ -415,6 +509,7 @@ def ingest_arxiv(body: ArxivIngestRequest, state: AppState = Depends(get_state))
         pdf_url=body.pdf_url or url,
         status="downloading",
         session_id=body.session_id,
+        owner_uid=uid,
     )
     try:
         response = requests.get(
@@ -435,6 +530,7 @@ def ingest_arxiv(body: ArxivIngestRequest, state: AppState = Depends(get_state))
         paper_id=pid,
         path=dest,
         title=body.title,
+        owner_uid=uid,
         authors=body.authors,
         abstract=body.abstract,
         pdf_url=body.pdf_url or url,
@@ -448,9 +544,11 @@ def ingest_arxiv(body: ArxivIngestRequest, state: AppState = Depends(get_state))
     dependencies=[Depends(require_api_key)],
 )
 def create_paper_guide(
-    paper_id: str, state: AppState = Depends(get_state)
+    paper_id: str, state: AppState = Depends(get_state), uid: str = Depends(get_current_user)
 ) -> PaperGuide:
-    metadata = state.paper_store.get(paper_id)
+    metadata = _owned_paper(state, paper_id, uid)
+    if metadata is None:
+        raise HTTPException(status_code=404, detail=f"no paper {paper_id!r}")
     chunks = state.chunks.paper_chunks(paper_id)
     if not chunks:
         raise HTTPException(status_code=404, detail="paper has no indexed content")
@@ -458,7 +556,11 @@ def create_paper_guide(
         return PaperGuide.model_validate(metadata["guide"])
     title = str((metadata or {}).get("title") or paper_id)
     guide = state.paper_guide.generate(title, chunks)
-    state.paper_store.save(paper_id, guide=guide.model_dump(mode="json"))
+    # owner_uid re-passed explicitly, not left to merge=True alone - same
+    # reasoning as rename_session's created_at/goal carry-through
+    # (service/routers/sessions.py): the fake Firestore client tests run
+    # against does a full overwrite on set(), not a true merge.
+    state.paper_store.save(paper_id, guide=guide.model_dump(mode="json"), owner_uid=metadata.get("owner_uid"))
     return guide
 
 
@@ -468,7 +570,7 @@ def create_paper_guide(
     dependencies=[Depends(require_api_key)],
 )
 def get_paper_deep_dive(
-    paper_id: str, state: AppState = Depends(get_state)
+    paper_id: str, state: AppState = Depends(get_state), uid: str = Depends(get_current_user)
 ) -> DeepDiveResponse:
     """Return the optional, source-expanded view of the existing guide.
 
@@ -476,7 +578,7 @@ def get_paper_deep_dive(
     is assembled deterministically from indexed chunks so it cannot be
     hallucinated or altered by a second model response.
     """
-    metadata = state.paper_store.get(paper_id)
+    metadata = _owned_paper(state, paper_id, uid)
     if metadata is None:
         raise HTTPException(status_code=404, detail=f"no paper {paper_id!r}")
     chunks = state.chunks.paper_chunks(paper_id)
@@ -486,7 +588,7 @@ def get_paper_deep_dive(
         guide = PaperGuide.model_validate(metadata["guide"])
     else:
         guide = state.paper_guide.generate(str(metadata.get("title") or paper_id), chunks)
-        state.paper_store.save(paper_id, guide=guide.model_dump(mode="json"))
+        state.paper_store.save(paper_id, guide=guide.model_dump(mode="json"), owner_uid=metadata.get("owner_uid"))
 
     sections: list[DeepDiveSection] = []
     for index, section in enumerate(guide.sections):

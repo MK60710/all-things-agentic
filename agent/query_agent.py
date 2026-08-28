@@ -104,6 +104,20 @@ class QueryAgent:
         # query sharing one generic token with an unrelated node doesn't
         # win graph mode over a more specific chunk match.
         min_graph_score: float = 0.4,
+        # Same 0-1 scale as min_graph_score but NOT the same value - confirmed
+        # live this path had no floor at all before (assemble_context's own
+        # min_score defaults to 0.0), so a query with genuinely no signal
+        # (a bare "HI") always surfaced its top-N nearest chunks as citations
+        # regardless of relevance, with only the answer text itself noticing
+        # and disclaiming it after the fact. min_graph_score's own 0.4 is
+        # calibrated for name-matching, a much higher-scoring shape than this
+        # path's blended lexical+vector formula (see retrieval.py's search) -
+        # copying it verbatim broke real "low but genuinely relevant" test
+        # fixtures scoring as low as 0.32. Measured directly: a bare "HI"
+        # against real paper chunks scores exactly 0.0 (zero lexical overlap,
+        # zero vector signal), so this only needs to clear true zero-signal
+        # noise, not compete with min_graph_score's calibration.
+        min_vector_score: float = 0.15,
         timeout_ms: int = 15_000,
         max_output_tokens: int = 1024,
         # disambiguation_margin/confident_score are QueryAgent's version of
@@ -140,6 +154,7 @@ class QueryAgent:
         self._max_citations = max_citations
         self._max_context_characters = max_context_characters
         self._min_graph_score = min_graph_score
+        self._min_vector_score = min_vector_score
         self._timeout_ms = timeout_ms
         self._max_output_tokens = max_output_tokens
         self._disambiguation_margin = disambiguation_margin
@@ -202,6 +217,7 @@ class QueryAgent:
         # to the normal text-search path if the id doesn't resolve.
         node_id: str | None = None,
         section: str | None = None,
+        owner_uid: str | None = None,
     ) -> QueryResult:
         """Retrieve evidence and answer ``query`` using Vertex Gemini.
 
@@ -224,6 +240,15 @@ class QueryAgent:
         forced_node: NodeSearchHit | None = None
         if node_id is not None and self._graph is not None:
             data = self._graph.get_node(node_id)
+            # A caller-supplied node_id (e.g. clicking a candidate from an
+            # earlier ambiguous result) must still respect the account
+            # boundary - get_node itself is a low-level, owner-agnostic
+            # lookup, so the check happens here instead. Falling through
+            # to the normal search path (rather than raising) matches
+            # this parameter's own existing "falls back if the id doesn't
+            # resolve" contract.
+            if data is not None and data.get("owner_uid") != owner_uid:
+                data = None
             if data is not None:
                 forced_node = NodeSearchHit(
                     node_id=node_id,
@@ -243,6 +268,7 @@ class QueryAgent:
                 cleaned_query,
                 limit=self._max_graph_nodes,
                 min_score=self._min_graph_score,
+                owner_uid=owner_uid,
             )
             if self._graph is not None
             else []
@@ -310,6 +336,11 @@ class QueryAgent:
             paper_ids=paper_ids,
             section=section,
             max_characters=self._max_context_characters,
+            owner_uid=owner_uid,
+            # section is an explicit direct lookup (a real section title,
+            # not a similarity search), so it keeps the no-floor default -
+            # the floor only matters for the free-text similarity path.
+            min_score=0.0 if section is not None else self._min_vector_score,
         )
         if not assembled.hits:
             return QueryResult(

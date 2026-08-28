@@ -175,12 +175,20 @@ class ContradictionFinder:
                 self._checked_pairs.add(tuple(sorted((a_id, b_id))))
 
     def check_session(
-        self, session_id: str, max_llm_calls: int = 10
+        self, session_id: str, owner_uid: str, max_llm_calls: int = 10
     ) -> list[ContradictionCandidate]:
         """Compare this session's CLAIM nodes pairwise for genuine
         disagreement. The embedding-similarity pre-filter is the full
         extent of what decides which pairs are even worth asking about -
         Gemini only judges the survivors, it never invents candidates.
+
+        owner_uid is required, same as canonicalize/resolve_alias - claims
+        are already scoped to session_id here (and a session can't cross
+        owners, Phase 1), so this isn't a cross-account leak either way,
+        but the resulting CONTRADICTS edge still needs owner_uid set for
+        consistency with every other edge in the graph. Confirmed live as
+        the third real instance of this exact gap (resolve_alias and
+        ClarificationOrchestrator.answer were the other two).
 
         Reads GraphManager's graph through its own lock (self._gm._lock,
         the same RLock every GraphManager method already holds for its
@@ -293,6 +301,7 @@ class ContradictionFinder:
                 # real source_quote.
                 source_quote=verdict.explanation,
                 session_id=session_id,
+                owner_uid=owner_uid,
             )
             self._gm.add_edge(edge)
             results.append(

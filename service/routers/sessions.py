@@ -5,10 +5,12 @@ import uuid
 from collections import defaultdict
 from itertools import combinations
 from datetime import datetime, timezone
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 
 from agent.bibliography import build_bibtex
+from service.auth import get_current_user
 from service.deps import get_state, require_api_key
 from service.schemas import (
     SessionCreateRequest,
@@ -36,54 +38,74 @@ _MAX_STORED_MESSAGES_BYTES = 800_000
 _COMPACT_TAIL_MESSAGES = 3
 
 
+def _get_owned_session(state: AppState, session_id: str, uid: str) -> dict[str, Any]:
+    """Every route below that takes a session_id resolves it through here,
+    never a bare `next(... if s.get("id") == session_id)` lookup - a
+    session that exists but belongs to a different uid returns the exact
+    same 404 as one that doesn't exist at all, so a caller can't use this
+    endpoint to probe which session ids are real for another account."""
+    session = state.session_store.get(session_id)
+    if session is None or session.get("owner_uid") != uid:
+        raise HTTPException(status_code=404, detail=f"no session {session_id!r}")
+    return session
+
+
 @router.post("", response_model=SessionMetadata)
-def create_session(body: SessionCreateRequest, state: AppState = Depends(get_state)) -> SessionMetadata:
+def create_session(
+    body: SessionCreateRequest,
+    state: AppState = Depends(get_state),
+    uid: str = Depends(get_current_user),
+) -> SessionMetadata:
     session_id = str(uuid.uuid4())
     created_at = datetime.now(timezone.utc).isoformat()
     saved = state.session_store.save(
-        session_id, name=body.name, created_at=created_at, goal=body.goal
+        session_id, name=body.name, created_at=created_at, goal=body.goal, owner_uid=uid
     )
     return SessionMetadata.model_validate(saved)
 
 
 @router.get("", response_model=list[SessionMetadata])
-def list_sessions(state: AppState = Depends(get_state)) -> list[SessionMetadata]:
-    return [SessionMetadata.model_validate(item) for item in state.session_store.list()]
+def list_sessions(
+    state: AppState = Depends(get_state), uid: str = Depends(get_current_user)
+) -> list[SessionMetadata]:
+    return [
+        SessionMetadata.model_validate(item)
+        for item in state.session_store.list()
+        if item.get("owner_uid") == uid
+    ]
 
 
 @router.patch("/{session_id}", response_model=SessionMetadata)
 def rename_session(
-    session_id: str, body: SessionCreateRequest, state: AppState = Depends(get_state)
+    session_id: str,
+    body: SessionCreateRequest,
+    state: AppState = Depends(get_state),
+    uid: str = Depends(get_current_user),
 ) -> SessionMetadata:
-    existing = next(
-        (s for s in state.session_store.list() if s.get("id") == session_id), None
-    )
-    if existing is None:
-        raise HTTPException(status_code=404, detail=f"no session {session_id!r}")
+    existing = _get_owned_session(state, session_id, uid)
     # SessionStore.save's returned dict is only {id, updated_at, **values} -
-    # not a Firestore read-back - so created_at (and goal, which this
-    # endpoint never changes) must be carried through explicitly or the
-    # response would fail SessionMetadata validation / silently clear the
-    # goal, even though the merge=True write itself only touches
+    # not a Firestore read-back - so created_at/goal/owner_uid (none of
+    # which this endpoint changes) must be carried through explicitly or
+    # the response would fail SessionMetadata validation / silently clear
+    # them, even though the merge=True write itself only touches
     # name/updated_at server-side.
     saved = state.session_store.save(
         session_id,
         name=body.name,
         created_at=existing.get("created_at"),
         goal=existing.get("goal"),
+        owner_uid=existing.get("owner_uid"),
     )
     return SessionMetadata.model_validate(saved)
 
 
 @router.get("/{session_id}/graph", response_model=SessionGraphResponse)
 def get_session_graph(
-    session_id: str, state: AppState = Depends(get_state)
+    session_id: str,
+    state: AppState = Depends(get_state),
+    uid: str = Depends(get_current_user),
 ) -> SessionGraphResponse:
-    existing = next(
-        (s for s in state.session_store.list() if s.get("id") == session_id), None
-    )
-    if existing is None:
-        raise HTTPException(status_code=404, detail=f"no session {session_id!r}")
+    _get_owned_session(state, session_id, uid)
     export = state.graph.export_session_graph(session_id)
     return SessionGraphResponse(
         nodes=[
@@ -98,7 +120,9 @@ def get_session_graph(
 
 @router.get("/{session_id}/paper-map", response_model=SessionPaperMapResponse)
 def get_session_paper_map(
-    session_id: str, state: AppState = Depends(get_state)
+    session_id: str,
+    state: AppState = Depends(get_state),
+    uid: str = Depends(get_current_user),
 ) -> SessionPaperMapResponse:
     """Return an optional paper-level projection of the session graph.
 
@@ -106,9 +130,7 @@ def get_session_paper_map(
     extracted graph evidence shares a canonical topic, and every summary
     points back to that topic's paper/section evidence.
     """
-    existing = next((s for s in state.session_store.list() if s.get("id") == session_id), None)
-    if existing is None:
-        raise HTTPException(status_code=404, detail=f"no session {session_id!r}")
+    _get_owned_session(state, session_id, uid)
     paper_titles = {
         p["id"]: p.get("title", p["id"])
         for p in state.paper_store.list()
@@ -151,13 +173,11 @@ def get_session_paper_map(
 
 @router.get("/{session_id}/bibliography")
 def get_session_bibliography(
-    session_id: str, state: AppState = Depends(get_state)
+    session_id: str,
+    state: AppState = Depends(get_state),
+    uid: str = Depends(get_current_user),
 ) -> Response:
-    existing = next(
-        (s for s in state.session_store.list() if s.get("id") == session_id), None
-    )
-    if existing is None:
-        raise HTTPException(status_code=404, detail=f"no session {session_id!r}")
+    _get_owned_session(state, session_id, uid)
     papers = [
         p for p in state.paper_store.list() if session_id in _paper_session_ids(p)
     ]
@@ -167,20 +187,27 @@ def get_session_bibliography(
 
 @router.get("/{session_id}/messages", response_model=SessionMessagesResponse)
 def get_session_messages(
-    session_id: str, state: AppState = Depends(get_state)
+    session_id: str,
+    state: AppState = Depends(get_state),
+    uid: str = Depends(get_current_user),
 ) -> SessionMessagesResponse:
-    # Deliberately no session-existence check, unlike every other route in
-    # this file - a brand-new session's first switchToSession load has
-    # nothing stored yet, which is a normal empty-list state, not a 404.
-    # This store is intentionally decoupled from session metadata's
-    # lifecycle (see SessionMessagesStore's own docstring).
+    # A session always exists (created via POST /sessions) before the
+    # frontend ever fetches its messages, so requiring ownership here
+    # doesn't conflict with the empty-list-not-404 behavior for a
+    # brand-new session that just has nothing saved yet - see
+    # SessionMessagesStore's own docstring for that part.
+    _get_owned_session(state, session_id, uid)
     return SessionMessagesResponse(messages=state.session_messages_store.get(session_id))
 
 
 @router.put("/{session_id}/messages", response_model=SessionMessagesResponse)
 def save_session_messages(
-    session_id: str, body: SessionMessagesRequest, state: AppState = Depends(get_state)
+    session_id: str,
+    body: SessionMessagesRequest,
+    state: AppState = Depends(get_state),
+    uid: str = Depends(get_current_user),
 ) -> SessionMessagesResponse:
+    _get_owned_session(state, session_id, uid)
     serialized_size = len(json.dumps(body.messages).encode("utf-8"))
     if serialized_size <= _MAX_STORED_MESSAGES_BYTES:
         state.session_messages_store.save(session_id, body.messages)
@@ -219,18 +246,18 @@ def save_session_messages(
 
 
 @router.delete("/{session_id}", status_code=204)
-def delete_session(session_id: str, state: AppState = Depends(get_state)) -> Response:
+def delete_session(
+    session_id: str,
+    state: AppState = Depends(get_state),
+    uid: str = Depends(get_current_user),
+) -> Response:
     """Cascade delete, scoped to what actually becomes ownerless: a
     paper (or graph node) still genuinely shared with another session
     survives this session's deletion, only this session's membership is
     removed from it - see PaperStore.detach_session and
     agent/graph_manager.py's remove_by_session, both of which already
     make this distinction rather than deleting unconditionally."""
-    existing = next(
-        (s for s in state.session_store.list() if s.get("id") == session_id), None
-    )
-    if existing is None:
-        raise HTTPException(status_code=404, detail=f"no session {session_id!r}")
+    _get_owned_session(state, session_id, uid)
 
     papers = [
         p for p in state.paper_store.list() if session_id in _paper_session_ids(p)

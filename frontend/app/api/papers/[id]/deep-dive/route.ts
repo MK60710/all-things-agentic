@@ -8,7 +8,10 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
   const { id } = await params;
   try {
     const response = await fetch(`${apiUrl.replace(/\/$/, "")}/papers/${encodeURIComponent(id)}/deep-dive`, {
-      headers: process.env.API_SHARED_SECRET ? { "X-API-Key": process.env.API_SHARED_SECRET } : {},
+      headers: {
+        ...(process.env.API_SHARED_SECRET ? { "X-API-Key": process.env.API_SHARED_SECRET } : {}),
+        ...(request.headers.get("authorization") ? { Authorization: request.headers.get("authorization")! } : {}),
+      },
       cache: "no-store",
     });
     const data = await response.json().catch(() => ({ detail: "Backend returned an invalid response" }));

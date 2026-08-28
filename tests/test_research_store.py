@@ -15,7 +15,7 @@ def test_chunk_only_ingestion_does_not_require_graph_or_cloud():
         chunks=["A useful research passage."],
     )
 
-    report = store.ingest(extraction)
+    report = store.ingest(extraction, owner_uid="owner-1")
 
     assert len(report.chunk_ids) == 1
     assert report.graph is None
@@ -41,6 +41,7 @@ def test_ingest_passes_clarification_through_to_apply_extraction_result(fake_db)
         ExtractionResult(
             paper_id="paper-0", entities=[existing], relations=[], chunks=[]
         ),
+        "owner-1",
         embedding_fn=lambda entity: [1.0, 0.0],
     )
 
@@ -61,7 +62,7 @@ def test_ingest_passes_clarification_through_to_apply_extraction_result(fake_db)
         extraction,
         entity_embedding_fn=lambda entity: [0.8, 0.6],  # needs_clarification band
         clarification=orchestrator,
-    )
+     owner_uid="owner-1")
 
     assert len(orchestrator.pending()) == 1
     assert orchestrator.pending()[0].kind == "entity_merge"

@@ -1,14 +1,17 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 
 export const runtime = "nodejs";
 
-export async function POST() {
+export async function POST(request: NextRequest) {
   const apiUrl = process.env.BACKEND_API_URL ?? process.env.NEXT_PUBLIC_API_URL;
   if (!apiUrl) return NextResponse.json({ error: "Backend is not configured" }, { status: 503 });
   try {
     const response = await fetch(`${apiUrl.replace(/\/$/, "")}/papers/upload-token`, {
       method: "POST",
-      headers: process.env.API_SHARED_SECRET ? { "X-API-Key": process.env.API_SHARED_SECRET } : {},
+      headers: {
+        ...(process.env.API_SHARED_SECRET ? { "X-API-Key": process.env.API_SHARED_SECRET } : {}),
+        ...(request.headers.get("authorization") ? { Authorization: request.headers.get("authorization")! } : {}),
+      },
       cache: "no-store",
     });
     const data = await response.json();

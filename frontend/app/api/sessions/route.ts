@@ -2,12 +2,15 @@ import { NextRequest, NextResponse } from "next/server";
 
 export const runtime = "nodejs";
 
-export async function GET() {
+export async function GET(request: NextRequest) {
   const apiUrl = process.env.BACKEND_API_URL ?? process.env.NEXT_PUBLIC_API_URL;
   if (!apiUrl) return NextResponse.json({ error: "Backend is not configured" }, { status: 503 });
   try {
     const response = await fetch(`${apiUrl.replace(/\/$/, "")}/sessions`, {
-      headers: process.env.API_SHARED_SECRET ? { "X-API-Key": process.env.API_SHARED_SECRET } : {},
+      headers: {
+        ...(process.env.API_SHARED_SECRET ? { "X-API-Key": process.env.API_SHARED_SECRET } : {}),
+        ...(request.headers.get("authorization") ? { Authorization: request.headers.get("authorization")! } : {}),
+      },
       cache: "no-store",
     });
     const data = await response.json();
@@ -26,6 +29,7 @@ export async function POST(request: NextRequest) {
       headers: {
         "Content-Type": "application/json",
         ...(process.env.API_SHARED_SECRET ? { "X-API-Key": process.env.API_SHARED_SECRET } : {}),
+        ...(request.headers.get("authorization") ? { Authorization: request.headers.get("authorization")! } : {}),
       },
       body: await request.text(),
       cache: "no-store",
