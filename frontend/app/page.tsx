@@ -276,9 +276,8 @@ const FLOW_REVEAL_INTERVAL_MS = 200;
 const MAX_SESSION_PAPERS = 5;
 
 function FlowDiagram({ guide }: { guide: NonNullable<PaperGuide["sections"][number]["diagram"]> }) {
-  // Builds itself in on a timer (same idea as GraphBuildAnimation's
-  // node-by-node reveal) instead of rendering every node at once -
-  // remounts (and so replays) each time its parent section becomes the
+  // Builds itself in node-by-node on a timer instead of rendering every
+  // node at once - remounts (and so replays) each time its parent section becomes the
   // active stop in GuidedReading below, since it's only rendered while
   // that stop is showing.
   const [revealedCount, setRevealedCount] = useState(0);
@@ -1464,10 +1463,8 @@ export default function Home() {
 
   // Drains buildingGraphQueue into real chat messages/graph state once the
   // whole batch is done. The modal is already closed by then (startBreakdown
-  // closed it before ingestion even started) - this replaces the old
-  // in-modal GraphBuildAnimation step, which required the modal to stay
-  // open and is exactly what made the full-screen ConvergenceRitual
-  // invisible (it renders behind the modal, z-index 200 vs 201).
+  // closed it before ingestion even started), so the full-screen
+  // ConvergenceRitual renders unobstructed instead of behind modal chrome.
   useEffect(() => {
     if (!readyToShowWalkthroughs) return;
     addPaper(buildingGraphQueue[0], false);

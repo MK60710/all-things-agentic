@@ -28,10 +28,9 @@ function bibliographyFilename(sessionName: string | null | undefined): string {
   return cleaned ? `${cleaned} citations.bib` : "session.bib";
 }
 
-// Matches GraphBuildAnimation.tsx's window-based sizing convention - a
-// persistent full-screen panel here, so the offsets subtract this
-// component's own topbar + filter row instead of that component's modal
-// chrome.
+// This is a persistent full-screen panel, not a modal, so the offsets
+// subtract this component's own topbar + filter row rather than any
+// modal chrome.
 const TOPBAR_AND_FILTERS_HEIGHT = 116;
 
 export default function GraphExplorer({
