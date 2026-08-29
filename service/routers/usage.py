@@ -21,5 +21,6 @@ def usage_status(
             "remaining": chat.remaining,
             "retry_after": chat.retry_after,
             "reset_at": chat.reset_at,
+            "scope": chat.scope,
         }
     }

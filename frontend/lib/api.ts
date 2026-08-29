@@ -21,7 +21,7 @@ export interface ChatHistoryItem {
 }
 
 export class RateLimitError extends Error {
-  constructor(message: string, public readonly retryAfter: number) {
+  constructor(message: string, public readonly retryAfter: number, public readonly scope: "user" | "global" = "user") {
     super(message);
     this.name = "RateLimitError";
   }
@@ -33,6 +33,7 @@ export interface UsageStatus {
     remaining: number;
     retry_after: number;
     reset_at?: string | null;
+    scope?: "user" | "global";
   };
 }
 
@@ -192,6 +193,7 @@ export async function askAssistant(
       throw new RateLimitError(
         data.error ?? "Your free chat limit has been reached.",
         Number(response.headers.get("retry-after") ?? "60"),
+        response.headers.get("x-ratelimit-scope") === "global" ? "global" : "user",
       );
     }
     throw new Error(data.error ?? `Assistant request failed (${response.status})`);

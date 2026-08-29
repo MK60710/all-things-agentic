@@ -61,4 +61,6 @@ def test_global_limit_cannot_be_bypassed_with_multiple_users(fake_db) -> None:
 
     assert limiter.consume("user-a", "chat").allowed
     assert limiter.consume("user-b", "chat").allowed
-    assert not limiter.consume("user-c", "chat").allowed
+    blocked = limiter.consume("user-c", "chat")
+    assert not blocked.allowed
+    assert blocked.scope == "global"
