@@ -49,7 +49,7 @@ _ARXIV_ID = re.compile(
 # app's single-instance concurrency profile" tolerance already documented
 # on GraphManager.apply_extraction_result's own race, not a banking-grade
 # guarantee.
-MAX_SESSION_PAPERS = 5
+MAX_SESSION_PAPERS = 3
 
 
 def _session_paper_count(state: AppState, session_id: str) -> int:

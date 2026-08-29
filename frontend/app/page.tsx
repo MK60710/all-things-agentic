@@ -273,7 +273,7 @@ const ATLAS_TOUR_STEPS: TourStep[] = [
 ];
 
 const FLOW_REVEAL_INTERVAL_MS = 200;
-const MAX_SESSION_PAPERS = 5;
+const MAX_SESSION_PAPERS = 3;
 
 function FlowDiagram({ guide }: { guide: NonNullable<PaperGuide["sections"][number]["diagram"]> }) {
   // Builds itself in node-by-node on a timer instead of rendering every
