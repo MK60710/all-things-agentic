@@ -91,6 +91,9 @@ export interface SessionGraphEdge {
   source_id: string;
   target_id: string;
   relation: string;
+  source_paper_id?: string | null;
+  source_section?: string | null;
+  source_quote?: string;
 }
 
 export interface FeynmanPrompt {

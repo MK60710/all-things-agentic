@@ -558,10 +558,12 @@ def test_apply_extraction_result_is_idempotent(fake_db):
 
     assert first.paper_node_id != "paper-1"
     assert len(first.node_writes) == 2
-    assert len(first.edge_writes) == 1
+    assert len(first.edge_writes) == 3  # two MENTIONS edges plus SUPPORTS
     assert gm.graph.number_of_nodes() == 3
-    assert gm.graph.number_of_edges() == 1
-    assert second.edge_writes[0].edge_id == first.edge_writes[0].edge_id
+    assert gm.graph.number_of_edges() == 3
+    first_supports = next(edge for edge in first.edge_writes if edge.relation == "SUPPORTS")
+    second_supports = next(edge for edge in second.edge_writes if edge.relation == "SUPPORTS")
+    assert second_supports.edge_id == first_supports.edge_id
 
 
 def test_apply_extraction_result_tags_new_nodes_and_edges_with_session_id(fake_db):
@@ -717,7 +719,8 @@ def test_relation_endpoint_uses_declared_entity_type(fake_db):
     report = gm.apply_extraction_result(extraction, owner_uid="owner-1")
 
     model_id = report.node_writes[0].node_id
-    assert report.edge_writes[0].source_id == model_id
+    uses_edge = next(edge for edge in report.edge_writes if edge.relation == "USES")
+    assert uses_edge.source_id == model_id
     assert "/" not in report.paper_node_id
 
 
@@ -769,7 +772,8 @@ def test_ambiguous_relation_endpoint_is_skipped_not_paper_fatal(fake_db):
     assert report.skipped_relations == 1
     # The second, unambiguous (typed) relation still gets written - one
     # bad relation doesn't take the rest of the paper down with it.
-    assert len(report.edge_writes) == 1
+    assert len(report.edge_writes) == 4  # three MENTIONS edges plus SUPPORTS
+    assert sum(edge.relation == "SUPPORTS" for edge in report.edge_writes) == 1
     assert len(report.node_writes) == 3
 
 

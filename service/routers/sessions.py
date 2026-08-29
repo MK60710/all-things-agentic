@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from itertools import combinations
 from datetime import datetime, timezone
 from typing import Any
@@ -165,6 +165,80 @@ def get_session_paper_map(
             paper_b_id=paper_b,
             paper_b_title=paper_titles[paper_b],
             summary=f"These papers are connected through shared extracted topics: {joined}.",
+            shared_topics=topic_names,
+            evidence=evidence,
+        ))
+
+    # A pair may not share a single extracted node, but can still be linked by
+    # a short chain such as Paper A -> method -> concept -> Paper B. Search
+    # the complete session graph for those bounded paths. Other paper nodes
+    # are not allowed as intermediaries, so this cannot manufacture a link by
+    # routing through an unrelated third paper.
+    node_by_id = {node.node_id: node for node in export.nodes}
+    paper_node_by_paper_id = {
+        paper_id: node_id
+        for paper_id in paper_titles
+        if (node_id := state.graph.paper_node_id(paper_id)) in node_by_id
+    }
+    adjacency: defaultdict[str, set[str]] = defaultdict(set)
+    for edge in export.edges:
+        adjacency[edge.source_id].add(edge.target_id)
+        adjacency[edge.target_id].add(edge.source_id)
+
+    def indirect_path(start: str, target: str) -> list[str] | None:
+        queue: deque[tuple[str, list[str]]] = deque([(start, [start])])
+        visited = {start}
+        while queue:
+            current, path = queue.popleft()
+            if len(path) - 1 >= 4:
+                continue
+            for neighbor in adjacency[current]:
+                if neighbor in visited:
+                    continue
+                if neighbor != target and node_by_id.get(neighbor, None) and node_by_id[neighbor].type == "PAPER":
+                    continue
+                next_path = [*path, neighbor]
+                if neighbor == target:
+                    return next_path
+                visited.add(neighbor)
+                queue.append((neighbor, next_path))
+        return None
+
+    existing_pairs = set(pair_topics)
+    for paper_a, paper_b in combinations(sorted(paper_node_by_paper_id), 2):
+        if (paper_a, paper_b) in existing_pairs:
+            continue
+        path = indirect_path(
+            paper_node_by_paper_id[paper_a],
+            paper_node_by_paper_id[paper_b],
+        )
+        if path is None:
+            continue
+        intermediate_nodes = [node_by_id[node_id] for node_id in path[1:-1] if node_id in node_by_id]
+        topic_names = [node.name for node in intermediate_nodes[:6]]
+        evidence = []
+        for node in intermediate_nodes[:6]:
+            citations_by_paper = {
+                citation.paper_id: citation
+                for citation in node.citations
+                if citation.paper_id in {paper_a, paper_b}
+            }
+            for paper_id in (paper_a, paper_b):
+                citation = citations_by_paper.get(paper_id)
+                if citation is not None:
+                    evidence.append(PaperConnectionEvidence(
+                        topic=node.name,
+                        paper_id=paper_id,
+                        section=citation.section,
+                        quote=citation.source_quote,
+                    ))
+        path_label = " → ".join([paper_titles[paper_a], *topic_names, paper_titles[paper_b]])
+        connections.append(PaperConnection(
+            paper_a_id=paper_a,
+            paper_a_title=paper_titles[paper_a],
+            paper_b_id=paper_b,
+            paper_b_title=paper_titles[paper_b],
+            summary=f"Indirect graph connection (up to three steps): {path_label}.",
             shared_topics=topic_names,
             evidence=evidence,
         ))

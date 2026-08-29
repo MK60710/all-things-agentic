@@ -302,6 +302,9 @@ class SessionGraphEdge(BaseModel):
     source_id: str
     target_id: str
     relation: str
+    source_paper_id: str | None = None
+    source_section: str | None = None
+    source_quote: str = ""
 
 
 class SessionGraphResponse(BaseModel):

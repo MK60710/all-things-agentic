@@ -10,8 +10,8 @@ def test_node_type_has_seven_members():
     assert len(NodeType) == 7
 
 
-def test_edge_type_has_eight_members():
-    assert len(EdgeType) == 8
+def test_edge_type_has_nine_members():
+    assert len(EdgeType) == 9
 
 
 def test_extracted_relation_requires_source_quote():
