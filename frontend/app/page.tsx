@@ -1241,13 +1241,13 @@ export default function Home() {
     const committed = papers.length + stagedResults.length + stagedFiles.length;
     const slots = MAX_SESSION_PAPERS - committed;
     if (slots <= 0) {
-      setUploadError(`This session is limited to ${MAX_SESSION_PAPERS} papers.`);
+      setUploadError(`The free plan allows only ${MAX_SESSION_PAPERS} papers per session. Remove a paper before adding another.`);
       return;
     }
     const pdfFiles = files.filter((file) => file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf"));
     const validFiles = pdfFiles.slice(0, slots);
     const notices: string[] = [];
-    if (files.length > slots) notices.push(`You can add up to ${MAX_SESSION_PAPERS} papers per session; only the first ${slots} file${slots === 1 ? "" : "s"} will be staged.`);
+    if (files.length > slots) notices.push(`The free plan allows only ${MAX_SESSION_PAPERS} papers per session; only the first ${slots} file${slots === 1 ? "" : "s"} will be staged.`);
     if (validFiles.length !== files.length && files.length <= slots) notices.push("Only PDF files were included; other files were skipped.");
     if (validFiles.length === 0) {
       setUploadError(notices.join(" ") || "Please choose PDF files.");
@@ -1455,6 +1455,16 @@ export default function Home() {
         return updated;
       });
     }
+  }
+
+  function stageSearchResult(result: PaperSearchResult) {
+    const total = papers.length + stagedResults.length + stagedFiles.length;
+    if (total >= MAX_SESSION_PAPERS) {
+      setSearchError(`The free plan allows only ${MAX_SESSION_PAPERS} papers per session. Remove a paper before adding another.`);
+      return;
+    }
+    setSearchError("");
+    setStagedResults((current) => current.some((staged) => staged.id === result.id) ? current : [...current, result]);
   }
 
   function onDrop(event: DragEvent<HTMLButtonElement>) {
@@ -1744,7 +1754,7 @@ export default function Home() {
           {addMode === "upload" && <div className="upload-panel">
             <button className="back-button" onClick={() => setAddMode("choose")}>← Back</button>
             <button className="drop-zone" onClick={() => fileInput.current?.click()} onDragOver={(event) => event.preventDefault()} onDrop={onDrop} disabled={papers.length + stagedResults.length + stagedFiles.length >= MAX_SESSION_PAPERS}>
-              <span><Icon name="upload" size={25}/></span><strong>{papers.length + stagedResults.length + stagedFiles.length >= MAX_SESSION_PAPERS ? `${MAX_SESSION_PAPERS}-paper limit reached` : `Choose up to ${MAX_SESSION_PAPERS} PDFs or drag them here`}</strong><small>Papers are staged below - nothing is read until you start the breakdown.</small>
+              <span><Icon name="upload" size={25}/></span><strong>{papers.length + stagedResults.length + stagedFiles.length >= MAX_SESSION_PAPERS ? `Free plan limit: ${MAX_SESSION_PAPERS} papers per session` : `Choose up to ${MAX_SESSION_PAPERS} PDFs or drag them here`}</strong><small>Papers are staged below - nothing is read until you start the breakdown.</small>
             </button>
             <input ref={fileInput} className="hidden-input" type="file" accept="application/pdf,.pdf" multiple disabled={papers.length + stagedResults.length + stagedFiles.length >= MAX_SESSION_PAPERS} onChange={(event: ChangeEvent<HTMLInputElement>) => { stageFiles(Array.from(event.target.files ?? [])); event.target.value = ""; }}/>
             {uploadError && <p className="form-error">{uploadError}</p>}
@@ -1756,11 +1766,10 @@ export default function Home() {
             {searchError && <p className="form-error">{searchError}</p>}
             <div className="search-results">{searchResults.map((result) => {
               const isStaged = stagedResults.some((staged) => staged.id === result.id);
-              const atLimit = papers.length + stagedResults.length + stagedFiles.length >= MAX_SESSION_PAPERS;
               return <article key={result.id}><div><span>arXiv</span><small>{result.published}</small></div><h3>{result.title}</h3><p>{result.authors}</p>
                 {isStaged
-                  ? <button className="staged-toggle" onClick={() => setStagedResults((current) => current.filter((staged) => staged.id !== result.id))}><Icon name="check" size={13}/>Added - remove</button>
-                  : <button onClick={() => setStagedResults((current) => [...current, result])} disabled={atLimit}>Add to list</button>}
+                  ? <button type="button" className="staged-toggle" onClick={() => setStagedResults((current) => current.filter((staged) => staged.id !== result.id))}><Icon name="check" size={13}/>Added - remove</button>
+                  : <button type="button" onClick={() => stageSearchResult(result)}>Add to list</button>}
               </article>;
             })}</div>
           </div>}
@@ -1771,7 +1780,7 @@ export default function Home() {
               {stagedResults.map((result) => <li key={result.id}><span>{result.title}</span><button onClick={() => setStagedResults((current) => current.filter((staged) => staged.id !== result.id))} aria-label={`Remove ${result.title}`}><Icon name="close" size={11}/></button></li>)}
               {stagedFiles.map((file, index) => <li key={`${file.name}-${index}`}><span>{file.name}</span><button onClick={() => setStagedFiles((current) => current.filter((_, i) => i !== index))} aria-label={`Remove ${file.name}`}><Icon name="close" size={11}/></button></li>)}
             </ul>
-            <button className="start-breakdown-button" onClick={startBreakdown}>Start breaking down {stagedResults.length + stagedFiles.length} paper{stagedResults.length + stagedFiles.length === 1 ? "" : "s"}</button>
+            <button type="button" className="start-breakdown-button" onClick={startBreakdown}>Start breaking down {stagedResults.length + stagedFiles.length} paper{stagedResults.length + stagedFiles.length === 1 ? "" : "s"}</button>
           </div>}
         </section>
       </div>}
