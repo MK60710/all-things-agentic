@@ -186,6 +186,65 @@ def test_gemini_receives_retrieved_context():
     assert calls[0]["config"].temperature == 0
 
 
+def test_broad_paper_question_receives_paper_prose_not_graph_entities(fake_db):
+    """A paper-scoped summary must not be reduced to the paper's extracted
+    entity names. The full question context should include prose from across
+    the indexed paper, including later sections when available."""
+    calls = []
+
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(text="Grounded paper summary")
+
+    index = ChunkIndex()
+    index.upsert_paper(
+        "paper-1",
+        [
+            ExtractionChunk(
+                text="The introduction studies contextual noncompliance in language models.",
+                ordinal=0,
+                section="Introduction",
+            ),
+            ExtractionChunk(
+                text="The authors evaluate five categories with a 1000-prompt benchmark.",
+                ordinal=1,
+                section="Experiments",
+            ),
+            ExtractionChunk(
+                text="LoRA improves noncompliance while preserving general capabilities.",
+                ordinal=2,
+                section="Conclusion",
+            ),
+        ],
+    )
+    agent = QueryAgent(
+        index,
+        _graph(fake_db),
+        client=SimpleNamespace(models=FakeModels()),
+    )
+
+    result = agent.answer("Summarize the paper", paper_ids={"paper-1"})
+
+    assert result.retrieval_mode == "vector"
+    assert result.answer == "Grounded paper summary"
+    assert "contextual noncompliance" in calls[0]["contents"]
+    assert "1000-prompt benchmark" in calls[0]["contents"]
+    assert "preserving general capabilities" in calls[0]["contents"]
+
+
+def test_paper_scoped_relationship_question_still_uses_graph(fake_db):
+    agent = QueryAgent(ChunkIndex(), _graph(fake_db))
+
+    result = agent.answer(
+        "What is the relationship between the memory method and recall?",
+        paper_ids={"paper-1"},
+    )
+
+    assert result.retrieval_mode == "graph"
+    assert result.citations[0].source_kind == "graph"
+
+
 def test_goal_is_added_to_system_instruction_when_provided():
     calls = []
 

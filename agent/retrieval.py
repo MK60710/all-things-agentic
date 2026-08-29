@@ -445,3 +445,66 @@ class ChunkIndex:
                 (record for record in self._records.values() if record.paper_id == paper_id),
                 key=lambda record: record.ordinal,
             )
+
+    def assemble_paper_context(
+        self,
+        paper_ids: set[str],
+        *,
+        max_characters: int = 14000,
+        owner_uid: str | None = None,
+    ) -> AssembledContext:
+        """Build broad context from across the selected papers.
+
+        Similarity search is a poor fit for questions such as "summarize this
+        paper" because the query may share no words with the paper's thesis.
+        This path samples the paper in reading order instead, keeping the
+        opening, middle, and conclusion represented when the full text is too
+        large for the context budget.
+        """
+        with self._lock:
+            records = sorted(
+                (
+                    record for record in self._records.values()
+                    if record.paper_id in paper_ids
+                    and (owner_uid is None or record.owner_uid == owner_uid)
+                ),
+                key=lambda record: (record.paper_id, record.ordinal),
+            )
+            if not records:
+                return AssembledContext(hits=[], text="")
+
+            if len(records) > 1:
+                # Evenly sample when a full paper would exceed the budget so
+                # later sections are not silently lost behind the introduction.
+                estimated = sum(len(record.text) + 120 for record in records)
+                if estimated > max_characters:
+                    count = max(1, int(len(records) * max_characters / estimated))
+                    indexes = {round(i * (len(records) - 1) / max(1, count - 1)) for i in range(count)}
+                    records = [records[index] for index in sorted(indexes)]
+
+            hits: list[SearchHit] = []
+            sections: list[str] = []
+            used_characters = 0
+            for record in records:
+                page = (
+                    str(record.page_start)
+                    if record.page_start == record.page_end
+                    else f"{record.page_start}-{record.page_end}"
+                )
+                metadata: dict[str, str] = {"paper_id": _escape_tag_delimiters(record.paper_id)}
+                if record.section:
+                    metadata["section"] = _escape_tag_delimiters(record.section)
+                if record.page_start is not None:
+                    metadata["page"] = page
+                rendered = (
+                    "<source_metadata>"
+                    + json.dumps(metadata, ensure_ascii=True, separators=(",", ":"))
+                    + "</source_metadata>\n"
+                    + _escape_tag_delimiters(record.text)
+                )
+                if sections and used_characters + len(rendered) > max_characters:
+                    break
+                sections.append(rendered)
+                used_characters += len(rendered)
+                hits.append(SearchHit(record.id, record.paper_id, record.text, 1.0, record.ordinal, record.page_start, record.page_end, record.section))
+            return AssembledContext(hits=hits, text="\n\n".join(sections))
