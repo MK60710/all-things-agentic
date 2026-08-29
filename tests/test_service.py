@@ -100,6 +100,7 @@ def app_state(fake_db, tmp_path) -> AppState:
     chunks = ChunkIndex(db_client=fake_db)
     clarification = ClarificationOrchestrator(graph_manager=graph)
     return AppState(
+        gemini_client=SimpleNamespace(),
         graph=graph,
         chunks=chunks,
         clarification=clarification,
