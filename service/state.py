@@ -29,6 +29,7 @@ from agent.session_summarizer import GeminiSessionSummarizer, SummarizeFn
 from agent.text_utils import entity_embedding_text
 from service.storage import PaperStore, SessionMessagesStore, SessionStore, UploadTokenStore
 from service.rate_limits import RateLimiter
+from service.document_storage import CloudStorageDocumentStore, DocumentStore, LocalDocumentStore
 
 
 @dataclass
@@ -45,6 +46,7 @@ class AppState:
     extraction_agent: ExtractionAgent
     research_store: ResearchStore
     upload_root: str
+    document_store: DocumentStore
     paper_store: PaperStore
     upload_tokens: UploadTokenStore
     session_store: SessionStore
@@ -108,6 +110,12 @@ def build_state() -> AppState:
 
     upload_root = os.environ.get("UPLOAD_ROOT", "/tmp/uploads")
     os.makedirs(upload_root, exist_ok=True)
+    storage_bucket = os.environ.get("PAPER_STORAGE_BUCKET")
+    document_store: DocumentStore = (
+        CloudStorageDocumentStore(storage_bucket, project=project)
+        if storage_bucket
+        else LocalDocumentStore(upload_root)
+    )
     extraction_agent = ExtractionAgent(
         document_extractor=PdfTextExtractor(allowed_root=upload_root),
         structured_extractor=GeminiStructuredExtractor(
@@ -130,6 +138,7 @@ def build_state() -> AppState:
         extraction_agent=extraction_agent,
         research_store=research_store,
         upload_root=upload_root,
+        document_store=document_store,
         paper_store=PaperStore(db),
         upload_tokens=UploadTokenStore(db),
         session_store=SessionStore(db),

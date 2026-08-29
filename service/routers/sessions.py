@@ -341,6 +341,9 @@ def delete_session(
         updated = state.paper_store.detach_session(paper_id, session_id)
         if not updated.get("session_ids"):
             state.chunks.remove_paper(paper_id)
+            source_object = paper.get("source_object")
+            if source_object:
+                state.document_store.delete(str(source_object))
             state.paper_store.delete(paper_id)
 
     removed_node_ids = state.graph.remove_by_session(session_id)

@@ -35,3 +35,6 @@ def validate_production_environment() -> None:
             raise RuntimeError(
                 "CORS_ORIGINS may contain only explicit HTTPS origins in production"
             )
+
+    if not os.environ.get("PAPER_STORAGE_BUCKET"):
+        raise RuntimeError("PAPER_STORAGE_BUCKET is required in production")
