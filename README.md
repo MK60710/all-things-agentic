@@ -1,147 +1,160 @@
 # Atlas
 
-All Things Agentic Hackathon (Google/Devpost). Collaborative Partner track.
+Atlas is an AI research assistant that helps people read academic papers, ask paper-grounded questions, test their understanding, and see how research ideas connect.
 
-An interactive research assistant that reads academic papers and uses cheap
-chunk retrieval for the common question-answering path. High-confidence,
-quoted relationships can additionally be stored in a small typed graph for
-cross-paper comparisons and research-gap analysis.
+## Features
 
-The default ingestion and retrieval path is local: `pdftotext`, deterministic
-chunking, and feature-hashed vectors. OCR, Gemini structured extraction,
-Firestore persistence, and hosted embeddings are optional upgrades rather
-than requirements for every paper or query.
+- Upload PDF papers or add papers from arXiv.
+- Read guided, section-by-section explanations.
+- Ask questions using retrieved paper context and citations.
+- Extract concepts, methods, models, datasets, metrics, and claims.
+- Explore relationships in an interactive knowledge graph.
+- Check for contradictions and possible research gaps.
+- Test understanding with optional knowledge checks.
 
-New to Atlas? See [`GUIDE.md`](GUIDE.md) for how to actually get the most
-out of it - Guided Reading, the Feynman Check, contradiction/gap
-detection, and why sessions with more than one related paper unlock most
-of what's interesting.
+## Tech stack
 
-## Run the integrated app locally
+- Next.js frontend
+- FastAPI backend
+- Gemini through the Google GenAI SDK
+- Firestore for persistent research data
+- Cloud Storage for uploaded papers
+- Google Cloud Run for the backend
+- Vercel for the frontend
 
-Copy `.env.example` values into your shell, authenticate Application Default
-Credentials, then start the API:
+## Reproducible local setup
+
+### Prerequisites
+
+- Python 3.11 or newer
+- `uv`
+- Node.js and npm
+- Poppler, for PDF text extraction
+- Docker, if using the container setup below
+- Google Cloud CLI, if using Gemini, Firestore, or Cloud Storage locally
+
+On macOS, install Poppler with:
+
+```bash
+brew install poppler
+```
+
+### Backend
+
+Install the Python dependencies and copy the example environment file:
+
+```bash
+uv sync --extra dev
+cp .env.example .env
+```
+
+For the full application, replace the placeholder project and model values with
+your own configuration and authenticate with Google Application Default
+Credentials. The application initializes Firestore and Gemini at startup, so
+the running backend needs access to that Google Cloud project. Configure the
+Google Cloud CLI with your own project ID:
+
+```bash
+gcloud config set project YOUR_PROJECT_ID
+gcloud auth application-default login
+gcloud auth application-default set-quota-project YOUR_PROJECT_ID
+```
+
+Then start the API with:
 
 ```bash
 uv run uvicorn service.app:app --reload --port 8000
 ```
 
-Copy `frontend/.env.local.example` to `frontend/.env.local`, using the same
-`API_SHARED_SECRET`, then start Next.js in a second terminal:
+The backend health endpoint is available at `http://localhost:8000/health`.
+
+If you only want to run the tests, cloud credentials are not required.
+
+### Frontend
+
+In a second terminal:
 
 ```bash
 cd frontend
+cp .env.local.example .env.local
 npm install
 npm run dev
 ```
 
-Open `http://localhost:3000`. General chat, PDF ingestion, arXiv ingestion,
-guided visual paper walkthroughs, and paper-grounded chat all use the FastAPI service. PDF uploads are limited
-to 25 MiB and use a short-lived browser upload token; the permanent shared
-secret stays in the Next.js server process.
+Open `http://localhost:3000`.
 
-## Stack
-- Gemini chat and optional structured extraction via Vertex AI
-- Local chunk index for retrieval
-- networkx graph engine + optional Firestore persistence
-- Cloud Storage for private, durable source PDFs
-- Cloud Run-compatible backend (deployment remains operator-managed)
+The frontend example file contains placeholders only. Do not commit `.env`,
+`.env.local`, API keys, service-account files, or secret values. These values
+belong in local environment files or a managed secret store, not in source
+control.
 
-## Architecture
+### Docker backend
 
-See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the system diagram, the two
-core request flows (paper ingestion, chat), and why the concurrency
-locks exist.
-
-## Future adjustments
-
-See [`adjustments.md`](adjustments.md) for planned improvements, including
-future academic-paper discovery beyond the current arXiv search.
-
-## Deploy
-
-See [`service/DEPLOY.md`](service/DEPLOY.md) for the production configuration,
-cloud-resource, cost-control, security, and verification checklist. Deployment
-itself remains operator-managed.
-
-## Setup
-Install from `pyproject.toml` or `requirements.txt`. The local path does not
-require GCP credentials. Cloud deployment and optional Gemini/Firestore paths
-require a configured GCP project.
-
-For fully local OCR on macOS, install Tesseract (Poppler's `pdftoppm` is also
-required):
+Docker is an alternative to installing the backend dependencies directly. The
+Dockerfile packages the FastAPI service and its Poppler PDF dependency. Build
+the image from the repository root:
 
 ```bash
-brew install tesseract poppler
+docker build -t atlas-backend .
 ```
 
-For higher-quality local semantic embeddings:
+Run the backend using your local environment file:
 
 ```bash
-uv sync --extra local-semantic
+docker run --rm --name atlas-backend \
+  --env-file .env \
+  -p 8000:8080 \
+  atlas-backend
 ```
 
-`FastEmbedEmbedder` downloads its model on first use and then runs through
-ONNX Runtime locally. `LocalHashingEmbedder` remains the download-free default.
-
-## Cost controls
-
-- PDF text extraction, chunking, local retrieval, and networkx reads are free.
-- OCR runs only when embedded PDF text is unusable.
-- Structured model extraction is injected explicitly; the default extractor
-  returns chunks and makes no API calls.
-- Firestore writes occur only when a Firestore client is supplied.
-- The graph is populated only when entities or quoted relations exist.
-- Paid operations have persistent per-user limits and global daily ceilings,
-  enforced by the backend before Gemini is called.
-
-## Local retrieval
-
-```python
-from agent.extraction_agent import ExtractionAgent
-from agent.research_store import ResearchStore
-from agent.retrieval import ChunkIndex
-
-outcome = ExtractionAgent().extract_one("paper-1", "paper.pdf")
-index = ChunkIndex()
-ResearchStore(index).ingest(outcome.result)
-
-context = index.assemble_context(
-    "What were the main evaluation results?",
-    limit=3,
-    neighbor_window=1,
-)
-print(context.text)
-```
-
-`assemble_context` retrieves the strongest chunks, includes adjacent context,
-deduplicates overlaps, restores paper order, and renders paper/page/section
-labels. Its output can be shown directly or passed to an optional answer model.
-
-## Vertex structured extraction
-
-Vertex AI uses Application Default Credentials rather than an API key:
+If your local configuration uses Google Cloud services, the container also
+needs access to your Application Default Credentials. Mount them read-only
+when starting the container:
 
 ```bash
-gcloud auth application-default login
-gcloud auth application-default set-quota-project "$GOOGLE_CLOUD_PROJECT"
+docker run --rm --name atlas-backend \
+  --env-file .env \
+  -v ~/.config/gcloud:/root/.config/gcloud:ro \
+  -p 8000:8080 \
+  atlas-backend
 ```
 
-```python
-from agent.extraction_agent import ExtractionAgent
-from agent.gemini_extractor import GeminiStructuredExtractor
+Keep the credentials on the host. Do not copy them into the image or commit
+them to the repository. The frontend can continue running with `npm run dev`
+and will connect to the backend on port 8000.
 
-extractor = ExtractionAgent(
-    structured_extractor=GeminiStructuredExtractor(
-        project="all-things-agentic-hack",
-        location="global",
-    )
-)
-outcome = extractor.extract_one("paper-1", "paper.pdf")
+## Reproducible testing
+
+Run the backend test suite from the repository root:
+
+```bash
+uv run pytest
 ```
 
-The default model is `gemini-3.5-flash-lite` with thinking disabled and a
-2,048-token output cap. Calls are bounded by source-window and per-paper limits.
-Only relations with source quotes found in the supplied source window and valid
-ontology endpoint signatures are retained.
+Run only the query and retrieval tests when working on paper-grounded answers:
+
+```bash
+uv run pytest tests/test_query_agent.py tests/test_retrieval.py
+```
+
+Run the frontend type check and production build:
+
+```bash
+cd frontend
+npm run lint
+npm run build
+```
+
+The tests use local fakes and fixtures by default, so they do not require cloud credentials or paid model calls. Tests marked `live` require explicitly configured Google Cloud credentials and are skipped unless enabled by the test configuration.
+
+## Optional cloud-backed features
+
+Gemini, Firestore, Firebase Authentication, and Cloud Storage require
+credentials and project configuration. Use environment variables locally and
+Secret Manager in production. Never put credentials, API keys, service-account
+files, private project identifiers, or secret values in source control.
+
+## Project documentation
+
+- [`docs/GUIDE.md`](docs/GUIDE.md): user-facing feature guide
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): system architecture

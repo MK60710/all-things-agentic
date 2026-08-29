@@ -2,7 +2,7 @@
 
 Atlas is a FastAPI backend (`service/` + `agent/`) and a Next.js frontend
 (`frontend/`), talking to Firestore and Vertex AI (Gemini). The backend
-deploys to Cloud Run as a single container (see [`service/DEPLOY.md`](service/DEPLOY.md));
+deploys to Cloud Run as a single container;
 the frontend currently runs as a local Next.js dev server (`npm run dev`) -
 no cloud deployment target is configured for it yet.
 
@@ -123,13 +123,13 @@ the regression test that proves it.
 ## Deployment
 
 - **Backend**: single container, Cloud Run, `--min-instances=1
-  --max-instances=1` (required, not tuned - see `service/DEPLOY.md` for
-  why more than one instance would let sessions diverge). Auth is a
+  --max-instances=1` (required because more than one instance would let
+  sessions diverge). Auth is a
   shared-secret `X-API-Key` header, not full user auth - a cost gate on
   an otherwise-public URL.
 - **Frontend**: local Next.js dev server only, as of this diagram. Its
   `app/api/*` routes are a real security boundary even locally - they're
   the only place `API_SHARED_SECRET` ever exists outside the backend
   itself, so the browser never sees it.
-- **Data**: Firestore (project `all-things-agentic-hack`), same project
+- **Data**: Firestore in the configured Google Cloud project
   Vertex AI calls resolve against via Application Default Credentials.
