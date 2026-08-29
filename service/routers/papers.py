@@ -475,7 +475,7 @@ def upload_paper(
         already_member = existing is not None and session_id in _paper_session_ids(existing)
         if not already_member and _session_paper_count(state, session_id) >= MAX_SESSION_PAPERS:
             raise HTTPException(
-                status_code=409, detail=f"This session is limited to {MAX_SESSION_PAPERS} papers."
+                status_code=409, detail=f"The free plan allows only {MAX_SESSION_PAPERS} papers per session. Remove a paper before adding another."
             )
     consume_rate_limit(state, uid, "paper_ingest")
     upload_root = Path(state.upload_root).resolve()
@@ -511,7 +511,7 @@ def ingest_arxiv(
         already_member = existing is not None and body.session_id in _paper_session_ids(existing)
         if not already_member and _session_paper_count(state, body.session_id) >= MAX_SESSION_PAPERS:
             raise HTTPException(
-                status_code=409, detail=f"This session is limited to {MAX_SESSION_PAPERS} papers."
+                status_code=409, detail=f"The free plan allows only {MAX_SESSION_PAPERS} papers per session. Remove a paper before adding another."
             )
     consume_rate_limit(state, uid, "paper_ingest")
     upload_root = Path(state.upload_root).resolve()

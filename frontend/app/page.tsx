@@ -1753,6 +1753,7 @@ export default function Home() {
 
           {addMode === "upload" && <div className="upload-panel">
             <button className="back-button" onClick={() => setAddMode("choose")}>← Back</button>
+            {papers.length + stagedResults.length + stagedFiles.length >= MAX_SESSION_PAPERS && <p className="plan-limit-notice" role="alert">The free plan allows only {MAX_SESSION_PAPERS} papers per session. Remove a paper before adding another.</p>}
             <button className="drop-zone" onClick={() => fileInput.current?.click()} onDragOver={(event) => event.preventDefault()} onDrop={onDrop} disabled={papers.length + stagedResults.length + stagedFiles.length >= MAX_SESSION_PAPERS}>
               <span><Icon name="upload" size={25}/></span><strong>{papers.length + stagedResults.length + stagedFiles.length >= MAX_SESSION_PAPERS ? `Free plan limit: ${MAX_SESSION_PAPERS} papers per session` : `Choose up to ${MAX_SESSION_PAPERS} PDFs or drag them here`}</strong><small>Papers are staged below - nothing is read until you start the breakdown.</small>
             </button>
@@ -1762,6 +1763,7 @@ export default function Home() {
 
           {addMode === "search" && <div className="search-panel">
             <button className="back-button" onClick={() => setAddMode("choose")}>← Back</button>
+            {papers.length + stagedResults.length + stagedFiles.length >= MAX_SESSION_PAPERS && <p className="plan-limit-notice" role="alert">The free plan allows only {MAX_SESSION_PAPERS} papers per session. Remove a paper before adding another.</p>}
             <form onSubmit={runSearch}><Icon name="search" size={18}/><input autoFocus value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Search by title, author, or topic…"/><button disabled={searchQuery.trim().length < 2 || searching}>{searching ? "Searching…" : "Search"}</button></form>
             {searchError && <p className="form-error">{searchError}</p>}
             <div className="search-results">{searchResults.map((result) => {
