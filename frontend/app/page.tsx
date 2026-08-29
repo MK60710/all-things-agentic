@@ -218,7 +218,7 @@ const ATLAS_TOUR_STEPS: TourStep[] = [
   {
     target: ".welcome-icon",
     title: "Welcome to Atlas",
-    body: "A quick nine stop tour. Skip anytime.",
+    body: "A quick nine stop tour. Cancel anytime.",
     placement: "top",
     noHighlight: true,
   },
@@ -1543,8 +1543,8 @@ export default function Home() {
             disabled={papers.length === 0}
             title={papers.length === 0 ? "Add a paper to explore its graph" : "Explore this session's knowledge graph"}
             aria-label="Open graph explorer"
-          ><Icon name="graph" size={17}/></button>
-          <button className="paper-map-toggle" onClick={() => setPaperMapOpen(true)} disabled={papers.length < 2} title={papers.length < 2 ? "Add at least two papers to map connections" : "Map connections between this session's papers"} aria-label="Map paper connections"><Icon name="papersLink" size={15}/><span>Map papers <em>ALPHA</em></span></button>
+          ><Icon name="graph" size={17}/><em>ALPHA</em></button>
+          <button className="paper-map-toggle" onClick={() => setPaperMapOpen(true)} disabled={papers.length < 2} title={papers.length < 2 ? "Add at least two papers to map connections" : "Map connections between this session's papers"} aria-label="Map paper connections"><Icon name="papersLink" size={15}/><span>Map papers</span><em>ALPHA</em></button>
           <button className="tour-help-button" onClick={() => setTourOpen(true)} title="Replay the walkthrough" aria-label="Replay the walkthrough"><Icon name="help" size={17}/></button>
           <button className="add-paper-button" onClick={() => openAddPaper()}><Icon name="plus" size={17}/>{papers.length ? "Add another" : "Add paper"}</button>
           <div className="user-menu" ref={userMenuRef}>

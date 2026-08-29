@@ -108,7 +108,7 @@ export default function ConvergenceRitual({
 
   return (
     <div className={`convergence-stage${phase === "leaving" ? " leaving" : ""}`}>
-      <div className="convergence-corner"><button className="convergence-ghost" onClick={skip}>Skip</button></div>
+      <div className="convergence-corner"><button className="convergence-ghost" onClick={skip}>Cancel</button></div>
 
       <div className="convergence-star-anchor">
         <div className="convergence-halo"/>

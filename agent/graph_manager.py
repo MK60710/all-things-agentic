@@ -157,6 +157,9 @@ class SessionGraphEdge:
     source_id: str
     target_id: str
     relation: str
+    source_paper_id: str | None = None
+    source_section: str | None = None
+    source_quote: str = ""
 
 
 @dataclass
@@ -620,6 +623,9 @@ class GraphManager:
                         source_id=source_id,
                         target_id=target_id,
                         relation=data.get("type", "UNKNOWN"),
+                        source_paper_id=data.get("source_paper_id"),
+                        source_section=data.get("source_section"),
+                        source_quote=data.get("source_quote") or "",
                     )
                 )
                 paper_id = data.get("source_paper_id")
@@ -663,6 +669,10 @@ class GraphManager:
 
     def _stable_paper_node_id(self, paper_id: str) -> str:
         return str(uuid.uuid5(uuid.NAMESPACE_URL, f"paper:{paper_id}"))
+
+    def paper_node_id(self, paper_id: str) -> str:
+        """Return the deterministic graph node ID for a stored paper ID."""
+        return self._stable_paper_node_id(paper_id)
 
     def _stable_edge_id(
         self,
@@ -986,6 +996,43 @@ class GraphManager:
 
         edge_writes: list[EdgeWriteResult] = []
         skipped_relations = 0
+
+        # Keep every extracted entity connected to its source paper so the
+        # graph represents the full paper context, including models,
+        # benchmarks, metrics, and concepts found in the source.
+        for node_id in set(entity_to_node_id.values()):
+            if node_id == paper_node.id:
+                continue
+            edge_id = self._stable_edge_id(
+                extraction.paper_id,
+                paper_node.id,
+                node_id,
+                EdgeType.MENTIONS,
+                "",
+            )
+            self.add_edge(
+                Edge(
+                    id=edge_id,
+                    source_id=paper_node.id,
+                    target_id=node_id,
+                    type=EdgeType.MENTIONS,
+                    provenance=ProvenanceTag.INFERRED,
+                    source_paper_id=extraction.paper_id,
+                    source_section=None,
+                    source_quote=None,
+                    session_id=session_id,
+                    owner_uid=owner_uid,
+                )
+            )
+            edge_writes.append(
+                EdgeWriteResult(
+                    relation=EdgeType.MENTIONS.value,
+                    edge_id=edge_id,
+                    source_id=paper_node.id,
+                    target_id=node_id,
+                )
+            )
+
         for relation in extraction.relations:
             try:
                 source_id = self._resolve_relation_endpoint(

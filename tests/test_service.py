@@ -247,6 +247,62 @@ def test_session_graph_endpoint_404s_for_unknown_session(client):
     assert response.status_code == 404
 
 
+def test_paper_map_finds_indirect_neighbor_path(client, app_state):
+    created = client.post("/sessions", json={"name": "Indirect paper map"}).json()
+    session_id = created["id"]
+    app_state.paper_store.save(
+        "paper-a", title="Paper A", status="ready", session_id=session_id, owner_uid=TEST_UID
+    )
+    app_state.paper_store.save(
+        "paper-b", title="Paper B", status="ready", session_id=session_id, owner_uid=TEST_UID
+    )
+
+    paper_a_node = Node(
+        id=app_state.graph.paper_node_id("paper-a"), type=NodeType.PAPER,
+        name="Paper A", session_id=session_id, owner_uid=TEST_UID,
+    )
+    paper_b_node = Node(
+        id=app_state.graph.paper_node_id("paper-b"), type=NodeType.PAPER,
+        name="Paper B", session_id=session_id, owner_uid=TEST_UID,
+    )
+    method = Node(
+        id="method-a", type=NodeType.METHOD, name="Method A",
+        session_id=session_id, owner_uid=TEST_UID,
+    )
+    concept = Node(
+        id="concept-b", type=NodeType.CONCEPT, name="Concept B",
+        session_id=session_id, owner_uid=TEST_UID,
+    )
+    for node in (paper_a_node, paper_b_node, method, concept):
+        app_state.graph.add_node(node)
+
+    app_state.graph.add_edge(Edge(
+        id="paper-a-method", source_id=paper_a_node.id, target_id=method.id,
+        type=EdgeType.MENTIONS, provenance=ProvenanceTag.INFERRED,
+        source_paper_id="paper-a", session_id=session_id, owner_uid=TEST_UID,
+    ))
+    app_state.graph.add_edge(Edge(
+        id="method-concept", source_id=method.id, target_id=concept.id,
+        type=EdgeType.SUPPORTS, provenance=ProvenanceTag.INFERRED,
+        session_id=session_id, owner_uid=TEST_UID,
+    ))
+    app_state.graph.add_edge(Edge(
+        id="paper-b-concept", source_id=paper_b_node.id, target_id=concept.id,
+        type=EdgeType.MENTIONS, provenance=ProvenanceTag.INFERRED,
+        source_paper_id="paper-b", session_id=session_id, owner_uid=TEST_UID,
+    ))
+
+    response = client.get(f"/sessions/{session_id}/paper-map")
+
+    assert response.status_code == 200
+    connections = response.json()["connections"]
+    assert len(connections) == 1
+    assert connections[0]["paper_a_id"] == "paper-a"
+    assert connections[0]["paper_b_id"] == "paper-b"
+    assert "Indirect graph connection" in connections[0]["summary"]
+    assert connections[0]["shared_topics"] == ["Method A", "Concept B"]
+
+
 def test_bibliography_endpoint_returns_real_bibtex_for_the_sessions_papers(client, app_state):
     created = client.post("/sessions", json={"name": "Bib session"}).json()
     session_id = created["id"]
@@ -609,10 +665,11 @@ def test_papers_upload_returns_the_real_graph_writes_for_the_build_animation(
 
     assert response.status_code == 200
     data = response.json()
-    assert len(data["new_nodes"]) == 1
-    assert data["new_nodes"][0]["name"] == "GraphRAG"
-    assert data["new_nodes"][0]["type"] == "METHOD"
-    assert data["new_edges"] == []
+    assert {node["name"] for node in data["new_nodes"]} == {"GraphRAG", "paper"}
+    graph_node = next(node for node in data["new_nodes"] if node["name"] == "GraphRAG")
+    assert graph_node["type"] == "METHOD"
+    assert len(data["new_edges"]) == 1
+    assert data["new_edges"][0]["relation"] == "MENTIONS"
 
 
 def test_papers_upload_backfills_implicit_relation_endpoint_nodes(
@@ -724,9 +781,9 @@ def test_papers_upload_auto_merges_a_bare_abbreviation_without_asking(
     assert response.status_code == 200
     data = response.json()
     assert data["pending_clarification_count"] == 0
-    assert len(data["new_nodes"]) == 1
-    assert data["new_nodes"][0]["node_id"] == existing.id
-    assert data["new_nodes"][0]["reused_existing_node"] is True
+    concept_node = next(node for node in data["new_nodes"] if node["node_id"] == existing.id)
+    assert concept_node["reused_existing_node"] is True
+    assert any(edge["relation"] == "MENTIONS" for edge in data["new_edges"])
 
 
 def test_papers_upload_and_ingest(client):

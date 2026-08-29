@@ -3,7 +3,7 @@
 // Graph Explorer both key off the same NodeType strings, so a color
 // change here doesn't drift between the two).
 export const TYPE_COLORS: Record<string, string> = {
-  PAPER: "#2d283c",
+  PAPER: "#e2a84b",
   CONCEPT: "#6658d5",
   METHOD: "#347eaa",
   MODEL: "#a34f3e",
@@ -39,6 +39,7 @@ export const RELATION_PHRASES: Record<string, string> = {
   SAME_AS: "is the same as",
   SUPPORTS: "supports",
   CONTRADICTS: "disagrees with",
+  MENTIONS: "is associated with",
 };
 
 export function relationPhrase(relation: string): string {
