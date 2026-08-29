@@ -54,7 +54,7 @@ export default function AuthProvider({ children }: { children: ReactNode }) {
       <div className="auth-gate">
         <div className="auth-gate-icon">
           <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6">
-            <path d="M4 19.5V5a2 2 0 0 1 2-2h13v15H6a2 2 0 0 0 0 4h13" />
+            <circle cx="12" cy="12" r="3"/><path d="M12 3v6M12 15v6M3 12h6M15 12h6M5.6 5.6l4.2 4.2M14.2 14.2l4.2 4.2M18.4 5.6l-4.2 4.2M9.8 14.2l-4.2 4.2"/>
           </svg>
         </div>
         <h1>Atlas</h1>

@@ -33,7 +33,7 @@ import Tour, { TourStep } from "./Tour";
 import PaperMap from "./PaperMap";
 import { useAuth } from "./AuthProvider";
 
-type IconName = "atlas" | "plus" | "send" | "paper" | "search" | "upload" | "close" | "quote" | "check" | "globe" | "thumbUp" | "thumbDown" | "rename" | "graph" | "help" | "quiz" | "book" | "menu" | "papersLink";
+type IconName = "atlas" | "plus" | "send" | "paper" | "search" | "upload" | "close" | "quote" | "check" | "globe" | "thumbUp" | "thumbDown" | "rename" | "graph" | "help" | "quiz" | "book" | "menu" | "papersLink" | "chevronDown";
 type AddMode = "choose" | "upload" | "search";
 
 interface Message {
@@ -188,6 +188,7 @@ function ingestStageLabel(stage: string | undefined): string {
 
 const icons: Record<IconName, React.ReactNode> = {
   atlas: <><circle cx="12" cy="12" r="3"/><path d="M12 3v6M12 15v6M3 12h6M15 12h6M5.6 5.6l4.2 4.2M14.2 14.2l4.2 4.2M18.4 5.6l-4.2 4.2M9.8 14.2l-4.2 4.2"/></>,
+  chevronDown: <path d="M6 9l6 6 6-6"/>,
   plus: <path d="M12 5v14M5 12h14"/>,
   send: <><path d="M22 2L9.5 14.5M22 2l-8 20-4.5-7.5L2 10z"/></>,
   paper: <><path d="M6 3h9l4 4v14H6z"/><path d="M15 3v5h5M9 12h7M9 16h7"/></>,
@@ -217,13 +218,6 @@ function Icon({ name, size = 19 }: { name: IconName; size?: number }) {
 }
 
 const ATLAS_TOUR_STEPS: TourStep[] = [
-  {
-    target: ".welcome-icon",
-    title: "Welcome to Atlas",
-    body: "A quick nine stop tour. Cancel anytime.",
-    placement: "top",
-    noHighlight: true,
-  },
   {
     target: ".add-paper-button",
     title: "Add a paper",
@@ -543,6 +537,7 @@ function FeynmanCheck({ paperId, sessionId, onViewNodeInGraph }: { paperId: stri
 export default function Home() {
   const { user, signOut } = useAuth();
   const [userMenuOpen, setUserMenuOpen] = useState(false);
+  const [papersMenuOpen, setPapersMenuOpen] = useState(false);
   // Reflects whatever's actually showing right now (an explicit choice, or
   // the system default when none was ever made) - not just "did the user
   // pick something." layout.tsx's inline blocking script already applied
@@ -766,12 +761,13 @@ export default function Home() {
   }, []);
   const sessionSwitcherRef = useRef<HTMLDivElement | null>(null);
   const userMenuRef = useRef<HTMLDivElement | null>(null);
+  const papersMenuRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     // graphExplorerOpen was missing here - confirmed live that Escape did
     // nothing while Graph Explorer was open, inconsistent with every other
     // modal in the app (the Add Paper dialog, the session switcher) which
     // this same handler already closes.
-    if (!sessionMenuOpen && !addOpen && !graphExplorerOpen && !createSessionOpen && !userMenuOpen) return;
+    if (!sessionMenuOpen && !addOpen && !graphExplorerOpen && !createSessionOpen && !userMenuOpen && !papersMenuOpen) return;
     function onKeyDown(event: KeyboardEvent) {
       if (event.key !== "Escape") return;
       setSessionMenuOpen(false);
@@ -779,10 +775,11 @@ export default function Home() {
       setGraphExplorerOpen(false);
       setCreateSessionOpen(false);
       setUserMenuOpen(false);
+      setPapersMenuOpen(false);
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [sessionMenuOpen, addOpen, graphExplorerOpen, createSessionOpen, userMenuOpen]);
+  }, [sessionMenuOpen, addOpen, graphExplorerOpen, createSessionOpen, userMenuOpen, papersMenuOpen]);
   useEffect(() => {
     // Neither modal had a focus trap - confirmed live: tabbing past
     // Cancel escaped the dialog entirely into background page elements
@@ -831,6 +828,15 @@ export default function Home() {
     document.addEventListener("mousedown", onMouseDown);
     return () => document.removeEventListener("mousedown", onMouseDown);
   }, [userMenuOpen]);
+  useEffect(() => {
+    if (!papersMenuOpen) return;
+    function onMouseDown(event: MouseEvent) {
+      if (papersMenuRef.current?.contains(event.target as Node)) return;
+      setPapersMenuOpen(false);
+    }
+    document.addEventListener("mousedown", onMouseDown);
+    return () => document.removeEventListener("mousedown", onMouseDown);
+  }, [papersMenuOpen]);
 
   async function initSession() {
     let resolved: SessionMetadata | null = null;
@@ -1565,8 +1571,15 @@ export default function Home() {
         <button className="app-sidebar-toggle" onClick={toggleSidebar} title={sidebarCollapsed ? "Show sessions" : "Hide sessions"} aria-label="Toggle sessions"><Icon name="menu" size={19}/></button>
         <div className={`mode-label ${papers.length ? "paper-mode" : ""}`}>
           {papers.length > 0 ? (
-            <div className="paper-chip-row">
-              {papers.map((p) => <span key={p.id} className="paper-chip"><Icon name="paper" size={12}/><strong>{p.title}</strong><button className="paper-chip-deep-dive" onClick={() => window.location.assign(`/deep-dive/${encodeURIComponent(p.id)}?session_id=${encodeURIComponent(currentSession?.id ?? "local")}`)} aria-label={`Open deeper dive for ${p.title}`} title="Open deeper dive"><Icon name="book" size={11}/></button><button onClick={() => removePaperFromSet(p.id)} aria-label={`Remove ${p.title}`}><Icon name="close" size={11}/></button></span>)}
+            <div className="papers-menu" ref={papersMenuRef}>
+              <button className="papers-menu-toggle" onClick={() => setPapersMenuOpen((open) => !open)} aria-label="Papers in this session" aria-expanded={papersMenuOpen}>
+                <Icon name="paper" size={13}/><strong>{papers.length} {papers.length === 1 ? "paper" : "papers"}</strong><Icon name="chevronDown" size={11}/>
+              </button>
+              {papersMenuOpen && (
+                <div className="papers-menu-panel">
+                  {papers.map((p) => <div key={p.id} className="paper-chip"><Icon name="paper" size={12}/><strong>{p.title}</strong><button className="paper-chip-deep-dive" onClick={() => window.location.assign(`/deep-dive/${encodeURIComponent(p.id)}?session_id=${encodeURIComponent(currentSession?.id ?? "local")}`)} aria-label={`Open deeper dive for ${p.title}`} title="Open deeper dive"><Icon name="book" size={11}/></button><button onClick={() => removePaperFromSet(p.id)} aria-label={`Remove ${p.title}`}><Icon name="close" size={11}/></button></div>)}
+                </div>
+              )}
             </div>
           ) : <><span className="online-dot"/><strong>General chat</strong><small>Atlas</small></>}
         </div>
