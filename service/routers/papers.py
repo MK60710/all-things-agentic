@@ -12,10 +12,10 @@ from pathlib import Path
 
 import requests
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 
 from service.auth import get_current_user
-from service.deps import get_state, require_api_key
+from service.deps import consume_rate_limit, get_state, require_api_key
 from service.schemas import (
     ArxivIngestRequest,
     DeepDiveResponse,
@@ -49,7 +49,7 @@ _ARXIV_ID = re.compile(
 # app's single-instance concurrency profile" tolerance already documented
 # on GraphManager.apply_extraction_result's own race, not a banking-grade
 # guarantee.
-MAX_SESSION_PAPERS = 5
+MAX_SESSION_PAPERS = 3
 
 
 def _session_paper_count(state: AppState, session_id: str) -> int:
@@ -225,6 +225,20 @@ def _ingest(
     # Extraction is a background operation. It must not interrupt the user
     # with alias-review questions; ambiguous matches remain separate and are
     # recorded in the logs for later automated canonicalization.
+    try:
+        source_object = state.document_store.persist(paper_id, path)
+    except Exception as exc:
+        logger.exception("paper_source_persist_failed paper_id=%s", paper_id)
+        state.paper_store.save(
+            paper_id,
+            **metadata,
+            status="failed",
+            error="could not store the paper source",
+            session_id=session_id,
+            owner_uid=owner_uid,
+        )
+        raise HTTPException(status_code=503, detail="could not store the paper source") from exc
+
     report = state.research_store.ingest(
         outcome.result,
         paper_name=title,
@@ -245,6 +259,7 @@ def _ingest(
         session_id=session_id,
         guide=guide_payload,
         owner_uid=owner_uid,
+        source_object=source_object,
     )
     logger.info(
         "ingest_ready paper_id=%s session_id=%s entities=%d relations=%d guide=%s duration_ms=%d",
@@ -382,16 +397,21 @@ def get_paper_status(
 @router.get("/{paper_id}/source", dependencies=[Depends(require_api_key)])
 def get_paper_source(
     paper_id: str, state: AppState = Depends(get_state), uid: str = Depends(get_current_user)
-) -> FileResponse:
+) -> Response:
     """Serve the session's stored PDF so graph/map paper links work for uploads."""
     paper = _owned_paper(state, paper_id, uid)
     if paper is None:
         raise HTTPException(status_code=404, detail="paper not found")
-    root = Path(state.upload_root).resolve()
-    path = (root / f"{_sanitize_paper_id(paper_id)}.pdf").resolve()
-    if not path.is_relative_to(root) or not path.is_file():
+    object_key = paper.get("source_object") or f"{_sanitize_paper_id(paper_id)}.pdf"
+    try:
+        content = state.document_store.read(str(object_key))
+    except FileNotFoundError:
         raise HTTPException(status_code=404, detail="paper source is not available")
-    return FileResponse(path, media_type="application/pdf", filename=f"{paper_id}.pdf")
+    return Response(
+        content=content,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{_sanitize_paper_id(paper_id)}.pdf"'},
+    )
 
 
 @router.post(
@@ -455,8 +475,9 @@ def upload_paper(
         already_member = existing is not None and session_id in _paper_session_ids(existing)
         if not already_member and _session_paper_count(state, session_id) >= MAX_SESSION_PAPERS:
             raise HTTPException(
-                status_code=409, detail=f"This session is limited to {MAX_SESSION_PAPERS} papers."
+                status_code=409, detail=f"The free plan allows only {MAX_SESSION_PAPERS} papers per session. Remove a paper before adding another."
             )
+    consume_rate_limit(state, uid, "paper_ingest")
     upload_root = Path(state.upload_root).resolve()
     dest = (upload_root / f"{pid}.pdf").resolve()
     if not dest.is_relative_to(upload_root):
@@ -490,8 +511,9 @@ def ingest_arxiv(
         already_member = existing is not None and body.session_id in _paper_session_ids(existing)
         if not already_member and _session_paper_count(state, body.session_id) >= MAX_SESSION_PAPERS:
             raise HTTPException(
-                status_code=409, detail=f"This session is limited to {MAX_SESSION_PAPERS} papers."
+                status_code=409, detail=f"The free plan allows only {MAX_SESSION_PAPERS} papers per session. Remove a paper before adding another."
             )
+    consume_rate_limit(state, uid, "paper_ingest")
     upload_root = Path(state.upload_root).resolve()
     dest = (upload_root / f"{pid}.pdf").resolve()
     if not dest.is_relative_to(upload_root):
@@ -554,6 +576,7 @@ def create_paper_guide(
         raise HTTPException(status_code=404, detail="paper has no indexed content")
     if metadata and isinstance(metadata.get("guide"), dict):
         return PaperGuide.model_validate(metadata["guide"])
+    consume_rate_limit(state, uid, "guide")
     title = str((metadata or {}).get("title") or paper_id)
     guide = state.paper_guide.generate(title, chunks)
     # owner_uid re-passed explicitly, not left to merge=True alone - same
@@ -587,6 +610,7 @@ def get_paper_deep_dive(
     if isinstance(metadata.get("guide"), dict):
         guide = PaperGuide.model_validate(metadata["guide"])
     else:
+        consume_rate_limit(state, uid, "guide")
         guide = state.paper_guide.generate(str(metadata.get("title") or paper_id), chunks)
         state.paper_store.save(paper_id, guide=guide.model_dump(mode="json"), owner_uid=metadata.get("owner_uid"))
 

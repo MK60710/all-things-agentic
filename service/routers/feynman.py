@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 
 from agent.feynman_checker import FeynmanCheckResult, FeynmanPrompt
 from service.auth import get_current_user
-from service.deps import get_state, require_api_key
+from service.deps import consume_rate_limit, get_state, require_api_key
 from service.state import AppState
 
 router = APIRouter(prefix="/papers", tags=["feynman"], dependencies=[Depends(require_api_key)])
@@ -55,6 +55,7 @@ def check_feynman_explanation(
     _check_session_owned(state, body.session_id, uid)
     if state.paper_store.get(paper_id) is None:
         raise HTTPException(status_code=404, detail=f"no paper {paper_id!r}")
+    consume_rate_limit(state, uid, "feynman")
     result = state.feynman_checker.check(
         body.node_id, body.explanation, paper_id=paper_id, session_id=body.session_id
     )

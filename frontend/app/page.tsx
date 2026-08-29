@@ -10,6 +10,7 @@ import {
   deleteSession,
   detachPaper,
   getFeynmanPrompts,
+  getUsageStatus,
   getPaperStatus,
   getSessionMessages,
   ingestArxivPaper,
@@ -22,6 +23,7 @@ import {
   saveSessionMessages,
   searchPapers,
   uploadPaper,
+  RateLimitError,
 } from "@/lib/api";
 import type { ChatHistoryItem, PaperContext, PaperIngestResult, PaperSearchResult, SessionMetadata } from "@/lib/api";
 import type { Citation, FeynmanCheckResult, FeynmanPrompt, GapCandidate, PaperGuide, PendingQuestion, QueryResponse } from "@/lib/types";
@@ -218,7 +220,7 @@ const ATLAS_TOUR_STEPS: TourStep[] = [
   {
     target: ".welcome-icon",
     title: "Welcome to Atlas",
-    body: "A quick nine stop tour. Skip anytime.",
+    body: "A quick nine stop tour. Cancel anytime.",
     placement: "top",
     noHighlight: true,
   },
@@ -273,7 +275,7 @@ const ATLAS_TOUR_STEPS: TourStep[] = [
 ];
 
 const FLOW_REVEAL_INTERVAL_MS = 200;
-const MAX_SESSION_PAPERS = 5;
+const MAX_SESSION_PAPERS = 3;
 
 function FlowDiagram({ guide }: { guide: NonNullable<PaperGuide["sections"][number]["diagram"]> }) {
   // Builds itself in node-by-node on a timer instead of rendering every
@@ -592,6 +594,8 @@ export default function Home() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
+  const [chatBlockedUntil, setChatBlockedUntil] = useState<number | null>(null);
+  const [chatLimitScope, setChatLimitScope] = useState<"user" | "global">("user");
   const [papers, setPapers] = useState<PaperContext[]>([]);
   const [addOpen, setAddOpen] = useState(false);
   const [addMode, setAddMode] = useState<AddMode>("choose");
@@ -664,6 +668,28 @@ export default function Home() {
   const [currentSession, setCurrentSession] = useState<SessionMetadata | null>(null);
   const [sessions, setSessions] = useState<SessionMetadata[]>([]);
   const [sessionMenuOpen, setSessionMenuOpen] = useState(false);
+
+  function applyChatUsage(status: Awaited<ReturnType<typeof getUsageStatus>>) {
+    if (status.chat.allowed) {
+      setChatBlockedUntil(null);
+      setChatLimitScope("user");
+      return;
+    }
+    setChatLimitScope(status.chat.scope === "global" ? "global" : "user");
+    const reset = status.chat.reset_at ? Date.parse(status.chat.reset_at) : Date.now() + status.chat.retry_after * 1000;
+    setChatBlockedUntil(Number.isFinite(reset) ? reset : Date.now() + 60_000);
+  }
+
+  useEffect(() => {
+    void getUsageStatus().then(applyChatUsage).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (!chatBlockedUntil) return;
+    const delay = Math.max(0, chatBlockedUntil - Date.now());
+    const timer = window.setTimeout(() => setChatBlockedUntil(null), delay);
+    return () => window.clearTimeout(timer);
+  }, [chatBlockedUntil]);
 
   useEffect(() => { chatEnd.current?.scrollIntoView({ behavior: "smooth" }); }, [messages, loading]);
   // Conversation history is persisted server-side (Firestore) so it
@@ -1144,7 +1170,7 @@ export default function Home() {
   async function ask(event?: FormEvent, suggested = query, papersOverride?: PaperContext[] | null, nodeId?: string) {
     event?.preventDefault();
     const question = suggested.trim();
-    if (!question || loading) return;
+    if (!question || loading || (chatBlockedUntil !== null && chatBlockedUntil > Date.now())) return;
     const effectivePapers = papersOverride === undefined ? papers : papersOverride;
 
     const history: ChatHistoryItem[] = messages
@@ -1171,7 +1197,12 @@ export default function Home() {
         candidates: response.candidates,
         clarificationQuestionId: response.clarification_question_id,
       }]);
+      void getUsageStatus().then(applyChatUsage).catch(() => {});
     } catch (error) {
+      if (error instanceof RateLimitError) {
+        setChatBlockedUntil(Date.now() + Math.max(1, error.retryAfter) * 1000);
+        setChatLimitScope(error.scope);
+      }
       setMessages((current) => [...current, {
         id: crypto.randomUUID(),
         role: "assistant",
@@ -1210,13 +1241,13 @@ export default function Home() {
     const committed = papers.length + stagedResults.length + stagedFiles.length;
     const slots = MAX_SESSION_PAPERS - committed;
     if (slots <= 0) {
-      setUploadError(`This session is limited to ${MAX_SESSION_PAPERS} papers.`);
+      setUploadError(`The free plan allows only ${MAX_SESSION_PAPERS} papers per session. Remove a paper before adding another.`);
       return;
     }
     const pdfFiles = files.filter((file) => file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf"));
     const validFiles = pdfFiles.slice(0, slots);
     const notices: string[] = [];
-    if (files.length > slots) notices.push(`You can add up to ${MAX_SESSION_PAPERS} papers per session; only the first ${slots} file${slots === 1 ? "" : "s"} will be staged.`);
+    if (files.length > slots) notices.push(`The free plan allows only ${MAX_SESSION_PAPERS} papers per session; only the first ${slots} file${slots === 1 ? "" : "s"} will be staged.`);
     if (validFiles.length !== files.length && files.length <= slots) notices.push("Only PDF files were included; other files were skipped.");
     if (validFiles.length === 0) {
       setUploadError(notices.join(" ") || "Please choose PDF files.");
@@ -1426,6 +1457,16 @@ export default function Home() {
     }
   }
 
+  function stageSearchResult(result: PaperSearchResult) {
+    const total = papers.length + stagedResults.length + stagedFiles.length;
+    if (total >= MAX_SESSION_PAPERS) {
+      setSearchError(`The free plan allows only ${MAX_SESSION_PAPERS} papers per session. Remove a paper before adding another.`);
+      return;
+    }
+    setSearchError("");
+    setStagedResults((current) => current.some((staged) => staged.id === result.id) ? current : [...current, result]);
+  }
+
   function onDrop(event: DragEvent<HTMLButtonElement>) {
     event.preventDefault();
     stageFiles(Array.from(event.dataTransfer.files ?? []));
@@ -1543,8 +1584,8 @@ export default function Home() {
             disabled={papers.length === 0}
             title={papers.length === 0 ? "Add a paper to explore its graph" : "Explore this session's knowledge graph"}
             aria-label="Open graph explorer"
-          ><Icon name="graph" size={17}/></button>
-          <button className="paper-map-toggle" onClick={() => setPaperMapOpen(true)} disabled={papers.length < 2} title={papers.length < 2 ? "Add at least two papers to map connections" : "Map connections between this session's papers"} aria-label="Map paper connections"><Icon name="papersLink" size={15}/><span>Map papers <em>ALPHA</em></span></button>
+          ><Icon name="graph" size={17}/><em>ALPHA</em></button>
+          <button className="paper-map-toggle" onClick={() => setPaperMapOpen(true)} disabled={papers.length < 2} title={papers.length < 2 ? "Add at least two papers to map connections" : "Map connections between this session's papers"} aria-label="Map paper connections"><Icon name="papersLink" size={15}/><span>Map papers</span><em>ALPHA</em></button>
           <button className="tour-help-button" onClick={() => setTourOpen(true)} title="Replay the walkthrough" aria-label="Replay the walkthrough"><Icon name="help" size={17}/></button>
           <button className="add-paper-button" onClick={() => openAddPaper()}><Icon name="plus" size={17}/>{papers.length ? "Add another" : "Add paper"}</button>
           <div className="user-menu" ref={userMenuRef}>
@@ -1691,12 +1732,13 @@ export default function Home() {
 
       <footer className="composer-area">
         {papers.length > 0 && <div className="paper-context-chip"><Icon name="paper" size={14}/><span>Using <strong>{papers.length === 1 ? papers[0].title : `${papers.length} papers`}</strong></span></div>}
+        {chatBlockedUntil !== null && chatBlockedUntil > Date.now() && <div className="quota-notice" role="status" aria-live="polite">{chatLimitScope === "global" ? "Atlas is temporarily unavailable while we reset the app's safety budget." : `Your free chat limit has been reached. You can prompt Atlas again after ${new Date(chatBlockedUntil).toLocaleString()}.`}</div>}
         <form className="composer" onSubmit={(event) => ask(event)}>
           <button type="button" className="composer-add" onClick={() => openAddPaper()} aria-label="Add a paper"><Icon name="plus" size={19}/></button>
-          <textarea ref={composerInput} value={query} maxLength={8000} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void ask(); } }} rows={1} placeholder={papers.length ? "Ask anything about these papers…" : "Message Atlas…"}/>
-          <button type="submit" className="send-button" disabled={!query.trim() || loading} aria-label="Send"><Icon name="send" size={18}/></button>
+          <textarea ref={composerInput} value={query} maxLength={8000} disabled={chatBlockedUntil !== null && chatBlockedUntil > Date.now()} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void ask(); } }} rows={1} placeholder={chatBlockedUntil !== null && chatBlockedUntil > Date.now() ? "Free chat limit reached. Try again after the limit resets." : papers.length ? "Ask anything about these papers…" : "Message Atlas…"}/>
+          <button type="submit" className="send-button" disabled={!query.trim() || loading || (chatBlockedUntil !== null && chatBlockedUntil > Date.now())} aria-label="Send"><Icon name="send" size={18}/></button>
         </form>
-        <small className="composer-hint">Atlas can make mistakes. Paper answers include sources when available.</small>
+        <small className="composer-hint">{chatBlockedUntil !== null && chatBlockedUntil > Date.now() ? `Free chat limit reached. Available again ${new Date(chatBlockedUntil).toLocaleString()}.` : "Atlas can make mistakes. Paper answers include sources when available."}</small>
       </footer>
 
       {addOpen && <div className="add-modal" role="dialog" aria-modal="true" aria-label="Add a research paper">
@@ -1711,8 +1753,9 @@ export default function Home() {
 
           {addMode === "upload" && <div className="upload-panel">
             <button className="back-button" onClick={() => setAddMode("choose")}>← Back</button>
+            {papers.length + stagedResults.length + stagedFiles.length >= MAX_SESSION_PAPERS && <p className="plan-limit-notice" role="alert">The free plan allows only {MAX_SESSION_PAPERS} papers per session. Remove a paper before adding another.</p>}
             <button className="drop-zone" onClick={() => fileInput.current?.click()} onDragOver={(event) => event.preventDefault()} onDrop={onDrop} disabled={papers.length + stagedResults.length + stagedFiles.length >= MAX_SESSION_PAPERS}>
-              <span><Icon name="upload" size={25}/></span><strong>{papers.length + stagedResults.length + stagedFiles.length >= MAX_SESSION_PAPERS ? `${MAX_SESSION_PAPERS}-paper limit reached` : `Choose up to ${MAX_SESSION_PAPERS} PDFs or drag them here`}</strong><small>Papers are staged below - nothing is read until you start the breakdown.</small>
+              <span><Icon name="upload" size={25}/></span><strong>{papers.length + stagedResults.length + stagedFiles.length >= MAX_SESSION_PAPERS ? `Free plan limit: ${MAX_SESSION_PAPERS} papers per session` : `Choose up to ${MAX_SESSION_PAPERS} PDFs or drag them here`}</strong><small>Papers are staged below - nothing is read until you start the breakdown.</small>
             </button>
             <input ref={fileInput} className="hidden-input" type="file" accept="application/pdf,.pdf" multiple disabled={papers.length + stagedResults.length + stagedFiles.length >= MAX_SESSION_PAPERS} onChange={(event: ChangeEvent<HTMLInputElement>) => { stageFiles(Array.from(event.target.files ?? [])); event.target.value = ""; }}/>
             {uploadError && <p className="form-error">{uploadError}</p>}
@@ -1720,15 +1763,15 @@ export default function Home() {
 
           {addMode === "search" && <div className="search-panel">
             <button className="back-button" onClick={() => setAddMode("choose")}>← Back</button>
+            {papers.length + stagedResults.length + stagedFiles.length >= MAX_SESSION_PAPERS && <p className="plan-limit-notice" role="alert">The free plan allows only {MAX_SESSION_PAPERS} papers per session. Remove a paper before adding another.</p>}
             <form onSubmit={runSearch}><Icon name="search" size={18}/><input autoFocus value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Search by title, author, or topic…"/><button disabled={searchQuery.trim().length < 2 || searching}>{searching ? "Searching…" : "Search"}</button></form>
             {searchError && <p className="form-error">{searchError}</p>}
             <div className="search-results">{searchResults.map((result) => {
               const isStaged = stagedResults.some((staged) => staged.id === result.id);
-              const atLimit = papers.length + stagedResults.length + stagedFiles.length >= MAX_SESSION_PAPERS;
               return <article key={result.id}><div><span>arXiv</span><small>{result.published}</small></div><h3>{result.title}</h3><p>{result.authors}</p>
                 {isStaged
-                  ? <button className="staged-toggle" onClick={() => setStagedResults((current) => current.filter((staged) => staged.id !== result.id))}><Icon name="check" size={13}/>Added - remove</button>
-                  : <button onClick={() => setStagedResults((current) => [...current, result])} disabled={atLimit}>Add to list</button>}
+                  ? <button type="button" className="staged-toggle" onClick={() => setStagedResults((current) => current.filter((staged) => staged.id !== result.id))}><Icon name="check" size={13}/>Added - remove</button>
+                  : <button type="button" onClick={() => stageSearchResult(result)}>Add to list</button>}
               </article>;
             })}</div>
           </div>}
@@ -1739,7 +1782,7 @@ export default function Home() {
               {stagedResults.map((result) => <li key={result.id}><span>{result.title}</span><button onClick={() => setStagedResults((current) => current.filter((staged) => staged.id !== result.id))} aria-label={`Remove ${result.title}`}><Icon name="close" size={11}/></button></li>)}
               {stagedFiles.map((file, index) => <li key={`${file.name}-${index}`}><span>{file.name}</span><button onClick={() => setStagedFiles((current) => current.filter((_, i) => i !== index))} aria-label={`Remove ${file.name}`}><Icon name="close" size={11}/></button></li>)}
             </ul>
-            <button className="start-breakdown-button" onClick={startBreakdown}>Start breaking down {stagedResults.length + stagedFiles.length} paper{stagedResults.length + stagedFiles.length === 1 ? "" : "s"}</button>
+            <button type="button" className="start-breakdown-button" onClick={startBreakdown}>Start breaking down {stagedResults.length + stagedFiles.length} paper{stagedResults.length + stagedFiles.length === 1 ? "" : "s"}</button>
           </div>}
         </section>
       </div>}

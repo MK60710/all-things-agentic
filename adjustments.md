@@ -23,6 +23,13 @@ presented as verified recommendations when their metadata can be resolved.
 The existing arXiv search and ingestion flow should remain available as the
 default until this multi-source discovery layer is implemented.
 
+## Add reliable paper links
+
+Paper opening from graph and map nodes is intentionally deferred for now. A
+future implementation should carry the canonical paper identifier separately
+from the graph node UUID, then route arXiv papers to their abstract page and
+uploaded files through authenticated, durable production storage.
+
 ## Make PDF figures and tables source-aware
 
 PDF extraction currently flattens multi-column author blocks, figures, and

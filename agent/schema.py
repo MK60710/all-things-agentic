@@ -34,6 +34,9 @@ class EdgeType(str, Enum):
     SAME_AS = "SAME_AS"
     SUPPORTS = "SUPPORTS"
     CONTRADICTS = "CONTRADICTS"
+    # Derived paper-context edge: the entity was extracted from this paper,
+    # without claiming that the paper proposes or uses it.
+    MENTIONS = "MENTIONS"
 
 
 class ProvenanceTag(str, Enum):

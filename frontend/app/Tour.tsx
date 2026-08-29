@@ -138,7 +138,7 @@ export default function Tour({ steps, active, onClose }: { steps: TourStep[]; ac
       <h4>{step.title}</h4>
       <p>{step.body}</p>
       <div className="tour-callout-actions">
-        <button type="button" className="tour-skip" onClick={finish}>Skip</button>
+        <button type="button" className="tour-skip" onClick={finish}>Cancel</button>
         <div>
           {stepIndex > 0 && <button type="button" onClick={() => setStepIndex((i) => i - 1)}>Back</button>}
           <button type="button" onClick={isLast ? finish : () => setStepIndex((i) => i + 1)}>{isLast ? "Done" : "Next"}</button>

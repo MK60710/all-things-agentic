@@ -44,7 +44,8 @@ secret stays in the Next.js server process.
 - Gemini chat and optional structured extraction via Vertex AI
 - Local chunk index for retrieval
 - networkx graph engine + optional Firestore persistence
-- Cloud Run (deployment)
+- Cloud Storage for private, durable source PDFs
+- Cloud Run-compatible backend (deployment remains operator-managed)
 
 ## Architecture
 
@@ -59,10 +60,9 @@ future academic-paper discovery beyond the current arXiv search.
 
 ## Deploy
 
-The backend deploys to Cloud Run as a single container - see
-[`service/DEPLOY.md`](service/DEPLOY.md) for the exact command, why
-`--min-instances=1 --max-instances=1` is required rather than tuned, and
-how to verify the deployed service afterward.
+See [`service/DEPLOY.md`](service/DEPLOY.md) for the production configuration,
+cloud-resource, cost-control, security, and verification checklist. Deployment
+itself remains operator-managed.
 
 ## Setup
 Install from `pyproject.toml` or `requirements.txt`. The local path does not
@@ -93,6 +93,8 @@ ONNX Runtime locally. `LocalHashingEmbedder` remains the download-free default.
   returns chunks and makes no API calls.
 - Firestore writes occur only when a Firestore client is supplied.
 - The graph is populated only when entities or quoted relations exist.
+- Paid operations have persistent per-user limits and global daily ceilings,
+  enforced by the backend before Gemini is called.
 
 ## Local retrieval
 

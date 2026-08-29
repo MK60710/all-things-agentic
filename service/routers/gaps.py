@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 from agent.gap_finder import GapCandidate
 from agent.schema import NodeType
 from service.auth import get_current_user
-from service.deps import get_state, require_api_key
+from service.deps import consume_rate_limit, get_state, require_api_key
 from service.schemas import GapFeedbackRequest
 from service.state import AppState
 
@@ -26,6 +26,7 @@ def list_gaps(
         if session is None or session.get("owner_uid") != uid:
             raise HTTPException(status_code=404, detail=f"no session {session_id!r}")
         goal = session.get("goal")
+    consume_rate_limit(state, uid, "gaps")
     # owner_uid is always passed, session_id-or-not - find_sparse_pairs
     # would otherwise scan the entire graph across every account when
     # session_id is omitted (see agent/graph_manager.py).

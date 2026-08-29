@@ -1,34 +1,27 @@
-FROM python:3.11-slim
+# Atlas backend container. The Next.js frontend is deployed separately on Vercel.
+FROM python:3.12-slim-bookworm
 
-# poppler-utils provides pdftotext, which PdfTextExtractor shells out to
-# for all real extraction. tesseract-ocr is intentionally NOT installed -
-# service/state.py constructs PdfTextExtractor with no ocr_fallback, so
-# the service never uses OCR in v1. This is a deliberate scope decision,
-# not an oversight - add tesseract-ocr here if OCR support is ever wired
-# into service/state.py.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    poppler-utils \
+# Atlas uses pdftotext for PDF extraction.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=ghcr.io/astral-sh/uv:0.11.29 /uv /uvx /usr/local/bin/
-
 WORKDIR /app
-COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --no-install-project
+
+# Install the backend's production dependencies from the plain requirements
+# file so the image remains easy to understand and maintain.
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY agent/ ./agent/
 COPY service/ ./service/
-RUN uv sync --frozen --no-dev
 
-ENV PATH="/app/.venv/bin:${PATH}"
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    UPLOAD_ROOT=/tmp/atlas-uploads
 
-# Cloud Run injects $PORT at runtime (default 8080) - shell form is
-# required for ${PORT:-8080} to actually expand; the exec-form JSON array
-# CMD does not perform shell substitution and would otherwise silently
-# bind to a literal "${PORT:-8080}".
-#
-# --workers 1: required, not a tuning choice - see service/state.py's
-# module docstring for why more than one worker/instance would split
-# in-memory state (ChunkIndex, ClarificationOrchestrator) across
-# processes that can't see each other's data.
-CMD exec uvicorn service.app:app --host 0.0.0.0 --port ${PORT:-8080} --workers 1
+EXPOSE 8080
+
+# Cloud Run supplies PORT. One worker is intentional for Atlas's current
+# process-local retrieval and clarification state.
+CMD ["sh", "-c", "exec uvicorn service.app:app --host 0.0.0.0 --port ${PORT:-8080} --workers 1"]

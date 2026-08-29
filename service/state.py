@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from google import genai
 from google.cloud import firestore
 
 from agent.clarification_orchestrator import ClarificationOrchestrator
@@ -28,10 +29,13 @@ from agent.retrieval import ChunkIndex, LocalHashingEmbedder
 from agent.session_summarizer import GeminiSessionSummarizer, SummarizeFn
 from agent.text_utils import entity_embedding_text
 from service.storage import PaperStore, SessionMessagesStore, SessionStore, UploadTokenStore
+from service.rate_limits import RateLimiter
+from service.document_storage import CloudStorageDocumentStore, DocumentStore, LocalDocumentStore
 
 
 @dataclass
 class AppState:
+    gemini_client: genai.Client
     graph: GraphManager
     chunks: ChunkIndex
     clarification: ClarificationOrchestrator
@@ -44,11 +48,13 @@ class AppState:
     extraction_agent: ExtractionAgent
     research_store: ResearchStore
     upload_root: str
+    document_store: DocumentStore
     paper_store: PaperStore
     upload_tokens: UploadTokenStore
     session_store: SessionStore
     session_messages_store: SessionMessagesStore
     session_summarizer: SummarizeFn
+    rate_limiter: RateLimiter
     _embedder: LocalHashingEmbedder | None = None
 
     def __post_init__(self) -> None:
@@ -67,6 +73,7 @@ def build_state() -> AppState:
     location = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
 
     db = firestore.Client(project=project)
+    gemini_client = genai.Client(vertexai=True, project=project, location=location)
     graph = GraphManager(project_id=project, db_client=db)
     chunks = ChunkIndex(db_client=db)
     clarification = ClarificationOrchestrator(graph_manager=graph, db_client=db)
@@ -78,44 +85,56 @@ def build_state() -> AppState:
         location=location,
         clarification=clarification,
         db_client=db,
+        client=gemini_client,
     )
     general_chat = GeneralChatAgent(
         project=project,
         location=location,
         model=os.environ.get("GEMINI_CHAT_MODEL", "gemini-3.5-flash-lite"),
+        client=gemini_client,
     )
     paper_guide = PaperGuideAgent(
         project=project,
         location=location,
         model=os.environ.get("GEMINI_GUIDE_MODEL", "gemini-3.5-flash-lite"),
+        client=gemini_client,
     )
     gap_finder = GapFinder(
         graph,
-        explain_fn=GeminiExplainer(project=project, location=location),
+        explain_fn=GeminiExplainer(client=gemini_client, project=project, location=location),
         db_client=db,
     )
     contradiction_finder = ContradictionFinder(
         graph,
-        judge=GeminiContradictionJudge(project=project, location=location),
+        judge=GeminiContradictionJudge(client=gemini_client, project=project, location=location),
         db_client=db,
     )
     feynman_checker = FeynmanChecker(
         graph,
-        judge=GeminiFeynmanJudge(project=project, location=location),
+        judge=GeminiFeynmanJudge(client=gemini_client, project=project, location=location),
     )
 
     upload_root = os.environ.get("UPLOAD_ROOT", "/tmp/uploads")
     os.makedirs(upload_root, exist_ok=True)
+    storage_bucket = os.environ.get("PAPER_STORAGE_BUCKET")
+    document_store: DocumentStore = (
+        CloudStorageDocumentStore(storage_bucket, project=project)
+        if storage_bucket
+        else LocalDocumentStore(upload_root)
+    )
     extraction_agent = ExtractionAgent(
         document_extractor=PdfTextExtractor(allowed_root=upload_root),
         structured_extractor=GeminiStructuredExtractor(
-            project=project, location=location
+            project=project, location=location, client=gemini_client
         ),
     )
     research_store = ResearchStore(chunks, graph)
-    session_summarizer = GeminiSessionSummarizer(project=project, location=location)
+    session_summarizer = GeminiSessionSummarizer(
+        client=gemini_client, project=project, location=location
+    )
 
     return AppState(
+        gemini_client=gemini_client,
         graph=graph,
         chunks=chunks,
         clarification=clarification,
@@ -128,9 +147,11 @@ def build_state() -> AppState:
         extraction_agent=extraction_agent,
         research_store=research_store,
         upload_root=upload_root,
+        document_store=document_store,
         paper_store=PaperStore(db),
         upload_tokens=UploadTokenStore(db),
         session_store=SessionStore(db),
         session_messages_store=SessionMessagesStore(db),
         session_summarizer=session_summarizer,
+        rate_limiter=RateLimiter(db),
     )
