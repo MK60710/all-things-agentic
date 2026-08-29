@@ -7,6 +7,8 @@ requests>=2.32
 fastapi>=0.115
 uvicorn[standard]>=0.32
 python-multipart>=0.0.9
+firebase-admin>=6.5.0
+google-cloud-storage>=2.18.0
 
 # Optional local-semantic embeddings (opt-in ONNX model download, kept out
 # of the base install to match pyproject.toml's local-semantic extra):
