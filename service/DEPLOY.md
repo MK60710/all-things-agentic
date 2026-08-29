@@ -1,89 +1,106 @@
-# Deploying the backend to Cloud Run
+# Production readiness checklist
 
-The FastAPI service in this directory is built and verified (see the
-commit that added it for what was tested). This doc covers the one step
-left: the actual deploy.
+This is an operator checklist, not a deployment script. Atlas does not deploy
+itself, and deployment configuration remains the operator's responsibility.
 
-## No IAM setup needed
+## Required backend configuration
 
-Checked live: the project's default compute service account
-(`321308278055-compute@developer.gserviceaccount.com`) already has
-`roles/editor`, which covers both Firestore and Vertex AI. Nothing to
-grant before deploying.
+Set these values on the backend service:
 
-## Deploy command
+- `ATLAS_ENV=production`
+- `GOOGLE_CLOUD_PROJECT`: the project containing Vertex AI and Firestore
+- `GOOGLE_CLOUD_LOCATION=global`: required by the configured Gemini models
+- `GEMINI_CHAT_MODEL` and `GEMINI_GUIDE_MODEL` when overriding the defaults
+- `API_SHARED_SECRET`: a random value of at least 32 characters, supplied
+  from Secret Manager rather than committed or exposed to browser JavaScript
+- `CORS_ORIGINS`: only the exact HTTPS frontend origin or origins
+- `PAPER_STORAGE_BUCKET`: a private Cloud Storage bucket for source PDFs
 
-Pick an `API_SHARED_SECRET` value first (any random string) and share it
-with whoever's calling this from the frontend - it's a cost gate on the
-open URL, not user auth, but every request needs it in an `X-API-Key`
-header once this is set.
+Production startup fails closed when the shared secret, HTTPS CORS origins, or
+paper bucket is missing.
 
-```bash
-gcloud run deploy all-things-agentic-api \
-  --source . \
-  --project all-things-agentic-hack \
-  --region us-central1 \
-  --allow-unauthenticated \
-  --min-instances=1 --max-instances=1 --concurrency=4 \
-  --timeout=300 --memory=1Gi --cpu=1 \
-  --set-env-vars=GOOGLE_CLOUD_PROJECT=all-things-agentic-hack,GOOGLE_CLOUD_LOCATION=global,API_SHARED_SECRET=<pick-a-value>
-```
+Set these values on the Next.js service:
 
-`--region us-central1` is just where the Cloud Run *service itself* runs -
-that's unrelated to and doesn't need to change. `GOOGLE_CLOUD_LOCATION`
-is a separate setting: it's what the app passes to the Vertex AI client
-to pick which Gemini endpoint to call, and this project only has
-`gemini-3.5-*` entitlement on the "global" Vertex AI endpoint, not
-"us-central1" (confirmed live: a direct call to gemini-3.5-flash in
-us-central1 404s with "your project does not have access to it"; the
-identical call against "global" succeeds). Deploying with the old value
-would put a live, publicly reachable service on Cloud Run where every
-Gemini call - contradiction checks, gap-finding, Feynman checks, chat -
-fails.
+- `BACKEND_API_URL`: the private server-side backend URL
+- `NEXT_PUBLIC_API_URL`: the backend URL used only for token-authorized direct
+  PDF uploads
+- `API_SHARED_SECRET`: the same server-side secret as the backend
+- all `NEXT_PUBLIC_FIREBASE_*` values listed in
+  `frontend/.env.local.example`
 
-`--min-instances=1 --max-instances=1` is not a tuning choice - it's
-required. `GraphManager`, `ChunkIndex`, and `ClarificationOrchestrator` all
-rehydrate from Firestore at process startup (see `service/state.py`'s
-module docstring), but that's a startup-only read, not a live subscription -
-an already-running instance never sees writes another instance makes after
-both have started. More than one concurrently running instance would still
-let two requests diverge mid-session (e.g. one instance ingests a paper the
-other never sees) until the next cold start re-rehydrates them.
+`API_SHARED_SECRET` must never have a `NEXT_PUBLIC_` prefix.
 
-## Verifying it after deploy
+## Google Cloud resources
 
-```bash
-SERVICE_URL=$(gcloud run services describe all-things-agentic-api \
-  --project all-things-agentic-hack --region us-central1 \
-  --format='value(status.url)')
+Before release:
 
-curl "$SERVICE_URL/health"
+- Enable Vertex AI, Firestore, Cloud Storage, Firebase Authentication, and
+  Secret Manager for the project.
+- Create a private PDF bucket with public access prevention and uniform
+  bucket-level access enabled. Do not add public object viewers.
+- Give the backend service account only the access it needs: Vertex AI User,
+  Datastore User, Secret Manager Secret Accessor for the API secret, and
+  Storage Object User scoped to the PDF bucket. Do not use the broad Editor
+  role for the production runtime.
+- Configure a Firestore TTL policy on the `expires_at` field for the
+  `rate_limits` collection group so expired fixed-window counters are removed.
+- Enable Google as a Firebase sign-in provider and add the final frontend
+  hostname to Firebase Authentication's authorized domains.
 
-curl -X POST "$SERVICE_URL/query" \
-  -H "content-type: application/json" \
-  -H "X-API-Key: <the-value-you-picked>" \
-  -d '{"query":"What is MemoryBank?"}'
-```
+## Cost controls
 
-Don't just check for a 200 - look at the actual JSON body. An empty or
-error-shaped 200 isn't a real pass.
+Atlas rejects paid operations before Gemini is called when a limit is reached.
+The backend, not the browser, owns these limits.
 
-## What already got tested (before this deploy step)
+Per-user defaults:
 
-- Full local `uvicorn` run against real Firestore + real Vertex AI,
-  covering every endpoint: `/healthz`, `/query` (no_results, graph mode,
-  and a real ambiguity hit that correctly returned a clarifying
-  question), `/query/feedback`, `/clarifications` (list, answer, and a
-  confirmed graph mutation from the answer), `/gaps` (real
-  `GeminiExplainer` output), `/papers` (a real corpus PDF, real Gemini
-  extraction, ~70s round trip, correctly surfaced a partial-extraction
-  issue and a pending clarification question through the HTTP response).
-- A real `gcloud builds submit` confirming the Dockerfile builds and
-  pushes cleanly (image deleted afterward - build-only, this repo's
-  session never ran or deployed that image).
-- 174 automated tests (172 passed, 2 skipped - real-Vertex-AI-only),
-  including 23 FastAPI `TestClient` tests with no live GCP dependency
-  (`tests/test_service.py`).
+| Operation | Burst limit | Daily limit |
+| --- | ---: | ---: |
+| Chat/query | 20/minute | 100/day |
+| Paper ingestion | 3/hour | 6/day |
+| Guide generation | 6/hour | 20/day |
+| Contradiction checks | 10/hour | 30/day |
+| Feynman checks | 20/hour | 50/day |
+| Gap explanations | 10/hour | 30/day |
 
-Not tested: the actual deployed Cloud Run URL, multiple concurrent
-users/instances, or anything past a single file per `/papers` request.
+Global daily ceilings across every account are 500 chat requests, 15 paper
+ingestions, 40 guide generations, 60 contradiction runs, 100 Feynman checks,
+and 60 gap-explanation runs.
+
+For the initial free release, start with a small monthly Google Cloud budget
+(for example, USD 25) and alerts at 50%, 80%, and 100%. A billing budget is an
+alert, not a guaranteed hard cap. Connect the 100% notification to a reviewed
+operator response or programmatic kill switch before increasing the budget.
+
+## Runtime constraints
+
+Keep the backend at one process and one service instance. `GraphManager`,
+`ChunkIndex`, and `ClarificationOrchestrator` rehydrate from Firestore at
+startup but do not subscribe to changes made by another running instance.
+Scaling beyond one instance can therefore split a live session's in-memory
+view. Remove this restriction only after those components use synchronized
+storage for every read/write path.
+
+The original PDFs are durable in Cloud Storage. `/tmp` is only scratch space
+for validation and parsing. Firestore remains the durable store for paper
+metadata, chunks, graph records, sessions, messages, and rate-limit counters.
+
+## Release verification
+
+Before directing users to the app:
+
+1. Run the full backend test suite and the optimized frontend production build.
+2. Confirm the health endpoint returns a successful JSON response.
+3. Sign in through the final frontend hostname.
+4. Upload a PDF and import an arXiv paper, then verify both remain available
+   after a backend restart.
+5. Verify paper ownership by attempting cross-account session and paper reads.
+6. Exercise chat, Deep Dive, graph, paper map, Feynman, contradiction, and gap
+   workflows against real Vertex AI.
+7. Temporarily lower a test user's limits and confirm the backend returns 429,
+   Gemini is not called, and the composer stays disabled after refresh.
+8. Confirm the bucket has no public access and Firestore TTL is active.
+9. Confirm budget notifications reach every intended recipient.
+
+Do not treat a health response alone as release verification; it intentionally
+does not spend money by calling Gemini.
