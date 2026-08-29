@@ -19,6 +19,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from service.routers import chat, clarifications, contradictions, feynman, gaps, health, papers, query, sessions
+from service.config import validate_production_environment
 from service.state import build_state
 
 logger = logging.getLogger("atlas.request")
@@ -29,6 +30,7 @@ async def lifespan(app: FastAPI):
     # Blocking - constructs the real GraphManager/ChunkIndex/QueryAgent/etc
     # exactly once at container startup. See service/state.py's docstring
     # for why this must never run more than once per process.
+    validate_production_environment()
     app.state.app_state = build_state()
     yield
 
