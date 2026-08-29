@@ -48,6 +48,7 @@ class RateLimitStatus:
     remaining: int
     retry_after: int
     reset_at: str | None
+    scope: str = "user"
 
 
 class RateLimiter:
@@ -120,7 +121,14 @@ class RateLimiter:
             snapshot = ref.get()
             count = int(snapshot.to_dict().get("count", 0)) if snapshot.exists else 0
             counts.append((count, rule.limit, reset))
-        return self._decision(action, counts, now)
+        decision = self._decision(action, counts, now)
+        user_count = len(self._rules[action])
+        if not decision.allowed and any(
+            count >= rule.limit
+            for count, (rule, *_rest) in zip(counts[user_count:], self._windows(uid, action, now)[user_count:])
+        ):
+            return replace(decision, scope="global")
+        return decision
 
     def consume(self, uid: str, action: str) -> RateLimitStatus:
         now = self._clock()
@@ -141,7 +149,9 @@ class RateLimiter:
                     now,
                 )
                 if not decision.allowed:
-                    return decision
+                    user_count = len(self._rules[action])
+                    global_exhausted = any(count >= rule.limit for count, (rule, *_rest) in zip(counts[user_count:], windows[user_count:]))
+                    return replace(decision, scope="global" if global_exhausted else "user")
                 for count, (rule, _start, reset, ref) in zip(counts, windows):
                     txn.set(
                         ref,
@@ -176,7 +186,9 @@ class RateLimiter:
                 now,
             )
             if not decision.allowed:
-                return decision
+                user_count = len(self._rules[action])
+                global_exhausted = any(count >= rule.limit for count, (rule, *_rest) in zip(counts[user_count:], windows[user_count:]))
+                return replace(decision, scope="global" if global_exhausted else "user")
             for count, (rule, _start, reset, ref) in zip(counts, windows):
                 ref.set(
                     {

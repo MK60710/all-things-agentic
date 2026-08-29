@@ -595,6 +595,7 @@ export default function Home() {
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
   const [chatBlockedUntil, setChatBlockedUntil] = useState<number | null>(null);
+  const [chatLimitScope, setChatLimitScope] = useState<"user" | "global">("user");
   const [papers, setPapers] = useState<PaperContext[]>([]);
   const [addOpen, setAddOpen] = useState(false);
   const [addMode, setAddMode] = useState<AddMode>("choose");
@@ -671,8 +672,10 @@ export default function Home() {
   function applyChatUsage(status: Awaited<ReturnType<typeof getUsageStatus>>) {
     if (status.chat.allowed) {
       setChatBlockedUntil(null);
+      setChatLimitScope("user");
       return;
     }
+    setChatLimitScope(status.chat.scope === "global" ? "global" : "user");
     const reset = status.chat.reset_at ? Date.parse(status.chat.reset_at) : Date.now() + status.chat.retry_after * 1000;
     setChatBlockedUntil(Number.isFinite(reset) ? reset : Date.now() + 60_000);
   }
@@ -1198,6 +1201,7 @@ export default function Home() {
     } catch (error) {
       if (error instanceof RateLimitError) {
         setChatBlockedUntil(Date.now() + Math.max(1, error.retryAfter) * 1000);
+        setChatLimitScope(error.scope);
       }
       setMessages((current) => [...current, {
         id: crypto.randomUUID(),
@@ -1718,6 +1722,7 @@ export default function Home() {
 
       <footer className="composer-area">
         {papers.length > 0 && <div className="paper-context-chip"><Icon name="paper" size={14}/><span>Using <strong>{papers.length === 1 ? papers[0].title : `${papers.length} papers`}</strong></span></div>}
+        {chatBlockedUntil !== null && chatBlockedUntil > Date.now() && <div className="quota-notice" role="status" aria-live="polite">{chatLimitScope === "global" ? "Atlas is temporarily unavailable while we reset the app's safety budget." : `Your free chat limit has been reached. You can prompt Atlas again after ${new Date(chatBlockedUntil).toLocaleString()}.`}</div>}
         <form className="composer" onSubmit={(event) => ask(event)}>
           <button type="button" className="composer-add" onClick={() => openAddPaper()} aria-label="Add a paper"><Icon name="plus" size={19}/></button>
           <textarea ref={composerInput} value={query} maxLength={8000} disabled={chatBlockedUntil !== null && chatBlockedUntil > Date.now()} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void ask(); } }} rows={1} placeholder={chatBlockedUntil !== null && chatBlockedUntil > Date.now() ? "Free chat limit reached. Try again after the limit resets." : papers.length ? "Ask anything about these papers…" : "Message Atlas…"}/>

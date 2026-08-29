@@ -80,7 +80,7 @@ def test_chat_rate_limit_stops_request_before_gemini(client, app_state, fake_db)
 
     assert response.status_code == 429
     assert response.headers["retry-after"]
-    assert "limit reached" in response.json()["detail"].lower()
+    assert "limit has been reached" in response.json()["detail"].lower()
 
 
 def test_usage_reports_chat_lockout(client, app_state, fake_db) -> None:

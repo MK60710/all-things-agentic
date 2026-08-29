@@ -27,6 +27,8 @@ export async function POST(request: NextRequest) {
       );
       const retryAfter = response.headers.get("retry-after");
       if (retryAfter) outgoing.headers.set("Retry-After", retryAfter);
+      const rateLimitScope = response.headers.get("x-ratelimit-scope");
+      if (rateLimitScope) outgoing.headers.set("X-RateLimit-Scope", rateLimitScope);
       return outgoing;
     }
     return NextResponse.json(data);

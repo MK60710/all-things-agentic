@@ -32,10 +32,13 @@ def consume_rate_limit(state: AppState, uid: str, action: str) -> None:
         return
     raise HTTPException(
         status_code=429,
-        detail=f"{action.replace('_', ' ').capitalize()} limit reached. Try again later.",
+        detail=("Atlas is temporarily unavailable because the app's safety budget has been reached."
+                 if decision.scope == "global"
+                 else f"Your {action.replace('_', ' ')} limit has been reached. Try again later."),
         headers={
             "Retry-After": str(decision.retry_after),
             "X-RateLimit-Action": action,
             "X-RateLimit-Reset": decision.reset_at or "",
+            "X-RateLimit-Scope": decision.scope,
         },
     )
