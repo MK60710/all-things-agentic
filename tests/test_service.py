@@ -26,6 +26,7 @@ from service.deps import get_state
 from service.state import AppState
 from service.storage import PaperStore, SessionMessagesStore, SessionStore, UploadTokenStore
 from service.rate_limits import LimitWindow, RateLimiter
+from service.document_storage import LocalDocumentStore
 
 # Every fixture-seeded session/paper/graph node uses this as owner_uid,
 # matching the get_current_user override below - keeps ownership checks
@@ -117,6 +118,7 @@ def app_state(fake_db, tmp_path) -> AppState:
         ),
         research_store=ResearchStore(chunks, graph),
         upload_root=str(tmp_path),
+        document_store=LocalDocumentStore(tmp_path),
         paper_store=PaperStore(fake_db),
         upload_tokens=UploadTokenStore(fake_db),
         session_store=SessionStore(fake_db),

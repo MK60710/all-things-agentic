@@ -41,5 +41,16 @@ def test_production_accepts_explicit_https_origins(monkeypatch) -> None:
     monkeypatch.setenv(
         "CORS_ORIGINS", "https://atlas.example,https://www.atlas.example"
     )
+    monkeypatch.setenv("PAPER_STORAGE_BUCKET", "atlas-private-papers")
 
     validate_production_environment()
+
+
+def test_production_requires_durable_paper_storage(monkeypatch) -> None:
+    monkeypatch.setenv("ATLAS_ENV", "production")
+    monkeypatch.setenv("API_SHARED_SECRET", "s" * 32)
+    monkeypatch.setenv("CORS_ORIGINS", "https://atlas.example")
+    monkeypatch.delenv("PAPER_STORAGE_BUCKET", raising=False)
+
+    with pytest.raises(RuntimeError, match="PAPER_STORAGE_BUCKET"):
+        validate_production_environment()
