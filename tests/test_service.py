@@ -25,6 +25,7 @@ from service.auth import get_current_user
 from service.deps import get_state
 from service.state import AppState
 from service.storage import PaperStore, SessionMessagesStore, SessionStore, UploadTokenStore
+from service.rate_limits import LimitWindow, RateLimiter
 
 # Every fixture-seeded session/paper/graph node uses this as owner_uid,
 # matching the get_current_user override below - keeps ownership checks
@@ -69,6 +70,29 @@ def _stub_summarizer(messages: list[dict]) -> str | None:
     return "Stub summary of the conversation."
 
 
+def test_chat_rate_limit_stops_request_before_gemini(client, app_state, fake_db) -> None:
+    app_state.rate_limiter = RateLimiter(
+        fake_db, rules={"chat": (LimitWindow(60, 0),)}
+    )
+
+    response = client.post("/chat", json={"message": "hello", "history": []})
+
+    assert response.status_code == 429
+    assert response.headers["retry-after"]
+    assert "limit reached" in response.json()["detail"].lower()
+
+
+def test_usage_reports_chat_lockout(client, app_state, fake_db) -> None:
+    app_state.rate_limiter = RateLimiter(
+        fake_db, rules={"chat": (LimitWindow(60, 0),)}
+    )
+
+    response = client.get("/usage")
+
+    assert response.status_code == 200
+    assert response.json()["chat"]["allowed"] is False
+
+
 @pytest.fixture
 def app_state(fake_db, tmp_path) -> AppState:
     graph = GraphManager(project_id="test", db_client=fake_db)
@@ -98,6 +122,7 @@ def app_state(fake_db, tmp_path) -> AppState:
         session_store=SessionStore(fake_db),
         session_messages_store=SessionMessagesStore(fake_db),
         session_summarizer=_stub_summarizer,
+        rate_limiter=RateLimiter(fake_db),
     )
 
 

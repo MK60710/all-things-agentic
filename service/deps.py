@@ -24,3 +24,18 @@ def require_api_key(x_api_key: str = Header(default="")) -> None:
     expected = os.environ.get("API_SHARED_SECRET")
     if expected and x_api_key != expected:
         raise HTTPException(status_code=401, detail="invalid or missing API key")
+
+
+def consume_rate_limit(state: AppState, uid: str, action: str) -> None:
+    decision = state.rate_limiter.consume(uid, action)
+    if decision.allowed:
+        return
+    raise HTTPException(
+        status_code=429,
+        detail=f"{action.replace('_', ' ').capitalize()} limit reached. Try again later.",
+        headers={
+            "Retry-After": str(decision.retry_after),
+            "X-RateLimit-Action": action,
+            "X-RateLimit-Reset": decision.reset_at or "",
+        },
+    )

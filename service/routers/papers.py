@@ -15,7 +15,7 @@ from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query
 from fastapi.responses import FileResponse
 
 from service.auth import get_current_user
-from service.deps import get_state, require_api_key
+from service.deps import consume_rate_limit, get_state, require_api_key
 from service.schemas import (
     ArxivIngestRequest,
     DeepDiveResponse,
@@ -457,6 +457,7 @@ def upload_paper(
             raise HTTPException(
                 status_code=409, detail=f"This session is limited to {MAX_SESSION_PAPERS} papers."
             )
+    consume_rate_limit(state, uid, "paper_ingest")
     upload_root = Path(state.upload_root).resolve()
     dest = (upload_root / f"{pid}.pdf").resolve()
     if not dest.is_relative_to(upload_root):
@@ -492,6 +493,7 @@ def ingest_arxiv(
             raise HTTPException(
                 status_code=409, detail=f"This session is limited to {MAX_SESSION_PAPERS} papers."
             )
+    consume_rate_limit(state, uid, "paper_ingest")
     upload_root = Path(state.upload_root).resolve()
     dest = (upload_root / f"{pid}.pdf").resolve()
     if not dest.is_relative_to(upload_root):
@@ -554,6 +556,7 @@ def create_paper_guide(
         raise HTTPException(status_code=404, detail="paper has no indexed content")
     if metadata and isinstance(metadata.get("guide"), dict):
         return PaperGuide.model_validate(metadata["guide"])
+    consume_rate_limit(state, uid, "guide")
     title = str((metadata or {}).get("title") or paper_id)
     guide = state.paper_guide.generate(title, chunks)
     # owner_uid re-passed explicitly, not left to merge=True alone - same
@@ -587,6 +590,7 @@ def get_paper_deep_dive(
     if isinstance(metadata.get("guide"), dict):
         guide = PaperGuide.model_validate(metadata["guide"])
     else:
+        consume_rate_limit(state, uid, "guide")
         guide = state.paper_guide.generate(str(metadata.get("title") or paper_id), chunks)
         state.paper_store.save(paper_id, guide=guide.model_dump(mode="json"), owner_uid=metadata.get("owner_uid"))
 

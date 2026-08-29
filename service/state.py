@@ -28,6 +28,7 @@ from agent.retrieval import ChunkIndex, LocalHashingEmbedder
 from agent.session_summarizer import GeminiSessionSummarizer, SummarizeFn
 from agent.text_utils import entity_embedding_text
 from service.storage import PaperStore, SessionMessagesStore, SessionStore, UploadTokenStore
+from service.rate_limits import RateLimiter
 
 
 @dataclass
@@ -49,6 +50,7 @@ class AppState:
     session_store: SessionStore
     session_messages_store: SessionMessagesStore
     session_summarizer: SummarizeFn
+    rate_limiter: RateLimiter
     _embedder: LocalHashingEmbedder | None = None
 
     def __post_init__(self) -> None:
@@ -133,4 +135,5 @@ def build_state() -> AppState:
         session_store=SessionStore(db),
         session_messages_store=SessionMessagesStore(db),
         session_summarizer=session_summarizer,
+        rate_limiter=RateLimiter(db),
     )
