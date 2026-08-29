@@ -10,6 +10,7 @@ import {
   deleteSession,
   detachPaper,
   getFeynmanPrompts,
+  getUsageStatus,
   getPaperStatus,
   getSessionMessages,
   ingestArxivPaper,
@@ -22,6 +23,7 @@ import {
   saveSessionMessages,
   searchPapers,
   uploadPaper,
+  RateLimitError,
 } from "@/lib/api";
 import type { ChatHistoryItem, PaperContext, PaperIngestResult, PaperSearchResult, SessionMetadata } from "@/lib/api";
 import type { Citation, FeynmanCheckResult, FeynmanPrompt, GapCandidate, PaperGuide, PendingQuestion, QueryResponse } from "@/lib/types";
@@ -592,6 +594,7 @@ export default function Home() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
+  const [chatBlockedUntil, setChatBlockedUntil] = useState<number | null>(null);
   const [papers, setPapers] = useState<PaperContext[]>([]);
   const [addOpen, setAddOpen] = useState(false);
   const [addMode, setAddMode] = useState<AddMode>("choose");
@@ -664,6 +667,26 @@ export default function Home() {
   const [currentSession, setCurrentSession] = useState<SessionMetadata | null>(null);
   const [sessions, setSessions] = useState<SessionMetadata[]>([]);
   const [sessionMenuOpen, setSessionMenuOpen] = useState(false);
+
+  function applyChatUsage(status: Awaited<ReturnType<typeof getUsageStatus>>) {
+    if (status.chat.allowed) {
+      setChatBlockedUntil(null);
+      return;
+    }
+    const reset = status.chat.reset_at ? Date.parse(status.chat.reset_at) : Date.now() + status.chat.retry_after * 1000;
+    setChatBlockedUntil(Number.isFinite(reset) ? reset : Date.now() + 60_000);
+  }
+
+  useEffect(() => {
+    void getUsageStatus().then(applyChatUsage).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (!chatBlockedUntil) return;
+    const delay = Math.max(0, chatBlockedUntil - Date.now());
+    const timer = window.setTimeout(() => setChatBlockedUntil(null), delay);
+    return () => window.clearTimeout(timer);
+  }, [chatBlockedUntil]);
 
   useEffect(() => { chatEnd.current?.scrollIntoView({ behavior: "smooth" }); }, [messages, loading]);
   // Conversation history is persisted server-side (Firestore) so it
@@ -1144,7 +1167,7 @@ export default function Home() {
   async function ask(event?: FormEvent, suggested = query, papersOverride?: PaperContext[] | null, nodeId?: string) {
     event?.preventDefault();
     const question = suggested.trim();
-    if (!question || loading) return;
+    if (!question || loading || (chatBlockedUntil !== null && chatBlockedUntil > Date.now())) return;
     const effectivePapers = papersOverride === undefined ? papers : papersOverride;
 
     const history: ChatHistoryItem[] = messages
@@ -1171,7 +1194,11 @@ export default function Home() {
         candidates: response.candidates,
         clarificationQuestionId: response.clarification_question_id,
       }]);
+      void getUsageStatus().then(applyChatUsage).catch(() => {});
     } catch (error) {
+      if (error instanceof RateLimitError) {
+        setChatBlockedUntil(Date.now() + Math.max(1, error.retryAfter) * 1000);
+      }
       setMessages((current) => [...current, {
         id: crypto.randomUUID(),
         role: "assistant",
@@ -1693,10 +1720,10 @@ export default function Home() {
         {papers.length > 0 && <div className="paper-context-chip"><Icon name="paper" size={14}/><span>Using <strong>{papers.length === 1 ? papers[0].title : `${papers.length} papers`}</strong></span></div>}
         <form className="composer" onSubmit={(event) => ask(event)}>
           <button type="button" className="composer-add" onClick={() => openAddPaper()} aria-label="Add a paper"><Icon name="plus" size={19}/></button>
-          <textarea ref={composerInput} value={query} maxLength={8000} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void ask(); } }} rows={1} placeholder={papers.length ? "Ask anything about these papers…" : "Message Atlas…"}/>
-          <button type="submit" className="send-button" disabled={!query.trim() || loading} aria-label="Send"><Icon name="send" size={18}/></button>
+          <textarea ref={composerInput} value={query} maxLength={8000} disabled={chatBlockedUntil !== null && chatBlockedUntil > Date.now()} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void ask(); } }} rows={1} placeholder={chatBlockedUntil !== null && chatBlockedUntil > Date.now() ? "Free chat limit reached. Try again after the limit resets." : papers.length ? "Ask anything about these papers…" : "Message Atlas…"}/>
+          <button type="submit" className="send-button" disabled={!query.trim() || loading || (chatBlockedUntil !== null && chatBlockedUntil > Date.now())} aria-label="Send"><Icon name="send" size={18}/></button>
         </form>
-        <small className="composer-hint">Atlas can make mistakes. Paper answers include sources when available.</small>
+        <small className="composer-hint">{chatBlockedUntil !== null && chatBlockedUntil > Date.now() ? `Free chat limit reached. Available again ${new Date(chatBlockedUntil).toLocaleString()}.` : "Atlas can make mistakes. Paper answers include sources when available."}</small>
       </footer>
 
       {addOpen && <div className="add-modal" role="dialog" aria-modal="true" aria-label="Add a research paper">

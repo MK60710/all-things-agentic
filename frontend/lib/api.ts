@@ -20,6 +20,29 @@ export interface ChatHistoryItem {
   text: string;
 }
 
+export class RateLimitError extends Error {
+  constructor(message: string, public readonly retryAfter: number) {
+    super(message);
+    this.name = "RateLimitError";
+  }
+}
+
+export interface UsageStatus {
+  chat: {
+    allowed: boolean;
+    remaining: number;
+    retry_after: number;
+    reset_at?: string | null;
+  };
+}
+
+export async function getUsageStatus(): Promise<UsageStatus> {
+  const response = await fetch("/api/usage", { headers: await authHeaders(), cache: "no-store" });
+  const data = await response.json() as UsageStatus & { error?: string };
+  if (!response.ok) throw new Error(data.error ?? "Could not load usage");
+  return data;
+}
+
 export interface PaperContext {
   id: string;
   title: string;
@@ -164,7 +187,15 @@ export async function askAssistant(
   });
 
   const data = await response.json() as Partial<QueryResponse> & { error?: string };
-  if (!response.ok) throw new Error(data.error ?? `Assistant request failed (${response.status})`);
+  if (!response.ok) {
+    if (response.status === 429) {
+      throw new RateLimitError(
+        data.error ?? "Your free chat limit has been reached.",
+        Number(response.headers.get("retry-after") ?? "60"),
+      );
+    }
+    throw new Error(data.error ?? `Assistant request failed (${response.status})`);
+  }
   return {
     answer: data.answer ?? "I couldn't produce a response.",
     citations: data.citations ?? [],

@@ -21,10 +21,13 @@ export async function POST(request: NextRequest) {
     });
     const data = await response.json().catch(() => ({ detail: "Backend returned an invalid response" }));
     if (!response.ok) {
-      return NextResponse.json(
+      const outgoing = NextResponse.json(
         { error: data.detail ?? `Backend request failed (${response.status})` },
         { status: response.status },
       );
+      const retryAfter = response.headers.get("retry-after");
+      if (retryAfter) outgoing.headers.set("Retry-After", retryAfter);
+      return outgoing;
     }
     return NextResponse.json(data);
   } catch (error) {

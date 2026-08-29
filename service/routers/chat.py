@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from agent.general_chat import ChatTurn
 from agent.query_agent import QueryResult
 from service.auth import get_current_user
-from service.deps import get_state, require_api_key
+from service.deps import consume_rate_limit, get_state, require_api_key
 from service.schemas import ChatRequest
 from service.state import AppState
 from service.storage import _paper_session_ids
@@ -23,6 +23,7 @@ def chat(
         owned = state.session_store.get(body.session_id)
         if owned is None or owned.get("owner_uid") != uid:
             raise HTTPException(status_code=404, detail=f"no session {body.session_id!r}")
+    consume_rate_limit(state, uid, "chat")
     history = [ChatTurn(role=item.role, text=item.text) for item in body.history]
     paper_ids = body.paper_ids
     if body.session_id and paper_ids:
