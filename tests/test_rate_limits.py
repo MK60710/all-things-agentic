@@ -49,3 +49,16 @@ def test_short_and_long_windows_are_both_enforced(fake_db) -> None:
     now[0] = 60.0
     assert limiter.consume("user-a", "chat").allowed
     assert not limiter.consume("user-a", "chat").allowed
+
+
+def test_global_limit_cannot_be_bypassed_with_multiple_users(fake_db) -> None:
+    limiter = RateLimiter(
+        fake_db,
+        rules={"chat": (LimitWindow(60, 10),)},
+        global_rules={"chat": (LimitWindow(86_400, 2),)},
+        clock=lambda: 100.0,
+    )
+
+    assert limiter.consume("user-a", "chat").allowed
+    assert limiter.consume("user-b", "chat").allowed
+    assert not limiter.consume("user-c", "chat").allowed

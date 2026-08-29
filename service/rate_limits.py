@@ -28,6 +28,18 @@ RATE_LIMITS: dict[str, tuple[LimitWindow, ...]] = {
     "gaps": (LimitWindow(3_600, 10), LimitWindow(86_400, 30)),
 }
 
+# Backstop for account multiplication or a leaked authenticated browser
+# session. These are intentionally conservative for a free hackathon app and
+# can be raised after observing real request/token costs.
+GLOBAL_RATE_LIMITS: dict[str, tuple[LimitWindow, ...]] = {
+    "chat": (LimitWindow(86_400, 500),),
+    "paper_ingest": (LimitWindow(86_400, 15),),
+    "guide": (LimitWindow(86_400, 40),),
+    "contradictions": (LimitWindow(86_400, 60),),
+    "feynman": (LimitWindow(86_400, 100),),
+    "gaps": (LimitWindow(86_400, 60),),
+}
+
 
 @dataclass(frozen=True)
 class RateLimitStatus:
@@ -44,11 +56,17 @@ class RateLimiter:
         db_client: Any,
         *,
         rules: dict[str, tuple[LimitWindow, ...]] | None = None,
+        global_rules: dict[str, tuple[LimitWindow, ...]] | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._db = db_client
         self._collection = db_client.collection("rate_limits")
         self._rules = rules or RATE_LIMITS
+        self._global_rules = (
+            global_rules
+            if global_rules is not None
+            else ({} if rules is not None else GLOBAL_RATE_LIMITS)
+        )
         self._clock = clock
         self._lock = threading.Lock()
 
@@ -59,17 +77,21 @@ class RateLimiter:
 
     def _windows(self, uid: str, action: str, now: float):
         try:
-            rules = self._rules[action]
+            user_rules = self._rules[action]
         except KeyError as exc:
             raise ValueError(f"unknown rate-limit action {action!r}") from exc
         windows = []
-        for rule in rules:
-            start = int(now // rule.seconds) * rule.seconds
-            reset = start + rule.seconds
-            ref = self._collection.document(
-                self._document_id(uid, action, rule.seconds, start)
-            )
-            windows.append((rule, start, reset, ref))
+        for subject, rules in (
+            (uid, user_rules),
+            ("__global__", self._global_rules.get(action, ())),
+        ):
+            for rule in rules:
+                start = int(now // rule.seconds) * rule.seconds
+                reset = start + rule.seconds
+                ref = self._collection.document(
+                    self._document_id(subject, action, rule.seconds, start)
+                )
+                windows.append((rule, start, reset, ref))
         return windows
 
     @staticmethod
