@@ -30,11 +30,19 @@ def consume_rate_limit(state: AppState, uid: str, action: str) -> None:
     decision = state.rate_limiter.consume(uid, action)
     if decision.allowed:
         return
+    messages = {
+        "chat": "Your free chat limit has been reached. Try again later.",
+        "paper_ingest": "Your free paper-processing limit has been reached. Try again later.",
+        "guide": "Your free walkthrough limit has been reached. Try again later.",
+        "contradictions": "Your free contradiction-checking limit has been reached. Try again later.",
+        "feynman": "Your free Feynman-check limit has been reached. Try again later.",
+        "gaps": "Your free research-gap limit has been reached. Try again later.",
+    }
     raise HTTPException(
         status_code=429,
         detail=("Atlas is temporarily unavailable because the app's safety budget has been reached."
                  if decision.scope == "global"
-                 else f"Your {action.replace('_', ' ')} limit has been reached. Try again later."),
+                 else messages.get(action, f"Your free {action.replace('_', ' ')} limit has been reached. Try again later.")),
         headers={
             "Retry-After": str(decision.retry_after),
             "X-RateLimit-Action": action,
