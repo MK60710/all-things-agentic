@@ -90,9 +90,14 @@ class QueryResult(BaseModel):
 class QueryAgent:
     """Answer research questions from stored graph/chunk evidence.
 
-    Paper-scoped broad questions use the paper text first, while explicit
-    relationship questions and selected graph nodes use graph evidence first.
-    A Vertex AI Gemini client is optional for local tests; without one - or if
+    Graph retrieval is attempted first for explicit relationship questions
+    and selected graph nodes, gated by min_graph_score so a single generic
+    shared token can't lock in a low-relevance graph answer over a better
+    chunk match. Paper-scoped broad questions (see _is_graph_question) use
+    the paper's own prose first instead, since graph-only retrieval starved
+    Gemini of the actual text for a question like "summarize the paper." If
+    neither path has evidence, the chunk index is used as a last resort. A
+    Vertex AI Gemini client is optional for local tests; without one - or if
     a configured client's call fails - the agent returns a deterministic
     evidence summary rather than making an ungrounded model call or letting
     the query crash.
