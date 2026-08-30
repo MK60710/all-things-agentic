@@ -69,6 +69,32 @@ def test_global_limit_cannot_be_bypassed_with_multiple_users(fake_db) -> None:
     assert blocked.scope == "global"
 
 
+def test_status_reports_global_scope_without_crashing_when_exhausted(fake_db) -> None:
+    # Live bug found 2026-08-30 while checking a user's current usage: the
+    # GET /usage endpoint calls status(), and status() crashed with a
+    # TypeError ('>=' not supported between instances of 'tuple' and 'int')
+    # for any user who had exhausted their limit on an action with global
+    # rules configured - which includes "chat", the only action /usage
+    # actually calls. It reused consume()'s tuple-unpacking idiom
+    # (`for count, (rule, *_rest) in zip(counts, windows)`), but status()'s
+    # own `counts` is a list of (count, limit, reset) tuples, not flat ints
+    # like consume()'s - so `count` was bound to the whole tuple instead of
+    # the number, and `count >= rule.limit` blew up. The frontend's
+    # `.catch(() => {})` around this call silently swallowed the crash,
+    # breaking the "remaining chat quota" indicator exactly when a user
+    # most needed to see it (0 remaining, resets at X).
+    limiter = RateLimiter(
+        fake_db,
+        rules={"chat": (LimitWindow(60, 1),)},
+        global_rules={"chat": (LimitWindow(86_400, 1),)},
+        clock=lambda: 100.0,
+    )
+    assert limiter.consume("user-a", "chat").allowed
+    status = limiter.status("user-a", "chat")
+    assert not status.allowed
+    assert status.scope == "global"
+
+
 def test_retry_on_contention_recovers_after_transient_aborts(monkeypatch) -> None:
     # Reproduces the 2026-08-30 bug live: 3 concurrent "Start breaking down"
     # paper adds for the same user all hit the same rate-limit counter
