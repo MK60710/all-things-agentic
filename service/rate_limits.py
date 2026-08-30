@@ -4,13 +4,40 @@ from __future__ import annotations
 
 import hashlib
 import math
+import random
 import threading
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
+from google.api_core.exceptions import Aborted
 from google.cloud import firestore
+
+
+def _retry_on_contention(fn: Callable[[], Any]) -> Any:
+    """Retry a Firestore transaction on write-contention aborts.
+
+    A concurrent batch (e.g. "Start breaking down N papers" firing N ingest
+    requests for the same user at once) makes every one of those
+    transactions read/write the same rate-limit counter documents in the
+    same instant. Firestore aborts the losers under contention (409
+    Aborted). That error surfaces during the transaction's read phase, and
+    the Firestore client's own transaction retry only covers a failed
+    commit, not a failed read - so left uncaught, this previously reached
+    the caller as an unhandled 500 and silently dropped that request
+    (confirmed live 2026-08-30: 3 concurrent paper adds, one lost this way).
+    """
+    last_error: Aborted | None = None
+    for attempt in range(6):
+        try:
+            return fn()
+        except Aborted as exc:
+            last_error = exc
+            if attempt < 5:
+                time.sleep(0.05 * (2**attempt) + random.uniform(0, 0.05))
+    assert last_error is not None
+    raise last_error
 
 
 @dataclass(frozen=True)
@@ -134,7 +161,6 @@ class RateLimiter:
         now = self._clock()
         windows = self._windows(uid, action, now)
         if hasattr(self._db, "transaction"):
-            transaction = self._db.transaction()
 
             @firestore.transactional
             def increment(txn):
@@ -170,7 +196,7 @@ class RateLimiter:
                     now,
                 ), allowed=True)
 
-            return increment(transaction)
+            return _retry_on_contention(lambda: increment(self._db.transaction()))
 
         # Deterministic fake/local clients do not expose transactions. The
         # deployed Firestore client always takes the transactional path.
