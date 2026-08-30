@@ -151,8 +151,7 @@ class RateLimiter:
         decision = self._decision(action, counts, now)
         user_count = len(self._rules[action])
         if not decision.allowed and any(
-            count >= rule.limit
-            for count, (rule, *_rest) in zip(counts[user_count:], self._windows(uid, action, now)[user_count:])
+            count >= limit for count, limit, _reset in counts[user_count:]
         ):
             return replace(decision, scope="global")
         return decision
